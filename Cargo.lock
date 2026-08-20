@@ -34,10 +34,29 @@ version = "0.1.0"
 [[package]]
 name = "agentark-adapter-sdk"
 version = "0.1.0"
+dependencies = [
+ "agentark-canonical",
+ "agentark-security",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "agentark-adapter-synthetic"
 version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-canonical",
+ "agentark-security",
+ "dunce",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "agentark-app"

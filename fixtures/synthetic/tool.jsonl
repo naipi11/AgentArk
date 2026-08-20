@@ -1,0 +1,2 @@
+{"type":"message","sessionId":"synthetic-tool","ordinal":1,"role":"user","text":"run the tool","timestamp":"2024-01-01T00:00:00Z"}
+{"type":"tool","sessionId":"synthetic-tool","ordinal":2,"toolName":"echo","status":"completed","input":"hello","output":"world"}

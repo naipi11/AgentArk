@@ -1,0 +1,2 @@
+{"type":"message","sessionId":"synthetic-text","ordinal":1,"role":"user","text":"hello","timestamp":"2024-01-01T00:00:00Z"}
+{"type":"message","sessionId":"synthetic-text","ordinal":2,"role":"assistant","text":"world","timestamp":"2024-01-01T00:00:00Z"}
