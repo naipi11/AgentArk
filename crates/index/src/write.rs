@@ -71,7 +71,7 @@ pub trait SessionIndex {
     fn record_quarantine(&mut self, record: QuarantineRecord) -> Result<(), IndexError>;
     fn finish_scan(&mut self, manifest: &ScanManifest) -> Result<(), IndexError>;
     fn fail_scan(&mut self, scan_id: Uuid) -> Result<(), IndexError>;
-    fn mark_scan_stale(&mut self, _scan_id: Uuid) -> Result<(), IndexError> {
+    fn mark_sessions_stale(&mut self, _session_ids: &[Uuid]) -> Result<(), IndexError> {
         Ok(())
     }
     fn record_verification(&mut self, _record: VerificationRecord) -> Result<(), IndexError> {
@@ -107,14 +107,28 @@ impl SessionIndex for IndexDb {
                 return Err(IndexError::InvariantViolation);
             }
         }
-        let ordered = input
+        let messages_ordered = input
+            .session
+            .messages
+            .windows(2)
+            .all(|window| window[0].ordinal < window[1].ordinal);
+        let tools_ordered = input
+            .session
+            .tool_events
+            .windows(2)
+            .all(|window| window[0].ordinal < window[1].ordinal);
+        let mut merged_ordinals = input
             .session
             .messages
             .iter()
             .map(|message| message.ordinal)
             .chain(input.session.tool_events.iter().map(|event| event.ordinal))
             .collect::<Vec<_>>();
-        if ordered.windows(2).any(|window| window[0] >= window[1]) {
+        merged_ordinals.sort_unstable();
+        let merged_unique = merged_ordinals
+            .windows(2)
+            .all(|window| window[0] < window[1]);
+        if !messages_ordered || !tools_ordered || !merged_unique {
             return Err(IndexError::InvariantViolation);
         }
         let canonical_json = serde_json::to_string(input.session)?;
@@ -319,6 +333,7 @@ impl SessionIndex for IndexDb {
                 manifest.id.to_string(),
             ],
         )?;
+        self.set_active_scan_id(None);
         Ok(())
     }
 
@@ -328,16 +343,20 @@ impl SessionIndex for IndexDb {
             "UPDATE scan_runs SET status = 'failed', completed_at = ?1 WHERE id = ?2",
             params![now_string(), scan_id.to_string()],
         )?;
-        tx.execute("UPDATE sessions SET stale = 1", [])?;
         tx.commit()?;
         self.set_active_scan_id(None);
         Ok(())
     }
 
-    fn mark_scan_stale(&mut self, scan_id: Uuid) -> Result<(), IndexError> {
-        let _ = scan_id;
-        self.connection_mut()
-            .execute("UPDATE sessions SET stale = 1", [])?;
+    fn mark_sessions_stale(&mut self, session_ids: &[Uuid]) -> Result<(), IndexError> {
+        let tx = self.connection_mut().transaction()?;
+        for session_id in session_ids {
+            tx.execute(
+                "UPDATE sessions SET stale = 1 WHERE id = ?1",
+                params![session_id.to_string()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

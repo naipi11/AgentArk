@@ -178,6 +178,55 @@ fn failed_scan_marks_retained_sessions_stale() {
     .unwrap();
     let failed_scan = Uuid::new_v4();
     db.begin_scan(failed_scan, "fixture", "snapshot-2").unwrap();
+    db.mark_sessions_stale(&[session.id]).unwrap();
     db.fail_scan(failed_scan).unwrap();
     assert!(db.list_sessions(10, 0).unwrap()[0].stale);
+}
+
+#[test]
+fn interleaved_messages_and_tool_events_follow_global_ordinal_order() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let db_path = dir.path().join("agentark.db");
+    let mut db = IndexDb::open(&db_path, keys.sqlcipher_key()).unwrap();
+    let install = AgentInstall {
+        id: Uuid::new_v4(),
+        kind: AgentKind::Codex,
+        executable_version: "0.146.0".into(),
+        authorized_root_uri: "file:///fixture".into(),
+        adapter_version: "0.1.0".into(),
+        schema_fingerprint: "sha256:fixture".into(),
+        capabilities: BTreeSet::new(),
+        quarantine_reason: None,
+    };
+    let mut session = session(
+        install.id,
+        vec![
+            CanonicalMessage::text_fixture(1, "same", "first"),
+            CanonicalMessage::text_fixture(3, "same", "third"),
+        ],
+    );
+    session.tool_events.push(agentark_canonical::ToolEvent {
+        id: "tool-2".into(),
+        ordinal: 2,
+        tool_name: "echo".into(),
+        status: "completed".into(),
+        visible_input: Some("input".into()),
+        visible_output: Some("output".into()),
+        raw_ref: agentark_canonical::Sha256Digest::from_bytes(b"raw"),
+    });
+    let hash = canonical_hash("session", &session).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &session,
+        source_records: &[],
+        sanitized_title: "interleaved",
+        sanitized_body: "interleaved",
+        findings: &[],
+        canonical_hash: &hash,
+    })
+    .unwrap();
+    assert_eq!(db.list_sessions(10, 0).unwrap().len(), 1);
 }

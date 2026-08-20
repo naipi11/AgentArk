@@ -1,6 +1,6 @@
 use agentark_adapter_sdk::{CaptureRequest, NormalizeOutcome, SourceAdapter};
 use agentark_canonical::{
-    AgentInstall, CanonicalSession, Sha256Digest, SourceRecord, canonical_hash,
+    AgentInstall, CanonicalSession, Sha256Digest, SourceRecord, canonical_hash, session_id,
 };
 use agentark_cas::{ArtifactStore, ObjectType};
 use agentark_index::{
@@ -45,6 +45,7 @@ pub struct ScanService<A, C, I> {
     index: I,
     scanner: SecretScanner,
     journal: VerificationJournal,
+    pending_session_ids: Vec<Uuid>,
 }
 
 impl<A, C, I> ScanService<A, C, I>
@@ -60,6 +61,7 @@ where
             index,
             scanner,
             journal: VerificationJournal::default(),
+            pending_session_ids: Vec::new(),
         }
     }
 
@@ -80,6 +82,7 @@ where
     }
 
     pub fn run(&mut self, request: ScanRequest) -> Result<ScanReport, AppError> {
+        self.pending_session_ids.clear();
         let scan_id = Uuid::new_v4();
         let initial_snapshot = request
             .snapshot_hint
@@ -93,7 +96,9 @@ where
         match result {
             Ok(report) => Ok(report),
             Err(error) => {
+                let _ = self.index.mark_sessions_stale(&self.pending_session_ids);
                 let _ = self.index.fail_scan(scan_id);
+                self.pending_session_ids.clear();
                 Err(error)
             }
         }
@@ -110,6 +115,12 @@ where
         let mut rejected = 0;
 
         for record in batch.records {
+            if let Some(source_session_id) = record.source_session_id.as_deref() {
+                let id = session_id(request.install.id, source_session_id);
+                if !self.pending_session_ids.contains(&id) {
+                    self.pending_session_ids.push(id);
+                }
+            }
             let stored = self.cas.put(ObjectType::AgentRawRecord, &record.bytes)?;
             self.journal.record(scan_id, stored.clone());
             self.index.record_verification(VerificationRecord {
@@ -218,6 +229,7 @@ where
             retryable_count: retryable,
             rejected_count: rejected,
         })?;
+        self.pending_session_ids.clear();
         Ok(ScanReport {
             scan_id,
             status,

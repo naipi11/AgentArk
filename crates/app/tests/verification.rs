@@ -56,3 +56,16 @@ fn verification_reports_cas_authentication_failure_without_plaintext() {
     assert_eq!(report.failures[0].code, "cas-authentication-failed");
     assert!(!serde_json::to_string(&report).unwrap().contains("raw"));
 }
+
+#[test]
+fn verification_rejects_an_unknown_scan_id() {
+    let verifier = VerificationService::new(
+        TamperingCas {
+            tampered: Arc::new(AtomicBool::new(false)),
+        },
+        VerificationJournal::default(),
+    );
+    let report = verifier.verify_scan(Uuid::new_v4()).unwrap();
+    assert!(!report.passed);
+    assert_eq!(report.failures[0].code, "scan-not-found");
+}
