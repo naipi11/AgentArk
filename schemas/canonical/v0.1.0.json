@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CanonicalSession",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "installId": {
+      "type": "string"
+    },
+    "sourceSessionId": {
+      "type": "string"
+    },
+    "sourceKind": {
+      "type": "string"
+    },
+    "workspace": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Workspace"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "archived": {
+      "type": "boolean"
+    },
+    "createdAtRaw": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updatedAtRaw": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "modelProvider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "modelName": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CanonicalMessage"
+      }
+    },
+    "toolEvents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ToolEvent"
+      }
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Attachment"
+      }
+    },
+    "rawExtra": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "installId",
+    "sourceSessionId",
+    "sourceKind",
+    "archived",
+    "completeness",
+    "messages",
+    "toolEvents",
+    "attachments",
+    "rawExtra"
+  ],
+  "$defs": {
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "pathNative": {
+          "type": "string"
+        },
+        "canonicalUri": {
+          "type": "string"
+        },
+        "gitCommit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "pathNative",
+        "canonicalUri"
+      ]
+    },
+    "Completeness": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "quarantined"
+      ]
+    },
+    "CanonicalMessage": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "sourceRecordId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "role": {
+          "$ref": "#/$defs/CanonicalRole"
+        },
+        "rawRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAtRaw": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContentPart"
+          }
+        },
+        "rawRef": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "ordinal",
+        "role",
+        "content",
+        "rawRef"
+      ]
+    },
+    "CanonicalRole": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "system",
+        "tool",
+        "unknown"
+      ]
+    },
+    "ContentPart": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ContentPartKind"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attachmentId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rawExtra": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "kind",
+        "rawExtra"
+      ]
+    },
+    "ContentPartKind": {
+      "type": "string",
+      "enum": [
+        "text",
+        "image",
+        "audio",
+        "file",
+        "unknown"
+      ]
+    },
+    "ToolEvent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "visibleInput": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visibleOutput": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rawRef": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "ordinal",
+        "toolName",
+        "status",
+        "rawRef"
+      ]
+    },
+    "Attachment": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "sourceLocator": {
+          "type": "string"
+        },
+        "mediaType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "rawRef": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sourceLocator",
+        "size",
+        "sha256",
+        "rawRef"
+      ]
+    }
+  }
+}
