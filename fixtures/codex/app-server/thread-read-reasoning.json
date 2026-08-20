@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thread_reasoning","turns":[{"items":[{"type":"userMessage","content":[{"type":"input_text","text":"visible"}]},{"type":"reasoning","text":"HiddenReasoningCanary"},{"type":"agentMessage","text":"answer"}]},{"items":[{"type":"unknownFutureItem","payload":"future"}]}]}}}

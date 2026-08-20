@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thread_visible","turns":[{"items":[{"type":"userMessage","content":[{"type":"input_text","text":"hello"}]},{"type":"agentMessage","text":"hi"},{"type":"commandExecution","command":"echo hi","aggregatedOutput":"hi","status":"completed"}]}]}}}

@@ -16,4 +16,8 @@ pub enum CodexError {
     EndOfStream,
     #[error("Codex App Server protocol error")]
     Protocol,
+    #[error("Codex source record is retryable: {0}")]
+    Retryable(&'static str),
+    #[error("Codex source changed during capture")]
+    SourceChanged,
 }

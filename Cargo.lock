@@ -34,6 +34,7 @@ dependencies = [
  "agentark-adapter-sdk",
  "agentark-canonical",
  "agentark-security",
+ "dunce",
  "hex",
  "serde",
  "serde_json",
