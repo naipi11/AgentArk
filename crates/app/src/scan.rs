@@ -1,0 +1,273 @@
+use agentark_adapter_sdk::{CaptureRequest, NormalizeOutcome, SourceAdapter};
+use agentark_canonical::{
+    AgentInstall, CanonicalSession, Sha256Digest, SourceRecord, canonical_hash,
+};
+use agentark_cas::{ArtifactStore, ObjectType};
+use agentark_index::{
+    QuarantineRecord, ScanManifest, ScanManifestStatus, SessionIndex, SessionIngest,
+};
+use agentark_security::{SecretFinding, SecretScanner};
+use serde::Serialize;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
+
+use crate::{AppError, VerificationJournal};
+
+#[derive(Clone, Debug)]
+pub struct ScanRequest {
+    pub install: AgentInstall,
+    pub snapshot_hint: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScanStatus {
+    Complete,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanReport {
+    pub scan_id: Uuid,
+    pub status: ScanStatus,
+    pub indexed: u64,
+    pub quarantined: u64,
+    pub retryable: u64,
+    pub rejected: u64,
+}
+
+pub struct ScanService<A, C, I> {
+    adapter: A,
+    cas: C,
+    index: I,
+    scanner: SecretScanner,
+    journal: VerificationJournal,
+}
+
+impl<A, C, I> ScanService<A, C, I>
+where
+    A: SourceAdapter,
+    C: ArtifactStore,
+    I: SessionIndex,
+{
+    pub fn new(adapter: A, cas: C, index: I, scanner: SecretScanner) -> Self {
+        Self {
+            adapter,
+            cas,
+            index,
+            scanner,
+            journal: VerificationJournal::default(),
+        }
+    }
+
+    pub fn index(&self) -> &I {
+        &self.index
+    }
+
+    pub fn index_mut(&mut self) -> &mut I {
+        &mut self.index
+    }
+
+    pub fn verification_journal(&self) -> VerificationJournal {
+        self.journal.clone()
+    }
+
+    pub fn run(&mut self, request: ScanRequest) -> Result<ScanReport, AppError> {
+        let scan_id = Uuid::new_v4();
+        let initial_snapshot = request
+            .snapshot_hint
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("pending");
+        self.index
+            .begin_scan(scan_id, self.adapter.id(), initial_snapshot)?;
+
+        let result = self.run_started(scan_id, request);
+        match result {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                let _ = self.index.fail_scan(scan_id);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_started(&mut self, scan_id: Uuid, request: ScanRequest) -> Result<ScanReport, AppError> {
+        let batch = self.adapter.capture(&CaptureRequest {
+            install: request.install.clone(),
+            snapshot_hint: request.snapshot_hint.clone(),
+        })?;
+        let mut indexed = 0;
+        let mut quarantined = 0;
+        let mut retryable = 0;
+        let mut rejected = 0;
+
+        for record in batch.records {
+            let stored = self.cas.put(ObjectType::AgentRawRecord, &record.bytes)?;
+            self.journal.record(scan_id, stored.clone());
+            let outcome = self.adapter.normalize(&record)?;
+            match outcome {
+                NormalizeOutcome::Normalized(session) => {
+                    let session = *session;
+                    verify_raw_references(&session, &stored.plaintext_hash)?;
+                    let (sanitized_title, sanitized_body, findings) =
+                        sanitize_session(&self.scanner, &session);
+                    let canonical_hash = canonical_hash("session", &session)?;
+                    let source_record = SourceRecord {
+                        source_locator: sanitize_locator(&record.source_locator),
+                        source_record_id: record.source_record_id.clone(),
+                        ordinal: record.ordinal,
+                        raw_sha256: stored.plaintext_hash.clone(),
+                        cas_object_id: stored.object_id.clone(),
+                        adapter_version: request.install.adapter_version.clone(),
+                        snapshot_id: batch.snapshot_id.clone(),
+                    };
+                    self.journal.record_session(
+                        scan_id,
+                        &stored.object_id,
+                        session.clone(),
+                        canonical_hash.clone(),
+                        sanitized_title.clone(),
+                        sanitized_body.clone(),
+                    );
+                    self.index.ingest_session(SessionIngest {
+                        install: &request.install,
+                        session: &session,
+                        source_records: std::slice::from_ref(&source_record),
+                        sanitized_title: &sanitized_title,
+                        sanitized_body: &sanitized_body,
+                        findings: &findings,
+                        canonical_hash: &canonical_hash,
+                    })?;
+                    indexed += 1;
+                }
+                NormalizeOutcome::Quarantined {
+                    reason_code,
+                    fingerprint,
+                } => {
+                    self.index.record_quarantine(QuarantineRecord {
+                        id: Uuid::new_v5(
+                            &scan_id,
+                            format!("{}:{}", record.source_locator, record.ordinal).as_bytes(),
+                        ),
+                        scan_id,
+                        source_locator: sanitize_locator(&record.source_locator),
+                        fingerprint: sanitize_fingerprint(&fingerprint),
+                        reason_code: sanitize_reason(&reason_code),
+                        raw_sha256: stored.plaintext_hash,
+                        cas_object_id: stored.object_id,
+                    })?;
+                    quarantined += 1;
+                }
+                NormalizeOutcome::Retryable { .. } => retryable += 1,
+                NormalizeOutcome::Rejected { .. } => rejected += 1,
+            }
+        }
+
+        let status = if quarantined == 0 && retryable == 0 && rejected == 0 {
+            ScanStatus::Complete
+        } else {
+            ScanStatus::Partial
+        };
+        self.index.finish_scan(&ScanManifest {
+            id: scan_id,
+            status: match status {
+                ScanStatus::Complete => ScanManifestStatus::Complete,
+                ScanStatus::Partial => ScanManifestStatus::Partial,
+                ScanStatus::Failed => ScanManifestStatus::Failed,
+            },
+            completed_at: now_string(),
+            indexed_count: indexed,
+            quarantined_count: quarantined,
+            retryable_count: retryable,
+            rejected_count: rejected,
+        })?;
+        Ok(ScanReport {
+            scan_id,
+            status,
+            indexed,
+            quarantined,
+            retryable,
+            rejected,
+        })
+    }
+}
+
+fn verify_raw_references(
+    session: &CanonicalSession,
+    raw_hash: &Sha256Digest,
+) -> Result<(), AppError> {
+    let invalid_message = session
+        .messages
+        .iter()
+        .any(|message| &message.raw_ref != raw_hash);
+    let invalid_tool = session
+        .tool_events
+        .iter()
+        .any(|event| &event.raw_ref != raw_hash);
+    if invalid_message || invalid_tool {
+        return Err(AppError::Invariant(
+            "normalized raw reference is not the archived object hash".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_session(
+    scanner: &SecretScanner,
+    session: &CanonicalSession,
+) -> (String, String, Vec<SecretFinding>) {
+    let title = scanner.sanitize(session.title.as_deref().unwrap_or(""));
+    let body = scanner.sanitize(&session.searchable_text());
+    let mut findings = title.findings.clone();
+    let body_offset = title.text.len() + 1;
+    findings.extend(body.findings.into_iter().map(|mut finding| {
+        finding.start += body_offset;
+        finding.end += body_offset;
+        finding
+    }));
+    (title.text, body.text, findings)
+}
+
+fn sanitize_locator(value: &str) -> String {
+    let basename = value
+        .split(['/', '\\'])
+        .rfind(|part| !part.is_empty())
+        .unwrap_or("source");
+    let mut output = basename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    output.truncate(128);
+    if output.is_empty() {
+        "source".into()
+    } else {
+        output
+    }
+}
+
+fn sanitize_reason(value: &str) -> String {
+    sanitize_locator(value).replace('.', "-")
+}
+
+fn sanitize_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit() || *character == ':')
+        .take(80)
+        .collect()
+}
+
+fn now_string() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}

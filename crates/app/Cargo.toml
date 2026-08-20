@@ -6,3 +6,18 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+agentark-adapter-sdk = { path = "../adapter-sdk" }
+agentark-canonical = { path = "../canonical" }
+agentark-cas = { path = "../cas" }
+agentark-index = { path = "../index" }
+agentark-security = { path = "../security" }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+agentark-adapter-synthetic = { path = "../adapters/synthetic" }
+tempfile.workspace = true
+zeroize.workspace = true

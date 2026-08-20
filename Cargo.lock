@@ -61,6 +61,21 @@ dependencies = [
 [[package]]
 name = "agentark-app"
 version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-adapter-synthetic",
+ "agentark-canonical",
+ "agentark-cas",
+ "agentark-index",
+ "agentark-security",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "uuid",
+ "zeroize",
+]
 
 [[package]]
 name = "agentark-canonical"
