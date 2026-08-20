@@ -283,6 +283,19 @@ impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
                 });
             }
         }
+        if snapshot.status.is_some() {
+            let persisted_session_records = snapshot
+                .records
+                .iter()
+                .filter(|record| record.session.is_some())
+                .count() as u64;
+            if snapshot.sessions.len() as u64 != persisted_session_records {
+                failures.push(VerificationFailure {
+                    code: "scan-count-mismatch".into(),
+                    object_id: None,
+                });
+            }
+        }
         for entry in &snapshot.records {
             let plaintext = match self.cas.get(&entry.object) {
                 Ok(plaintext) => plaintext,
@@ -341,6 +354,16 @@ impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
                             != Some(&session.canonical_hash)
                         || canonical.messages.len() != session.message_ordinals.len()
                         || canonical.tool_events.len() != session.tool_event_ordinals.len()
+                        || canonical
+                            .messages
+                            .iter()
+                            .map(|message| message.ordinal)
+                            .ne(session.message_ordinals.iter().copied())
+                        || canonical
+                            .tool_events
+                            .iter()
+                            .map(|event| event.ordinal)
+                            .ne(session.tool_event_ordinals.iter().copied())
                         || !strictly_increasing(&session.message_ordinals)
                         || !strictly_increasing(&session.tool_event_ordinals)
                         || !merged_ordinals_unique(
