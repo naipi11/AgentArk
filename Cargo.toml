@@ -1,0 +1,53 @@
+[workspace]
+members = [
+  "crates/canonical",
+  "crates/security",
+  "crates/cas",
+  "crates/index",
+  "crates/adapter-sdk",
+  "crates/app",
+  "crates/adapters/synthetic",
+  "crates/adapters/codex",
+  "cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+authors = ["naipi11"]
+repository = "https://github.com/naipi11/AgentArk"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+schemars = { version = "=1.2.2", features = ["derive"] }
+uuid = { version = "=1.24.1", features = ["serde", "v4", "v5", "v7"] }
+thiserror = "=2.0.20"
+sha2 = "=0.11.0"
+hmac = "=0.13.0"
+hkdf = "=0.13.0"
+hex = "=0.4.3"
+getrandom = "=0.4.3"
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+zeroize = { version = "=1.9.0", features = ["derive"] }
+rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher-vendored-openssl", "backup", "hooks", "limits"] }
+keyring = "=4.1.6"
+clap = { version = "=4.6.6", features = ["derive", "env"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["fmt", "env-filter", "json"] }
+tempfile = "=3.27.0"
+proptest = "=1.11.0"
+assert_cmd = "=2.2.2"
+predicates = "=3.1.4"
+url = { version = "=2.5.8", features = ["serde"] }
+regex = "=1.13.1"
+walkdir = "=2.5.0"
+dunce = "=1.0.5"
+serde_jcs = "=0.2.0"
+time = { version = "=0.3.55", features = ["formatting", "parsing", "serde", "serde-well-known"] }
+directories = "=6.0.0"
+tauri = { version = "=2.11.5", features = ["tracing"] }
+tauri-build = "=2.6.3"
