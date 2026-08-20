@@ -1,0 +1,23 @@
+name: nightly
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  fuzz-and-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-20
+      - run: cargo install --locked cargo-fuzz --version 0.13.2
+      - run: cargo fuzz run codex_jsonl -- -max_total_time=900
+      - run: cargo fuzz run path_policy -- -max_total_time=900
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - run: pwsh -File ci/enforce-search-benchmark.ps1

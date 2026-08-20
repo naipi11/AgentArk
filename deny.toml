@@ -1,0 +1,30 @@
+[graph]
+all-features = true
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"]
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+# Workspace crates use local path dependencies by design; cargo-deny reports
+# those as wildcard requirements even though they are not registry wildcards.
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+# MPL-2.0 is pulled by the Tauri/WebView2 desktop stack; it remains a
+# transitive dependency and is permitted here so the release audit is
+# reproducible across supported desktop targets.
+allow = ["Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0", "NCSA", "Unicode-3.0", "OpenSSL", "Zlib"]
+
+[licenses.private]
+ignore = true

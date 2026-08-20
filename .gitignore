@@ -1,4 +1,5 @@
 /target/
+target/
 /.worktrees/
 /node_modules/
 /apps/desktop/node_modules/
@@ -8,6 +9,8 @@
 /apps/desktop/vite.config.d.ts
 /apps/desktop/src-tauri/gen/
 /.tmp-*/
+fuzz/artifacts/
+fuzz/corpus/
 *.db
 *.db-wal
 *.db-shm
