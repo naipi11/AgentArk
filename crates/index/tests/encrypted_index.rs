@@ -1,0 +1,85 @@
+use std::{collections::BTreeSet, fs};
+
+use agentark_canonical::{
+    AgentInstall, AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession,
+    Completeness, canonical_hash,
+};
+use agentark_index::{IndexDb, SessionIndex, SessionIngest, SessionQuery};
+use agentark_security::{DatasetBootstrap, MemoryMasterKeyStore, SanitizedText};
+use tempfile::tempdir;
+use uuid::Uuid;
+
+fn fixture() -> (AgentInstall, CanonicalSession, SanitizedText) {
+    let install = AgentInstall {
+        id: Uuid::new_v4(),
+        kind: AgentKind::Codex,
+        executable_version: "0.146.0".into(),
+        authorized_root_uri: "file:///fixture".into(),
+        adapter_version: "0.1.0".into(),
+        schema_fingerprint: "sha256:fixture".into(),
+        capabilities: BTreeSet::new(),
+        quarantine_reason: None,
+    };
+    let session = CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: Uuid::new_v4(),
+        install_id: install.id,
+        source_session_id: "thread_fixture".into(),
+        source_kind: "cli".into(),
+        workspace: None,
+        title: Some("CanonicalVisibleCanary".into()),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: Some("openai".into()),
+        model_name: Some("fixture".into()),
+        completeness: Completeness::Complete,
+        messages: vec![CanonicalMessage::text_fixture(
+            1,
+            "same",
+            "CanonicalVisibleCanary",
+        )],
+        tool_events: Vec::new(),
+        attachments: Vec::new(),
+        raw_extra: Default::default(),
+    };
+    let sanitized = SanitizedText {
+        text: "[REDACTED:vendor-token]".into(),
+        findings: Vec::new(),
+    };
+    (install, session, sanitized)
+}
+
+#[test]
+fn encrypts_canonical_text_and_searches_only_sanitized_fts() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let db_path = dir.path().join("agentark.db");
+    let mut db = IndexDb::open(&db_path, keys.sqlcipher_key()).unwrap();
+    let (install, session, _sanitized) = fixture();
+    let body = "[REDACTED:vendor-token]";
+    let title = "[REDACTED:vendor-token]";
+    let canonical_hash = canonical_hash("session", &session).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &session,
+        source_records: &[],
+        sanitized_title: title,
+        sanitized_body: body,
+        findings: &[],
+        canonical_hash: &canonical_hash,
+    })
+    .unwrap();
+    let file = fs::read(db_path).unwrap();
+    assert!(
+        !file
+            .windows("CanonicalVisibleCanary".len())
+            .any(|window| window == b"CanonicalVisibleCanary")
+    );
+    assert_eq!(db.search("vendor-token", 10).unwrap().len(), 1);
+    assert_eq!(db.search("CanonicalVisibleCanary", 10).unwrap().len(), 0);
+    assert!(db.cipher_version().unwrap().starts_with("4."));
+    assert!(db.fts5_enabled().unwrap());
+}
