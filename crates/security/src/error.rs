@@ -12,4 +12,6 @@ pub enum SecurityError {
     NonUtf8Path,
     #[error("security I/O operation failed")]
     Io(#[from] std::io::Error),
+    #[error("secret rule set is invalid")]
+    SecretRuleInvalid,
 }

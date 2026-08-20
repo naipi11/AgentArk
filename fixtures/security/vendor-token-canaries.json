@@ -1,0 +1,6 @@
+[
+  {"class":"openai","value":"sk-proj-AgentArkCanaryValue1234567890"},
+  {"class":"github","value":"ghp_AgentArkCanaryValue1234567890"},
+  {"class":"aws","value":"AKIAAGENTARKCANARY12"},
+  {"class":"uri","value":"https://agentark:AgentArkCanaryValue@example.invalid/"}
+]
