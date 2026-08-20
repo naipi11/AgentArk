@@ -198,6 +198,7 @@ impl SourceAdapter for SyntheticAdapter {
         let text = String::from_utf8(record.bytes.clone()).map_err(|_| {
             AdapterError::InvalidData("synthetic fixture is not valid UTF-8".into())
         })?;
+        let record_hash = Sha256Digest::from_bytes(&record.bytes);
         let mut messages = Vec::new();
         let mut tool_events = Vec::new();
         let mut source_session_id = None;
@@ -278,7 +279,7 @@ impl SourceAdapter for SyntheticAdapter {
                             attachment_id: None,
                             raw_extra: BTreeMap::new(),
                         }],
-                        raw_ref: raw_hash,
+                        raw_ref: record_hash.clone(),
                     });
                 }
                 Some("tool") => {
@@ -307,7 +308,7 @@ impl SourceAdapter for SyntheticAdapter {
                             .get("output")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
-                        raw_ref: raw_hash,
+                        raw_ref: record_hash.clone(),
                     });
                 }
                 _ => {
