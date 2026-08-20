@@ -163,15 +163,17 @@ impl DatasetBootstrap {
         let aad = format!("agentark:v1:dataset-key:{}", self.dataset_id);
         let nonce = XNonce::try_from(nonce_bytes.as_slice())
             .map_err(|_| SecurityError::KeyOperationFailed)?;
-        let plaintext = cipher
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: &ciphertext,
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|_| SecurityError::KeyOperationFailed)?;
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: &ciphertext,
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|_| SecurityError::KeyOperationFailed)?,
+        );
         let mut dataset_key = Zeroizing::new([0u8; 32]);
         if plaintext.len() != dataset_key.len() {
             return Err(SecurityError::KeyOperationFailed);
