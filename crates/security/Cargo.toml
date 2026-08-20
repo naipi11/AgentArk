@@ -6,3 +6,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+dunce.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
