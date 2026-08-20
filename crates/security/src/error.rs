@@ -14,4 +14,10 @@ pub enum SecurityError {
     Io(#[from] std::io::Error),
     #[error("secret rule set is invalid")]
     SecretRuleInvalid,
+    #[error("master key is unavailable")]
+    MasterKeyUnavailable,
+    #[error("master key has an invalid length")]
+    InvalidMasterKeyLength,
+    #[error("key wrapping or derivation failed")]
+    KeyOperationFailed,
 }
