@@ -64,6 +64,7 @@ Pin these exact versions in workspace manifests:
 | serde_jcs | 0.2.0 | default |
 | time | 0.3.55 | `formatting,parsing,serde,serde-well-known` |
 | directories | 6.0.0 | default |
+| cap-std | 4.0.2 | default |
 | libfuzzer-sys | 0.4.13 | default |
 | tauri | 2.11.5 | `tracing` |
 | tauri-build | 2.6.3 | default |
@@ -218,6 +219,7 @@ dunce = "=1.0.5"
 serde_jcs = "=0.2.0"
 time = { version = "=0.3.55", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 directories = "=6.0.0"
+cap-std = "=4.0.2"
 tauri = { version = "=2.11.5", features = ["tracing"] }
 tauri-build = "=2.6.3"
 ```
@@ -359,6 +361,12 @@ fn identities_are_stable_and_message_ordinals_are_distinct() {
         message_id(session, Some("item_1"), 1, &raw),
         message_id(session, Some("item_1"), 99, &raw)
     );
+    assert_eq!(install.to_string(), "6cbb4aa8-a0ec-5855-8f90-cc73a3ecb980");
+    assert_eq!(session.to_string(), "74488c15-b9ac-5572-b6cd-94eca4eaa7a9");
+    assert_eq!(
+        message_id(session, Some("item_1"), 1, &raw).to_string(),
+        "a9c86930-ddd6-538c-949b-82762e81709c"
+    );
 }
 
 #[derive(Serialize)]
@@ -375,6 +383,23 @@ fn canonical_hash_is_key_order_independent_and_domain_separated() {
     assert_ne!(session_hash, message_hash);
     assert!(session_hash.as_str().starts_with("sha256:"));
     assert_eq!(session_hash.as_str().len(), 71);
+}
+
+#[test]
+fn canonical_hash_uses_jcs_key_order_and_known_answer() {
+    let mut first = serde_json::Map::new();
+    first.insert("b".into(), serde_json::Value::from(7));
+    first.insert("a".into(), serde_json::Value::from("x"));
+    let mut second = serde_json::Map::new();
+    second.insert("a".into(), serde_json::Value::from("x"));
+    second.insert("b".into(), serde_json::Value::from(7));
+    let first_hash = canonical_hash("session", &first).unwrap();
+    let second_hash = canonical_hash("session", &second).unwrap();
+    assert_eq!(first_hash, second_hash);
+    assert_eq!(
+        first_hash.as_str(),
+        "sha256:507bd3957d5890938190600e935dc1b7c4d6b319a6f8735eb53fd99038dc16e1"
+    );
 }
 ```
 
@@ -578,6 +603,21 @@ use crate::Sha256Digest;
 
 pub const CANONICAL_SCHEMA_VERSION: &str = "0.1.0";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum CanonicalSchemaVersion {
+    #[serde(rename = "0.1.0")]
+    V0_1_0,
+}
+
+impl CanonicalSchemaVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V0_1_0 => CANONICAL_SCHEMA_VERSION,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentKind { Codex }
@@ -619,7 +659,7 @@ pub struct Workspace {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalSession {
-    pub schema_version: String,
+    pub schema_version: CanonicalSchemaVersion,
     pub id: Uuid,
     pub install_id: Uuid,
     pub source_session_id: String,
@@ -746,11 +786,11 @@ git commit -m "feat: define canonical session schema"
 - Test: `crates/security/tests/path_policy.rs`
 
 **Interfaces:**
-- Consumes: `dunce`, `url`, and standard filesystem metadata.
+- Consumes: `cap-std`, `dunce`, and standard filesystem metadata.
 - Produces:
   - `AuthorizedRoot::new(root: PathBuf) -> Result<AuthorizedRoot, SecurityError>`
   - `AuthorizedRoot::resolve_existing(&self, relative: &Path) -> Result<PathBuf, SecurityError>`
-  - `AuthorizedRoot::open_regular_file(&self, relative: &Path) -> Result<File, SecurityError>`
+  - `AuthorizedRoot::open_regular_file(&self, relative: &Path) -> Result<cap_std::fs::File, SecurityError>`
   - `validate_relative_lexical(value: &str) -> Result<(), SecurityError>`
   - `PathClass::{Local, Unc, Device, AlternateDataStream, Traversal, ReparsePoint, Symlink}`
 
@@ -835,7 +875,17 @@ pub fn classify_windows_path(value: &str) -> PathClass {
 }
 ```
 
-`AuthorizedRoot::new` requires an existing absolute local directory and stores `dunce::canonicalize(root)`. `resolve_existing` rejects absolute input and every non-`Local` lexical class, walks each component with `symlink_metadata`, rejects symlinks, and on Windows rejects `FILE_ATTRIBUTE_REPARSE_POINT (0x400)`. The final canonical path must start with the canonical root plus a component boundary.
+`AuthorizedRoot::new` rejects a symlink/reparse root, canonicalizes it once, and
+opens a `cap_std::fs::Dir` capability handle with ambient authority. The handle
+is retained for the lifetime of the root. `resolve_existing` rejects absolute
+input and every non-`Local` lexical class, checks relative handle metadata, and
+returns a canonical path only for diagnostics. `open_regular_file` never
+reopens an absolute path: it checks relative handle metadata, opens through
+`Dir::open`, checks the opened file metadata and the relative entry again, and
+returns the handle-backed `cap_std::fs::File`. This closes the
+check-by-name/open-by-name TOCTOU while cap-std rejects a symlink escape outside
+the capability directory. On Windows it rejects `FILE_ATTRIBUTE_REPARSE_POINT
+(0x400)`.
 
 `validate_relative_lexical` rejects empty strings, absolute/prefixed/rooted
 paths, `.` and `..` components, and every non-`Local` Windows class. It accepts
@@ -878,7 +928,7 @@ the pure test is mandatory and requires no junction-creation privilege.
 cargo test -p agentark-security --test path_policy
 cargo clippy -p agentark-security --all-targets -- -D warnings
 git diff --check
-git add -- crates/security/Cargo.toml crates/security/src/lib.rs crates/security/src/error.rs crates/security/src/path.rs crates/security/tests/path_policy.rs
+git add -- Cargo.lock Cargo.toml crates/security/Cargo.toml crates/security/src/lib.rs crates/security/src/error.rs crates/security/src/path.rs crates/security/tests/path_policy.rs docs/superpowers/plans/2026-08-20-agentark-m0-codex-l0.md
 git commit -m "feat: enforce authorized source roots"
 ```
 
@@ -954,7 +1004,9 @@ const RULE_VERSION: &str = "agentark-secret-rules-v1";
 const RULES: &[(&str, SecretClass)] = &[
     (r"(?is)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", SecretClass::PrivateKey),
     (r"(?im)^(authorization|cookie)\s*:\s*[^\r\n]+", SecretClass::Authorization),
-    (r#"(?i)\b(token|access_token|refresh_token|api_key|secret|password|authorization)\b\s*[:=]\s*["']?[^\s"',}]+"#, SecretClass::StructuredValue),
+    (r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*"(?:\\.|[^"\\])*""#, SecretClass::StructuredValue),
+    (r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*'(?:\\.|[^'\\])*'"#, SecretClass::StructuredValue),
+    (r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*[^\s"',}]+"#, SecretClass::StructuredValue),
     (r"(?i)https?://[^/\s:@]+:[^@\s/]+@", SecretClass::UriUserInfo),
     (r"\bsk-[A-Za-z0-9_-]{20,}\b", SecretClass::VendorToken),
     (r"\bghp_[A-Za-z0-9]{20,}\b", SecretClass::VendorToken),
@@ -1025,7 +1077,7 @@ git commit -m "feat: sanitize secret-bearing projections"
 - Test: `crates/security/tests/key_management.rs`
 
 **Interfaces:**
-- Consumes: `keyring`, `getrandom`, `hkdf`, `sha2`, `chacha20poly1305`, `hex`, `zeroize`.
+- Consumes: `keyring`, `getrandom`, `hkdf`, `sha2`, `chacha20poly1305`, `hex`, `uuid`, `serde`, and `zeroize`.
 - Produces:
   - `MasterKeyStore::{load, store}`
   - `OsMasterKeyStore::new(machine_id: Uuid)`
@@ -1083,7 +1135,7 @@ Define:
 
 ```rust
 pub trait MasterKeyStore: Send + Sync {
-    fn load(&self) -> Result<Zeroizing<[u8; 32]>, SecurityError>;
+    fn load(&self) -> Result<Zeroizing<Vec<u8>>, SecurityError>;
     fn store(&self, key: &[u8; 32]) -> Result<(), SecurityError>;
 }
 ```
@@ -1094,7 +1146,12 @@ pub trait MasterKeyStore: Send + Sync {
 let entry = keyring::Entry::new("dev.agentark.master-key", &machine_id.to_string())?;
 ```
 
-Use `Entry::get_secret` and `Entry::set_secret`. Accept exactly 32 bytes; any other length returns `SecurityError::InvalidMasterKeyLength`. Map a missing credential to `MasterKeyUnavailable` and never create a replacement while unlocking an existing bootstrap.
+Use `Entry::get_secret` and `Entry::set_secret`. Wrap returned bytes in
+`Zeroizing<Vec<u8>>`, accept exactly 32 bytes, and copy only into
+`Zeroizing<[u8; 32]>` buffers. Map `keyring::Error::NoEntry` to
+`MasterKeyUnavailable`, map all other backend errors to
+`MasterKeyStoreUnavailable`, and never create a replacement for the latter.
+Reject `DatasetBootstrap.format_version != 1` before decrypting.
 
 - [ ] **Step 4: Implement wrapping and subkey derivation**
 

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use agentark_canonical::{
-    CanonicalMessage, CanonicalRole, ContentPart, ContentPartKind, Sha256Digest,
+    CanonicalMessage, CanonicalRole, CanonicalSchemaVersion, CanonicalSession, Completeness,
+    ContentPart, ContentPartKind, Sha256Digest,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -39,4 +40,30 @@ fn ordinal_is_not_derived_from_timestamp() {
     messages.sort_by_key(|message| message.ordinal);
     assert_eq!(messages[0].visible_text(), "first");
     assert_eq!(messages[1].visible_text(), "second");
+}
+
+#[test]
+fn rejects_unknown_schema_version() {
+    let session = CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: Uuid::nil(),
+        install_id: Uuid::nil(),
+        source_session_id: "fixture".into(),
+        source_kind: "synthetic".into(),
+        workspace: None,
+        title: None,
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: None,
+        model_name: None,
+        completeness: Completeness::Complete,
+        messages: Vec::new(),
+        tool_events: Vec::new(),
+        attachments: Vec::new(),
+        raw_extra: BTreeMap::new(),
+    };
+    let mut value = serde_json::to_value(session).unwrap();
+    value["schemaVersion"] = json!("9.9.9");
+    assert!(serde_json::from_value::<CanonicalSession>(value).is_err());
 }

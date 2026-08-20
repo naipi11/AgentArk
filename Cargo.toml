@@ -49,5 +49,6 @@ dunce = "=1.0.5"
 serde_jcs = "=0.2.0"
 time = { version = "=0.3.55", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 directories = "=6.0.0"
+cap-std = "=4.0.2"
 tauri = { version = "=2.11.5", features = ["tracing"] }
 tauri-build = "=2.6.3"

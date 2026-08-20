@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "schemaVersion": {
-      "type": "string"
+      "$ref": "#/$defs/CanonicalSchemaVersion"
     },
     "id": {
       "type": "string"
@@ -101,6 +101,12 @@
     "rawExtra"
   ],
   "$defs": {
+    "CanonicalSchemaVersion": {
+      "type": "string",
+      "enum": [
+        "0.1.0"
+      ]
+    },
     "Workspace": {
       "type": "object",
       "properties": {

@@ -12,13 +12,13 @@ use zeroize::Zeroizing;
 use crate::SecurityError;
 
 pub trait MasterKeyStore: Send + Sync {
-    fn load(&self) -> Result<Zeroizing<[u8; 32]>, SecurityError>;
+    fn load(&self) -> Result<Zeroizing<Vec<u8>>, SecurityError>;
     fn store(&self, key: &[u8; 32]) -> Result<(), SecurityError>;
 }
 
 #[derive(Clone, Default)]
 pub struct MemoryMasterKeyStore {
-    key: Arc<Mutex<Option<[u8; 32]>>>,
+    key: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
 }
 
 impl MemoryMasterKeyStore {
@@ -28,15 +28,14 @@ impl MemoryMasterKeyStore {
 }
 
 impl MasterKeyStore for MemoryMasterKeyStore {
-    fn load(&self) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    fn load(&self) -> Result<Zeroizing<Vec<u8>>, SecurityError> {
         let guard = self
             .key
             .lock()
             .map_err(|_| SecurityError::KeyOperationFailed)?;
         guard
             .as_ref()
-            .copied()
-            .map(Zeroizing::new)
+            .map(|key| Zeroizing::new(key.to_vec()))
             .ok_or(SecurityError::MasterKeyUnavailable)
     }
 
@@ -45,7 +44,7 @@ impl MasterKeyStore for MemoryMasterKeyStore {
             .key
             .lock()
             .map_err(|_| SecurityError::KeyOperationFailed)?;
-        *guard = Some(*key);
+        *guard = Some(Zeroizing::new(*key));
         Ok(())
     }
 }
@@ -57,27 +56,27 @@ pub struct OsMasterKeyStore {
 impl OsMasterKeyStore {
     pub fn new(machine_id: Uuid) -> Result<Self, SecurityError> {
         let entry = keyring::Entry::new("dev.agentark.master-key", &machine_id.to_string())
-            .map_err(|_| SecurityError::KeyOperationFailed)?;
+            .map_err(|_| SecurityError::MasterKeyStoreUnavailable)?;
         Ok(Self { entry })
     }
 }
 
 impl MasterKeyStore for OsMasterKeyStore {
-    fn load(&self) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
-        let bytes = self
-            .entry
-            .get_secret()
-            .map_err(|_| SecurityError::MasterKeyUnavailable)?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| SecurityError::InvalidMasterKeyLength)?;
-        Ok(Zeroizing::new(key))
+    fn load(&self) -> Result<Zeroizing<Vec<u8>>, SecurityError> {
+        let bytes = self.entry.get_secret().map_err(|error| match error {
+            keyring::Error::NoEntry => SecurityError::MasterKeyUnavailable,
+            _ => SecurityError::MasterKeyStoreUnavailable,
+        })?;
+        if bytes.len() != 32 {
+            return Err(SecurityError::InvalidMasterKeyLength);
+        }
+        Ok(Zeroizing::new(bytes))
     }
 
     fn store(&self, key: &[u8; 32]) -> Result<(), SecurityError> {
         self.entry
             .set_secret(key)
-            .map_err(|_| SecurityError::KeyOperationFailed)
+            .map_err(|_| SecurityError::MasterKeyStoreUnavailable)
     }
 }
 
@@ -117,27 +116,27 @@ impl DatasetKeys {
 
 impl DatasetBootstrap {
     pub fn create(dataset_id: Uuid, store: &dyn MasterKeyStore) -> Result<Self, SecurityError> {
-        let master = match store.load() {
+        let master = match load_master_key(store) {
             Ok(key) => key,
             Err(SecurityError::MasterKeyUnavailable) => {
                 let key = random_key()?;
                 store.store(&key)?;
-                Zeroizing::new(key)
+                key
             }
             Err(error) => return Err(error),
         };
         let dataset_key = random_key()?;
-        let mut nonce = [0u8; 24];
-        getrandom::fill(&mut nonce).map_err(|_| SecurityError::KeyOperationFailed)?;
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes).map_err(|_| SecurityError::KeyOperationFailed)?;
         let cipher = XChaCha20Poly1305::new((&*master).into());
         let aad = format!("agentark:v1:dataset-key:{dataset_id}");
-        let nonce =
-            XNonce::try_from(nonce.as_slice()).map_err(|_| SecurityError::KeyOperationFailed)?;
+        let nonce = XNonce::try_from(nonce_bytes.as_slice())
+            .map_err(|_| SecurityError::KeyOperationFailed)?;
         let encrypted = cipher
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: &dataset_key,
+                    msg: &*dataset_key,
                     aad: aad.as_bytes(),
                 },
             )
@@ -151,15 +150,20 @@ impl DatasetBootstrap {
     }
 
     pub fn unlock(&self, store: &dyn MasterKeyStore) -> Result<DatasetKeys, SecurityError> {
-        let master = store.load()?;
-        let nonce = decode_fixed::<24>(&self.wrap_nonce_hex)?;
-        let ciphertext = hex::decode(&self.wrapped_dataset_key_hex)
-            .map_err(|_| SecurityError::KeyOperationFailed)?;
+        let master = load_master_key(store)?;
+        if self.format_version != 1 {
+            return Err(SecurityError::KeyOperationFailed);
+        }
+        let nonce_bytes = decode_fixed::<24>(&self.wrap_nonce_hex)?;
+        let ciphertext = Zeroizing::new(
+            hex::decode(&self.wrapped_dataset_key_hex)
+                .map_err(|_| SecurityError::KeyOperationFailed)?,
+        );
         let cipher = XChaCha20Poly1305::new((&*master).into());
         let aad = format!("agentark:v1:dataset-key:{}", self.dataset_id);
-        let nonce =
-            XNonce::try_from(nonce.as_slice()).map_err(|_| SecurityError::KeyOperationFailed)?;
-        let dataset_key = cipher
+        let nonce = XNonce::try_from(nonce_bytes.as_slice())
+            .map_err(|_| SecurityError::KeyOperationFailed)?;
+        let plaintext = cipher
             .decrypt(
                 &nonce,
                 Payload {
@@ -168,9 +172,11 @@ impl DatasetBootstrap {
                 },
             )
             .map_err(|_| SecurityError::KeyOperationFailed)?;
-        let dataset_key: [u8; 32] = dataset_key
-            .try_into()
-            .map_err(|_| SecurityError::KeyOperationFailed)?;
+        let mut dataset_key = Zeroizing::new([0u8; 32]);
+        if plaintext.len() != dataset_key.len() {
+            return Err(SecurityError::KeyOperationFailed);
+        }
+        dataset_key.copy_from_slice(&plaintext);
         Ok(DatasetKeys {
             dataset_id: self.dataset_id,
             sqlcipher_key: derive_key(&dataset_key, self.dataset_id, b"agentark-v1-sqlcipher")?,
@@ -180,9 +186,19 @@ impl DatasetBootstrap {
     }
 }
 
-fn random_key() -> Result<[u8; 32], SecurityError> {
-    let mut key = [0u8; 32];
-    getrandom::fill(&mut key).map_err(|_| SecurityError::KeyOperationFailed)?;
+fn random_key() -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *key).map_err(|_| SecurityError::KeyOperationFailed)?;
+    Ok(key)
+}
+
+fn load_master_key(store: &dyn MasterKeyStore) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    let bytes = store.load()?;
+    if bytes.len() != 32 {
+        return Err(SecurityError::InvalidMasterKeyLength);
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&bytes);
     Ok(key)
 }
 

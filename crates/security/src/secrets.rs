@@ -64,7 +64,15 @@ impl SecretScanner {
                 SecretClass::Authorization,
             ),
             (
-                r#"(?i)\b(token|access_token|refresh_token|api_key|secret|password|authorization)\b\s*[:=]\s*["']?[^\s"',}]+"#,
+                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*"(?:\\.|[^"\\])*""#,
+                SecretClass::StructuredValue,
+            ),
+            (
+                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*'(?:\\.|[^'\\])*'"#,
+                SecretClass::StructuredValue,
+            ),
+            (
+                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*[^\s"',}]+"#,
                 SecretClass::StructuredValue,
             ),
             (

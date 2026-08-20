@@ -55,3 +55,14 @@ fn serialized_diagnostic_contains_no_original_secret_value() {
     assert!(!diagnostic.contains("AgentArkDiagnosticCanary"));
     assert!(diagnostic.contains("authorization"));
 }
+
+#[test]
+fn quoted_structured_secrets_with_spaces_and_escaped_quotes_are_fully_redacted() {
+    let input = r#"password = "horse battery staple"
+token: "alpha\" beta"
+{"api_key":"first second"}"#;
+    let sanitized = SecretScanner::v1().unwrap().sanitize(input);
+    assert!(!sanitized.text.contains("horse battery staple"));
+    assert!(!sanitized.text.contains("alpha\\\" beta"));
+    assert!(!sanitized.text.contains("first second"));
+}

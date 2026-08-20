@@ -16,6 +16,8 @@ pub enum SecurityError {
     SecretRuleInvalid,
     #[error("master key is unavailable")]
     MasterKeyUnavailable,
+    #[error("master key store is unavailable")]
+    MasterKeyStoreUnavailable,
     #[error("master key has an invalid length")]
     InvalidMasterKeyLength,
     #[error("key wrapping or derivation failed")]

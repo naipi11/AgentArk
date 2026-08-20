@@ -9,6 +9,21 @@ use crate::Sha256Digest;
 
 pub const CANONICAL_SCHEMA_VERSION: &str = "0.1.0";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum CanonicalSchemaVersion {
+    #[serde(rename = "0.1.0")]
+    V0_1_0,
+}
+
+impl CanonicalSchemaVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V0_1_0 => CANONICAL_SCHEMA_VERSION,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentKind {
@@ -70,7 +85,7 @@ pub struct Workspace {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalSession {
-    pub schema_version: String,
+    pub schema_version: CanonicalSchemaVersion,
     #[schemars(with = "String")]
     pub id: Uuid,
     #[schemars(with = "String")]
