@@ -5,13 +5,14 @@ use agentark_canonical::{
 use agentark_cas::{ArtifactStore, ObjectType};
 use agentark_index::{
     QuarantineRecord, ScanManifest, ScanManifestStatus, SessionIndex, SessionIngest,
+    VerificationRecord,
 };
 use agentark_security::{SecretFinding, SecretScanner};
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{AppError, VerificationJournal};
+use crate::{AppError, VerificationJournal, VerificationService};
 
 #[derive(Clone, Debug)]
 pub struct ScanRequest {
@@ -74,6 +75,10 @@ where
         self.journal.clone()
     }
 
+    pub fn into_parts(self) -> (A, C, I, VerificationJournal) {
+        (self.adapter, self.cas, self.index, self.journal)
+    }
+
     pub fn run(&mut self, request: ScanRequest) -> Result<ScanReport, AppError> {
         let scan_id = Uuid::new_v4();
         let initial_snapshot = request
@@ -107,6 +112,17 @@ where
         for record in batch.records {
             let stored = self.cas.put(ObjectType::AgentRawRecord, &record.bytes)?;
             self.journal.record(scan_id, stored.clone());
+            self.index.record_verification(VerificationRecord {
+                scan_id,
+                object_id: stored.object_id.clone(),
+                object_type: stored.object_type.as_byte(),
+                plaintext_hash: stored.plaintext_hash.clone(),
+                size: stored.size,
+                session_json: None,
+                canonical_hash: None,
+                sanitized_title: None,
+                sanitized_body: None,
+            })?;
             let outcome = self.adapter.normalize(&record)?;
             match outcome {
                 NormalizeOutcome::Normalized(session) => {
@@ -132,6 +148,17 @@ where
                         sanitized_title.clone(),
                         sanitized_body.clone(),
                     );
+                    self.index.record_verification(VerificationRecord {
+                        scan_id,
+                        object_id: stored.object_id.clone(),
+                        object_type: stored.object_type.as_byte(),
+                        plaintext_hash: stored.plaintext_hash.clone(),
+                        size: stored.size,
+                        session_json: Some(serde_json::to_string(&session)?),
+                        canonical_hash: Some(canonical_hash.clone()),
+                        sanitized_title: Some(sanitized_title.clone()),
+                        sanitized_body: Some(sanitized_body.clone()),
+                    })?;
                     self.index.ingest_session(SessionIngest {
                         install: &request.install,
                         session: &session,
@@ -171,6 +198,13 @@ where
         } else {
             ScanStatus::Partial
         };
+        let verification =
+            VerificationService::new(&self.cas, self.journal.clone()).verify_scan(scan_id)?;
+        if !verification.passed {
+            return Err(AppError::Invariant(
+                "scan verification failed before manifest publication".into(),
+            ));
+        }
         self.index.finish_scan(&ScanManifest {
             id: scan_id,
             status: match status {

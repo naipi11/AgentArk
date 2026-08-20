@@ -1,11 +1,13 @@
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::IndexError;
 
 pub struct IndexDb {
     connection: Connection,
+    active_scan_id: Option<uuid::Uuid>,
 }
 
 impl IndexDb {
@@ -36,7 +38,10 @@ impl IndexDb {
             return Err(IndexError::UnsupportedStorageBuild);
         }
         connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            active_scan_id: None,
+        })
     }
 
     pub fn connection(&self) -> &Connection {
@@ -45,6 +50,14 @@ impl IndexDb {
 
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+
+    pub(crate) fn active_scan_id(&self) -> Option<uuid::Uuid> {
+        self.active_scan_id
+    }
+
+    pub(crate) fn set_active_scan_id(&mut self, scan_id: Option<uuid::Uuid>) {
+        self.active_scan_id = scan_id;
     }
 
     pub fn cipher_version(&self) -> Result<String, IndexError> {
@@ -59,5 +72,54 @@ impl IndexDb {
             [],
             |row| row.get::<_, i64>(0),
         )? == 1)
+    }
+
+    pub fn verification_records(
+        &self,
+        scan_id: Uuid,
+    ) -> Result<Vec<crate::VerificationRecord>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT object_id, object_type, plaintext_hash, size, session_json,
+                    canonical_hash, sanitized_title, sanitized_body
+             FROM verification_records WHERE scan_id = ?1 ORDER BY object_id ASC",
+        )?;
+        let rows = statement.query_map(params![scan_id.to_string()], |row| {
+            let object_type = row.get::<_, i64>(1)?;
+            let plaintext_hash = row.get::<_, String>(2)?;
+            let size = row.get::<_, i64>(3)?;
+            let canonical_hash = match row.get::<_, Option<String>>(5)? {
+                Some(value) => Some(agentark_canonical::Sha256Digest::parse(&value).ok_or_else(
+                    || {
+                        rusqlite::Error::InvalidColumnType(
+                            5,
+                            "canonical_hash".into(),
+                            rusqlite::types::Type::Text,
+                        )
+                    },
+                )?),
+                None => None,
+            };
+            Ok(crate::VerificationRecord {
+                scan_id,
+                object_id: row.get(0)?,
+                object_type: u8::try_from(object_type)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, object_type))?,
+                plaintext_hash: agentark_canonical::Sha256Digest::parse(&plaintext_hash)
+                    .ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            2,
+                            "plaintext_hash".into(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?,
+                size: u64::try_from(size)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, size))?,
+                session_json: row.get(4)?,
+                canonical_hash,
+                sanitized_title: row.get(6)?,
+                sanitized_body: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }

@@ -47,6 +47,19 @@ pub struct ScanManifest {
     pub rejected_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationRecord {
+    pub scan_id: Uuid,
+    pub object_id: String,
+    pub object_type: u8,
+    pub plaintext_hash: Sha256Digest,
+    pub size: u64,
+    pub session_json: Option<String>,
+    pub canonical_hash: Option<Sha256Digest>,
+    pub sanitized_title: Option<String>,
+    pub sanitized_body: Option<String>,
+}
+
 pub trait SessionIndex {
     fn begin_scan(
         &mut self,
@@ -58,6 +71,12 @@ pub trait SessionIndex {
     fn record_quarantine(&mut self, record: QuarantineRecord) -> Result<(), IndexError>;
     fn finish_scan(&mut self, manifest: &ScanManifest) -> Result<(), IndexError>;
     fn fail_scan(&mut self, scan_id: Uuid) -> Result<(), IndexError>;
+    fn mark_scan_stale(&mut self, _scan_id: Uuid) -> Result<(), IndexError> {
+        Ok(())
+    }
+    fn record_verification(&mut self, _record: VerificationRecord) -> Result<(), IndexError> {
+        Ok(())
+    }
 }
 
 impl SessionIndex for IndexDb {
@@ -72,6 +91,7 @@ impl SessionIndex for IndexDb {
              VALUES (?1, ?2, ?3, 'running', ?4)",
             params![scan_id.to_string(), adapter_id, snapshot_id, now_string(),],
         )?;
+        self.set_active_scan_id(Some(scan_id));
         Ok(())
     }
 
@@ -87,9 +107,20 @@ impl SessionIndex for IndexDb {
                 return Err(IndexError::InvariantViolation);
             }
         }
+        let ordered = input
+            .session
+            .messages
+            .iter()
+            .map(|message| message.ordinal)
+            .chain(input.session.tool_events.iter().map(|event| event.ordinal))
+            .collect::<Vec<_>>();
+        if ordered.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(IndexError::InvariantViolation);
+        }
         let canonical_json = serde_json::to_string(input.session)?;
         let capabilities_json = serde_json::to_string(&input.install.capabilities)?;
         let install_json = serde_json::to_string(&input.install.kind)?;
+        let active_scan_id = self.active_scan_id().map(|scan_id| scan_id.to_string());
         let tx = self.connection_mut().transaction()?;
         let workspace_id = if let Some(workspace) = input.session.workspace.as_ref() {
             tx.execute(
@@ -149,13 +180,14 @@ impl SessionIndex for IndexDb {
         tx.execute(
             "INSERT INTO sessions(id, install_id, workspace_id, source_session_id, source_kind,
              title, archived, completeness, canonical_hash, canonical_json, search_title,
-             search_body, model_provider, model_name, revision, stale)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)
+             search_body, model_provider, model_name, revision, stale, last_scan_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)
              ON CONFLICT(id) DO UPDATE SET title=excluded.title, archived=excluded.archived,
                completeness=excluded.completeness, canonical_hash=excluded.canonical_hash,
                canonical_json=excluded.canonical_json, search_title=excluded.search_title,
                search_body=excluded.search_body, model_provider=excluded.model_provider,
-               model_name=excluded.model_name, revision=excluded.revision, stale=0",
+               model_name=excluded.model_name, revision=excluded.revision, stale=0,
+               last_scan_id=excluded.last_scan_id",
             params![
                 input.session.id.to_string(),
                 input.install.id.to_string(),
@@ -172,6 +204,7 @@ impl SessionIndex for IndexDb {
                 input.session.model_provider,
                 input.session.model_name,
                 prior_revision.unwrap_or(0) + 1,
+                active_scan_id,
             ],
         )?;
         for message in &input.session.messages {
@@ -290,9 +323,49 @@ impl SessionIndex for IndexDb {
     }
 
     fn fail_scan(&mut self, scan_id: Uuid) -> Result<(), IndexError> {
-        self.connection_mut().execute(
+        let tx = self.connection_mut().transaction()?;
+        tx.execute(
             "UPDATE scan_runs SET status = 'failed', completed_at = ?1 WHERE id = ?2",
             params![now_string(), scan_id.to_string()],
+        )?;
+        tx.execute("UPDATE sessions SET stale = 1", [])?;
+        tx.commit()?;
+        self.set_active_scan_id(None);
+        Ok(())
+    }
+
+    fn mark_scan_stale(&mut self, scan_id: Uuid) -> Result<(), IndexError> {
+        let _ = scan_id;
+        self.connection_mut()
+            .execute("UPDATE sessions SET stale = 1", [])?;
+        Ok(())
+    }
+
+    fn record_verification(&mut self, record: VerificationRecord) -> Result<(), IndexError> {
+        self.connection_mut().execute(
+            "INSERT INTO verification_records(
+               scan_id, object_id, object_type, plaintext_hash, size,
+               session_json, canonical_hash, sanitized_title, sanitized_body
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(scan_id, object_id) DO UPDATE SET
+               object_type=excluded.object_type,
+               plaintext_hash=excluded.plaintext_hash,
+               size=excluded.size,
+               session_json=COALESCE(excluded.session_json, verification_records.session_json),
+               canonical_hash=COALESCE(excluded.canonical_hash, verification_records.canonical_hash),
+               sanitized_title=COALESCE(excluded.sanitized_title, verification_records.sanitized_title),
+               sanitized_body=COALESCE(excluded.sanitized_body, verification_records.sanitized_body)",
+            params![
+                record.scan_id.to_string(),
+                record.object_id,
+                i64::from(record.object_type),
+                record.plaintext_hash.as_str(),
+                record.size as i64,
+                record.session_json,
+                record.canonical_hash.map(|hash| hash.as_str().to_owned()),
+                record.sanitized_title,
+                record.sanitized_body,
+            ],
         )?;
         Ok(())
     }

@@ -1,6 +1,6 @@
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_adapter_synthetic::SyntheticAdapter;
-use agentark_app::{ScanRequest, ScanService, ScanStatus};
+use agentark_app::{ScanRequest, ScanService, ScanStatus, VerificationService};
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
 use agentark_security::{DatasetBootstrap, MemoryMasterKeyStore, SecretScanner};
@@ -39,4 +39,10 @@ fn synthetic_scan_publishes_only_normalized_sessions() {
     assert_eq!(report.retryable, 1);
     assert_eq!(service.index().list_sessions(10, 0).unwrap().len(), 2);
     assert_eq!(service.index().search("world", 10).unwrap().len(), 2);
+    let scan_id = report.scan_id;
+    let (_adapter, cas, index, _journal) = service.into_parts();
+    let durable_report = VerificationService::new(cas, index)
+        .verify_scan(scan_id)
+        .unwrap();
+    assert!(durable_report.passed);
 }

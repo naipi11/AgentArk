@@ -8,4 +8,7 @@ mod write;
 pub use database::IndexDb;
 pub use error::IndexError;
 pub use query::{QuarantineSummary, SearchHit, SessionDetail, SessionQuery, SessionSummary};
-pub use write::{QuarantineRecord, ScanManifest, ScanManifestStatus, SessionIndex, SessionIngest};
+pub use write::{
+    QuarantineRecord, ScanManifest, ScanManifestStatus, SessionIndex, SessionIngest,
+    VerificationRecord,
+};

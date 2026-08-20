@@ -15,6 +15,14 @@ impl Sha256Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let hex_part = value.strip_prefix("sha256:")?;
+        if hex_part.len() != 64 || !hex_part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self(value.to_owned()))
+    }
 }
 
 #[derive(Debug, Error)]

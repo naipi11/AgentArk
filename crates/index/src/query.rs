@@ -83,7 +83,7 @@ impl SessionQuery for IndexDb {
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, IndexError> {
         let query = query.trim();
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Err(IndexError::InvalidQuery);
         }
         let escaped = query
             .split_whitespace()

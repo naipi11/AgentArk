@@ -1,7 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use agentark_canonical::Sha256Digest;
@@ -31,6 +31,16 @@ pub struct StoredObject {
 pub trait ArtifactStore {
     fn put(&self, object_type: ObjectType, plaintext: &[u8]) -> Result<StoredObject, CasError>;
     fn get(&self, object: &StoredObject) -> Result<Zeroizing<Vec<u8>>, CasError>;
+}
+
+impl<T: ArtifactStore + ?Sized> ArtifactStore for &T {
+    fn put(&self, object_type: ObjectType, plaintext: &[u8]) -> Result<StoredObject, CasError> {
+        (*self).put(object_type, plaintext)
+    }
+
+    fn get(&self, object: &StoredObject) -> Result<Zeroizing<Vec<u8>>, CasError> {
+        (*self).get(object)
+    }
 }
 
 pub struct EncryptedCas {
@@ -181,10 +191,24 @@ impl ArtifactStore for EncryptedCas {
                 return Err(CasError::Io(error));
             }
         }
+        if let Some(parent) = final_path.parent() {
+            sync_parent_dir(parent)?;
+        }
         Ok(object)
     }
 
     fn get(&self, object: &StoredObject) -> Result<Zeroizing<Vec<u8>>, CasError> {
         self.read_verified(object)
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> Result<(), CasError> {
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> Result<(), CasError> {
+    Ok(())
 }

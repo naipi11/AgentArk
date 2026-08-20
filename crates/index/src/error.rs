@@ -12,4 +12,6 @@ pub enum IndexError {
     InvariantViolation,
     #[error("index entity was not found")]
     NotFound,
+    #[error("index query is empty")]
+    InvalidQuery,
 }

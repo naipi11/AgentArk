@@ -52,6 +52,7 @@ CREATE TABLE sessions (
   model_name TEXT,
   revision INTEGER NOT NULL,
   stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0,1)),
+  last_scan_id TEXT,
   UNIQUE(install_id, source_session_id)
 );
 
@@ -119,6 +120,19 @@ CREATE TABLE secret_findings (
   rule_version TEXT NOT NULL,
   start_offset INTEGER NOT NULL,
   end_offset INTEGER NOT NULL
+);
+
+CREATE TABLE verification_records (
+  scan_id TEXT NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+  object_id TEXT NOT NULL,
+  object_type INTEGER NOT NULL,
+  plaintext_hash TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  session_json TEXT,
+  canonical_hash TEXT,
+  sanitized_title TEXT,
+  sanitized_body TEXT,
+  PRIMARY KEY(scan_id, object_id)
 );
 
 CREATE VIRTUAL TABLE session_fts USING fts5(

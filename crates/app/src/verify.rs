@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use agentark_canonical::{CanonicalSession, Sha256Digest, canonical_hash};
-use agentark_cas::{ArtifactStore, StoredObject};
+use agentark_cas::{ArtifactStore, ObjectType, StoredObject};
+use agentark_index::IndexDb;
 use agentark_security::SecretScanner;
 use serde::Serialize;
 use uuid::Uuid;
@@ -25,28 +26,36 @@ pub struct VerificationReport {
 
 #[derive(Clone, Default)]
 pub struct VerificationJournal {
-    objects: Arc<std::sync::Mutex<std::collections::BTreeMap<Uuid, Vec<VerificationEntry>>>>,
+    objects:
+        Arc<std::sync::Mutex<std::collections::BTreeMap<Uuid, Vec<VerificationEvidenceRecord>>>>,
 }
 
 #[derive(Clone)]
-struct VerificationEntry {
-    object: StoredObject,
-    session: Option<CanonicalSession>,
-    canonical_hash: Option<Sha256Digest>,
-    sanitized_title: Option<String>,
-    sanitized_body: Option<String>,
+pub struct VerificationEvidenceRecord {
+    pub object: StoredObject,
+    pub session: Option<CanonicalSession>,
+    pub canonical_hash: Option<Sha256Digest>,
+    pub sanitized_title: Option<String>,
+    pub sanitized_body: Option<String>,
+}
+
+pub trait VerificationEvidence {
+    fn records(&self, scan_id: Uuid) -> Result<Vec<VerificationEvidenceRecord>, AppError>;
 }
 
 impl VerificationJournal {
     pub fn record(&self, scan_id: Uuid, object: StoredObject) {
         if let Ok(mut guard) = self.objects.lock() {
-            guard.entry(scan_id).or_default().push(VerificationEntry {
-                object,
-                session: None,
-                canonical_hash: None,
-                sanitized_title: None,
-                sanitized_body: None,
-            });
+            guard
+                .entry(scan_id)
+                .or_default()
+                .push(VerificationEvidenceRecord {
+                    object,
+                    session: None,
+                    canonical_hash: None,
+                    sanitized_title: None,
+                    sanitized_body: None,
+                });
         }
     }
 
@@ -74,7 +83,7 @@ impl VerificationJournal {
         }
     }
 
-    fn objects(&self, scan_id: Uuid) -> Vec<VerificationEntry> {
+    fn objects(&self, scan_id: Uuid) -> Vec<VerificationEvidenceRecord> {
         self.objects
             .lock()
             .ok()
@@ -83,24 +92,64 @@ impl VerificationJournal {
     }
 }
 
-pub struct VerificationService<C> {
+impl VerificationEvidence for VerificationJournal {
+    fn records(&self, scan_id: Uuid) -> Result<Vec<VerificationEvidenceRecord>, AppError> {
+        Ok(self.objects(scan_id))
+    }
+}
+
+impl<T: VerificationEvidence + ?Sized> VerificationEvidence for &T {
+    fn records(&self, scan_id: Uuid) -> Result<Vec<VerificationEvidenceRecord>, AppError> {
+        (*self).records(scan_id)
+    }
+}
+
+impl VerificationEvidence for IndexDb {
+    fn records(&self, scan_id: Uuid) -> Result<Vec<VerificationEvidenceRecord>, AppError> {
+        self.verification_records(scan_id)?
+            .into_iter()
+            .map(|record| {
+                let object_type = ObjectType::from_byte(record.object_type)?;
+                let session = record
+                    .session_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?;
+                Ok(VerificationEvidenceRecord {
+                    object: StoredObject {
+                        object_id: record.object_id,
+                        object_type,
+                        plaintext_hash: record.plaintext_hash,
+                        size: record.size,
+                    },
+                    session,
+                    canonical_hash: record.canonical_hash,
+                    sanitized_title: record.sanitized_title,
+                    sanitized_body: record.sanitized_body,
+                })
+            })
+            .collect()
+    }
+}
+
+pub struct VerificationService<C, E = VerificationJournal> {
     cas: C,
-    journal: VerificationJournal,
+    evidence: E,
     scanner: SecretScanner,
 }
 
-impl<C: ArtifactStore> VerificationService<C> {
-    pub fn new(cas: C, journal: VerificationJournal) -> Self {
+impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
+    pub fn new(cas: C, evidence: E) -> Self {
         Self {
             cas,
-            journal,
+            evidence,
             scanner: SecretScanner::v1().expect("built-in secret rules are valid"),
         }
     }
 
     pub fn verify_scan(&self, scan_id: Uuid) -> Result<VerificationReport, AppError> {
         let mut failures = Vec::new();
-        for entry in self.journal.objects(scan_id) {
+        for entry in self.evidence.records(scan_id)? {
             let plaintext = match self.cas.get(&entry.object) {
                 Ok(plaintext) => plaintext,
                 Err(_) => {
