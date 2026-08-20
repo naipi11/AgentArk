@@ -1,0 +1,9 @@
+/target/
+/.worktrees/
+/node_modules/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/.tmp-*/
+*.db
+*.db-wal
+*.db-shm
