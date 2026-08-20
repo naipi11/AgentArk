@@ -8,6 +8,7 @@ members = [
   "crates/app",
   "crates/adapters/synthetic",
   "crates/adapters/codex",
+  "apps/desktop/src-tauri",
   "cli",
 ]
 resolver = "2"

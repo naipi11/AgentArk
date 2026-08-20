@@ -1,0 +1,11 @@
+{
+  "name": "agentark-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "engines": { "node": ">=24 <25", "pnpm": "11.22.0" },
+  "scripts": {
+    "desktop:dev": "pnpm --dir apps/desktop tauri dev",
+    "desktop:build": "pnpm --dir apps/desktop tauri build",
+    "desktop:test": "pnpm --dir apps/desktop test"
+  }
+}
