@@ -1,0 +1,11 @@
+schema_version = 1
+
+[[adapter]]
+agent = "codex"
+adapter_version = "0.1.0"
+codex_cli_version = "0.146.0"
+protocol = "app-server-v2"
+schema_sha256 = "fcb6b8b329c3436b4af8c5b180b7cb06f05cbcefdf31462aeefa579b0ca99cd"
+semantic_source = "app-server"
+filesystem_source = "raw-only"
+experimental_api = false
