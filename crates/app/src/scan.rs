@@ -46,6 +46,8 @@ pub struct ScanService<A, C, I> {
     scanner: SecretScanner,
     journal: VerificationJournal,
     pending_session_ids: Vec<Uuid>,
+    pending_source_session_ids: Vec<String>,
+    pending_install_id: Option<Uuid>,
 }
 
 impl<A, C, I> ScanService<A, C, I>
@@ -62,6 +64,8 @@ where
             scanner,
             journal: VerificationJournal::default(),
             pending_session_ids: Vec::new(),
+            pending_source_session_ids: Vec::new(),
+            pending_install_id: None,
         }
     }
 
@@ -83,6 +87,8 @@ where
 
     pub fn run(&mut self, request: ScanRequest) -> Result<ScanReport, AppError> {
         self.pending_session_ids.clear();
+        self.pending_source_session_ids.clear();
+        self.pending_install_id = Some(request.install.id);
         let scan_id = Uuid::new_v4();
         let initial_snapshot = request
             .snapshot_hint
@@ -97,8 +103,15 @@ where
             Ok(report) => Ok(report),
             Err(error) => {
                 let _ = self.index.mark_sessions_stale(&self.pending_session_ids);
+                if let Some(install_id) = self.pending_install_id {
+                    let _ = self
+                        .index
+                        .mark_source_sessions_stale(install_id, &self.pending_source_session_ids);
+                }
                 let _ = self.index.fail_scan(scan_id);
                 self.pending_session_ids.clear();
+                self.pending_source_session_ids.clear();
+                self.pending_install_id = None;
                 Err(error)
             }
         }
@@ -120,6 +133,14 @@ where
                 if !self.pending_session_ids.contains(&id) {
                     self.pending_session_ids.push(id);
                 }
+                if !self
+                    .pending_source_session_ids
+                    .iter()
+                    .any(|value| value == source_session_id)
+                {
+                    self.pending_source_session_ids
+                        .push(source_session_id.to_owned());
+                }
             }
             let stored = self.cas.put(ObjectType::AgentRawRecord, &record.bytes)?;
             self.journal.record(scan_id, stored.clone());
@@ -138,6 +159,9 @@ where
             match outcome {
                 NormalizeOutcome::Normalized(session) => {
                     let session = *session;
+                    if !self.pending_session_ids.contains(&session.id) {
+                        self.pending_session_ids.push(session.id);
+                    }
                     verify_raw_references(&session, &stored.plaintext_hash)?;
                     let (sanitized_title, sanitized_body, findings) =
                         sanitize_session(&self.scanner, &session);
@@ -209,12 +233,27 @@ where
         } else {
             ScanStatus::Partial
         };
-        let verification =
-            VerificationService::new(&self.cas, self.journal.clone()).verify_scan(scan_id)?;
+        let verification = VerificationService::new(&self.cas, self.journal.clone())
+            .verify_scan_before_publish(scan_id)?;
         if !verification.passed {
             return Err(AppError::Invariant(
                 "scan verification failed before manifest publication".into(),
             ));
+        }
+        if let Some(snapshot) = self.index.verification_snapshot(scan_id)? {
+            let verification = VerificationService::new(&self.cas, snapshot)
+                .verify_scan_before_publish(scan_id)?;
+            if !verification.passed {
+                return Err(AppError::Invariant(format!(
+                    "durable scan verification failed before manifest publication: {}",
+                    verification
+                        .failures
+                        .iter()
+                        .map(|failure| failure.code.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
         }
         self.index.finish_scan(&ScanManifest {
             id: scan_id,
@@ -230,6 +269,8 @@ where
             rejected_count: rejected,
         })?;
         self.pending_session_ids.clear();
+        self.pending_source_session_ids.clear();
+        self.pending_install_id = None;
         Ok(ScanReport {
             scan_id,
             status,

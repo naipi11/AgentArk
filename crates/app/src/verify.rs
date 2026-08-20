@@ -157,6 +157,12 @@ impl VerificationEvidence for IndexDb {
     }
 }
 
+impl VerificationEvidence for VerificationSnapshot {
+    fn snapshot(&self, _scan_id: Uuid) -> Result<VerificationEvidenceSnapshot, AppError> {
+        convert_index_snapshot(self.clone())
+    }
+}
+
 fn convert_index_snapshot(
     snapshot: VerificationSnapshot,
 ) -> Result<VerificationEvidenceSnapshot, AppError> {
@@ -230,6 +236,21 @@ impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
     }
 
     pub fn verify_scan(&self, scan_id: Uuid) -> Result<VerificationReport, AppError> {
+        self.verify_scan_internal(scan_id, false)
+    }
+
+    pub fn verify_scan_before_publish(
+        &self,
+        scan_id: Uuid,
+    ) -> Result<VerificationReport, AppError> {
+        self.verify_scan_internal(scan_id, true)
+    }
+
+    fn verify_scan_internal(
+        &self,
+        scan_id: Uuid,
+        allow_running: bool,
+    ) -> Result<VerificationReport, AppError> {
         let mut failures = Vec::new();
         let snapshot = self.evidence.snapshot(scan_id)?;
         if snapshot.status.as_deref() == Some("missing") {
@@ -238,13 +259,17 @@ impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
                 object_id: None,
             });
         }
-        if matches!(snapshot.status.as_deref(), Some("running" | "failed")) {
+        if snapshot.status.as_deref() == Some("failed")
+            || (!allow_running && snapshot.status.as_deref() == Some("running"))
+        {
             failures.push(VerificationFailure {
                 code: "scan-not-complete".into(),
                 object_id: None,
             });
         }
-        if snapshot.status.is_some() {
+        if snapshot.status.is_some()
+            && !(allow_running && snapshot.status.as_deref() == Some("running"))
+        {
             let expected_records = snapshot.indexed_count
                 + snapshot.quarantined_count
                 + snapshot.retryable_count

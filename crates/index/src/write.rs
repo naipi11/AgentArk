@@ -74,6 +74,19 @@ pub trait SessionIndex {
     fn mark_sessions_stale(&mut self, _session_ids: &[Uuid]) -> Result<(), IndexError> {
         Ok(())
     }
+    fn mark_source_sessions_stale(
+        &mut self,
+        _install_id: Uuid,
+        _source_session_ids: &[String],
+    ) -> Result<(), IndexError> {
+        Ok(())
+    }
+    fn verification_snapshot(
+        &self,
+        _scan_id: Uuid,
+    ) -> Result<Option<crate::VerificationSnapshot>, IndexError> {
+        Ok(None)
+    }
     fn record_verification(&mut self, _record: VerificationRecord) -> Result<(), IndexError> {
         Ok(())
     }
@@ -358,6 +371,30 @@ impl SessionIndex for IndexDb {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn mark_source_sessions_stale(
+        &mut self,
+        install_id: Uuid,
+        source_session_ids: &[String],
+    ) -> Result<(), IndexError> {
+        let tx = self.connection_mut().transaction()?;
+        for source_session_id in source_session_ids {
+            tx.execute(
+                "UPDATE sessions SET stale = 1
+                 WHERE install_id = ?1 AND source_session_id = ?2",
+                params![install_id.to_string(), source_session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn verification_snapshot(
+        &self,
+        scan_id: Uuid,
+    ) -> Result<Option<crate::VerificationSnapshot>, IndexError> {
+        Ok(Some(IndexDb::verification_snapshot(self, scan_id)?))
     }
 
     fn record_verification(&mut self, record: VerificationRecord) -> Result<(), IndexError> {

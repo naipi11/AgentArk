@@ -116,11 +116,15 @@ impl ArtifactStore for FixtureCas {
 struct FixtureIndex {
     events: Arc<Mutex<Vec<&'static str>>>,
     status: Arc<Mutex<Option<String>>>,
+    stale_sources: Arc<Mutex<Vec<String>>>,
     fail_ingest: bool,
 }
 impl FixtureIndex {
     fn last_scan_status(&self) -> Option<String> {
         self.status.lock().unwrap().clone()
+    }
+    fn stale_sources(&self) -> Vec<String> {
+        self.stale_sources.lock().unwrap().clone()
     }
 }
 impl SessionIndex for FixtureIndex {
@@ -158,6 +162,18 @@ impl SessionIndex for FixtureIndex {
         *self.status.lock().unwrap() = Some("failed".into());
         Ok(())
     }
+
+    fn mark_source_sessions_stale(
+        &mut self,
+        _install_id: Uuid,
+        source_session_ids: &[String],
+    ) -> Result<(), IndexError> {
+        self.stale_sources
+            .lock()
+            .unwrap()
+            .extend(source_session_ids.iter().cloned());
+        Ok(())
+    }
 }
 
 fn install() -> AgentInstall {
@@ -190,6 +206,7 @@ fn fixture_service(
         FixtureIndex {
             events,
             status: Arc::new(Mutex::new(None)),
+            stale_sources: Arc::new(Mutex::new(Vec::new())),
             fail_ingest: false,
         },
         SecretScanner::v1().unwrap(),
@@ -212,6 +229,7 @@ fn fixture_service_with_failing_index(
         FixtureIndex {
             events,
             status: Arc::new(Mutex::new(None)),
+            stale_sources: Arc::new(Mutex::new(Vec::new())),
             fail_ingest: true,
         },
         SecretScanner::v1().unwrap(),
@@ -258,4 +276,5 @@ fn index_failure_does_not_publish_a_complete_manifest() {
     let error = service.run(fixture_request()).unwrap_err();
     assert!(matches!(error, AppError::Index(_)));
     assert_eq!(service.index().last_scan_status(), Some("failed".into()));
+    assert_eq!(service.index().stale_sources(), vec!["fixture-session"]);
 }
