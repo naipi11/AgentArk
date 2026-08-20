@@ -3,6 +3,10 @@
 /node_modules/
 /apps/desktop/node_modules/
 /apps/desktop/dist/
+/apps/desktop/*.tsbuildinfo
+/apps/desktop/vite.config.js
+/apps/desktop/vite.config.d.ts
+/apps/desktop/src-tauri/gen/
 /.tmp-*/
 *.db
 *.db-wal
