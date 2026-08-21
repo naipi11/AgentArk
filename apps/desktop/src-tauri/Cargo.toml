@@ -19,6 +19,7 @@ tauri-build.workspace = true
 [dependencies]
 agentark-app = { path = "../../../crates/app" }
 agentark-adapter-codex = { path = "../../../crates/adapters/codex" }
+agentark-adapter-claude = { path = "../../../crates/adapters/claude" }
 agentark-adapter-sdk = { path = "../../../crates/adapter-sdk" }
 agentark-cas = { path = "../../../crates/cas" }
 agentark-index = { path = "../../../crates/index" }

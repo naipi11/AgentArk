@@ -63,6 +63,8 @@ export const api = {
   search: (query: string, limit = 50) => invoke<SearchHit[]>('search', { query, limit }),
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),
   codexDefaultRoot: () => invoke<string | null>('codex_default_root'),
+  claudeDefaultRoot: () => invoke<string | null>('claude_default_root'),
   scanCodex: (sourceRoot: string) => invoke<ScanReport>('scan_codex', { sourceRoot }),
+  scanClaude: (sourceRoot: string) => invoke<ScanReport>('scan_claude', { sourceRoot }),
   workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

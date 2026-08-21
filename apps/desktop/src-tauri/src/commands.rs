@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[allow(dead_code)]
-pub const REGISTERED_COMMANDS: [&str; 8] = [
+pub const REGISTERED_COMMANDS: [&str; 10] = [
     "status",
     "sessions_list",
     "sessions_show",
@@ -19,6 +19,8 @@ pub const REGISTERED_COMMANDS: [&str; 8] = [
     "scan_codex",
     "codex_default_root",
     "workspaces_list",
+    "scan_claude",
+    "claude_default_root",
 ];
 
 #[tauri::command]
@@ -93,6 +95,16 @@ pub fn scan_codex(state: State<'_, AppState>, source_root: String) -> Result<Sca
 #[tauri::command]
 pub fn codex_default_root() -> Option<String> {
     crate::state::detected_codex_home().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn scan_claude(state: State<'_, AppState>, source_root: String) -> Result<ScanReport, String> {
+    state.scan_claude(std::path::PathBuf::from(source_root.trim()))
+}
+
+#[tauri::command]
+pub fn claude_default_root() -> Option<String> {
+    crate::state::detected_claude_home().map(|path| path.to_string_lossy().into_owned())
 }
 
 fn with_query<T>(

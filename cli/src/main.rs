@@ -17,15 +17,20 @@ fn main() -> ExitCode {
     let data_root = runtime::data_dir(cli.data_dir.clone());
     match cli.command {
         Command::Doctor => print_result(cli.json, "doctor", Ok(runtime::doctor(&data_root))),
-        Command::Probe {
-            agent: ProbeAgent::Codex,
-        } => print_result(cli.json, "probe", runtime::probe_codex()),
+        Command::Probe { agent } => match agent {
+            ProbeAgent::Codex => print_result(cli.json, "probe", runtime::probe_codex()),
+            ProbeAgent::Claude => print_result(cli.json, "probe", runtime::probe_claude()),
+        },
         Command::Scan(scan) => {
-            let _agent = scan.agent;
+            let agent = scan.agent;
             let source_root = match scan.source_root {
                 Some(root) => root,
-                None if scan.allow_detected_codex_home => {
-                    let Some(root) = runtime::detected_codex_home() else {
+                None if scan.allow_detected_codex_home || scan.allow_detected_claude_home => {
+                    let root = match agent {
+                        args::AgentArg::Codex => runtime::detected_codex_home(),
+                        args::AgentArg::Claude => runtime::detected_claude_home(),
+                    };
+                    let Some(root) = root else {
                         return print_error(cli.json, "scan", RuntimeError::Authorization);
                     };
                     root
@@ -35,7 +40,10 @@ fn main() -> ExitCode {
             print_scan_result(
                 cli.json,
                 "scan",
-                runtime::scan_codex(&source_root, &data_root),
+                match agent {
+                    args::AgentArg::Codex => runtime::scan_codex(&source_root, &data_root),
+                    args::AgentArg::Claude => runtime::scan_claude(&source_root, &data_root),
+                },
             )
         }
         Command::Sessions { command } => match command {

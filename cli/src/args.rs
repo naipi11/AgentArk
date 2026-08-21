@@ -44,11 +44,13 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum ProbeAgent {
     Codex,
+    Claude,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AgentArg {
     Codex,
+    Claude,
 }
 
 #[derive(Subcommand, Debug)]
@@ -68,8 +70,10 @@ pub enum SessionsCommand {
 pub struct ScanArgs {
     #[arg(value_enum)]
     pub agent: AgentArg,
-    #[arg(long, conflicts_with = "allow_detected_codex_home")]
+    #[arg(long, conflicts_with_all = ["allow_detected_codex_home", "allow_detected_claude_home"])]
     pub source_root: Option<PathBuf>,
     #[arg(long)]
     pub allow_detected_codex_home: bool,
+    #[arg(long)]
+    pub allow_detected_claude_home: bool,
 }
