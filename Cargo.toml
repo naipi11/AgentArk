@@ -9,6 +9,7 @@ members = [
   "crates/adapters/synthetic",
   "crates/adapters/codex",
   "crates/adapters/claude",
+  "crates/adapters/hermes",
   "apps/desktop/src-tauri",
   "cli",
   "fuzz",
