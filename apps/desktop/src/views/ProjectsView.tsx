@@ -6,7 +6,7 @@ function projectName(path: string) {
   return parts.at(-1) ?? path;
 }
 
-export function ProjectsView() {
+export function ProjectsView({ onSelect }: { onSelect: (project: WorkspaceDto) => void }) {
   const [projects, setProjects] = useState<WorkspaceDto[]>([]);
   const [failed, setFailed] = useState(false);
 
@@ -29,11 +29,11 @@ export function ProjectsView() {
       )}
       <div className="project-list">
         {projects.map((project) => (
-          <article className="project-item" key={project.id}>
+          <button className="project-item" key={project.id} type="button" onClick={() => onSelect(project)}>
             <div className="project-heading"><strong>{projectName(project.pathNative)}</strong><span>{project.sessionCount} sessions</span></div>
             <div className="mono project-path">{project.pathNative}</div>
             {project.gitCommit && <div className="muted mono">Git: {project.gitCommit}</div>}
-          </article>
+          </button>
         ))}
       </div>
     </section>

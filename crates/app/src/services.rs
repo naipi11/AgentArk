@@ -19,6 +19,15 @@ pub trait VerifyUseCase: Send + Sync {}
 pub trait QueryUseCase: Send + Sync {
     fn status(&self) -> Result<StatusDto, AppError>;
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, AppError>;
+    fn list_sessions_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        let _ = workspace_id;
+        self.list_sessions(limit, offset)
+    }
     fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError>;
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, AppError>;
@@ -136,6 +145,17 @@ impl<I: SessionQuery + Send + Sync> QueryUseCase for IndexQueryService<I> {
             .collect())
     }
 
+    fn list_sessions_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        Ok(self
+            .index
+            .list_sessions_for_workspace(workspace_id, limit, offset)?)
+    }
+
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError> {
         public_detail_from_index(&self.index, &self.scanner, id)
     }
@@ -184,6 +204,19 @@ impl<I: SessionQuery + Send> QueryUseCase for LockedIndexQueryService<I> {
             .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
             .list_workspaces(limit, offset)
             .map(|rows| rows.into_iter().map(workspace_dto).collect())
+            .map_err(AppError::from)
+    }
+
+    fn list_sessions_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        self.index
+            .lock()
+            .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
+            .list_sessions_for_workspace(workspace_id, limit, offset)
             .map_err(AppError::from)
     }
 

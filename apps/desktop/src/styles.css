@@ -20,7 +20,8 @@ dl { display: grid; grid-template-columns: 180px 1fr; gap: 10px 20px; margin: 24
 .quarantine-list article { display: grid; gap: 5px; border-left: 3px solid #ec9d65; padding: 12px 14px; background: #151c20; }
 .project-empty { margin-top: 24px; line-height: 1.6; }
 .project-list { display: grid; gap: 10px; margin-top: 24px; }
-.project-item { display: grid; gap: 7px; border: 1px solid #263b49; border-radius: 12px; padding: 15px; background: #101d27; }
+.project-item { display: grid; gap: 7px; width: 100%; border: 1px solid #263b49; border-radius: 12px; padding: 15px; text-align: left; color: #e6edf3; background: #101d27; }
+.project-item:hover { border-color: #55b8ff; }
 .project-heading { display: flex; justify-content: space-between; gap: 16px; }
 .project-heading span { color: #8dd2ff; font-size: 12px; }
 .project-path { color: #a8bac6; }

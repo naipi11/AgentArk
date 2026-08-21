@@ -58,7 +58,7 @@ export type ScanReport = {
 
 export const api = {
   status: () => invoke<StatusDto>('status'),
-  sessionsList: (limit = 50, offset = 0) => invoke<SessionSummary[]>('sessions_list', { limit, offset }),
+  sessionsList: (limit = 50, offset = 0, workspaceId?: string) => invoke<SessionSummary[]>('sessions_list', { limit, offset, workspaceId }),
   sessionsShow: (sessionId: string) => invoke<PublicSessionDetail>('sessions_show', { sessionId }),
   search: (query: string, limit = 50) => invoke<SearchHit[]>('search', { query, limit }),
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),

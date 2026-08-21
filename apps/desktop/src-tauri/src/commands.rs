@@ -35,16 +35,21 @@ pub fn sessions_list(
     state: State<'_, AppState>,
     limit: u32,
     offset: u32,
+    workspace_id: Option<Uuid>,
 ) -> Result<Vec<SessionSummary>, String> {
-    sessions_list_inner(&state.services, limit, offset)
+    sessions_list_inner(&state.services, limit, offset, workspace_id)
 }
 
 pub fn sessions_list_inner(
     services: &Arc<Mutex<agentark_app::AppServices>>,
     limit: u32,
     offset: u32,
+    workspace_id: Option<Uuid>,
 ) -> Result<Vec<SessionSummary>, String> {
-    with_query(services, |query| query.list_sessions(limit, offset))
+    with_query(services, |query| match workspace_id {
+        Some(workspace_id) => query.list_sessions_for_workspace(workspace_id, limit, offset),
+        None => query.list_sessions(limit, offset),
+    })
 }
 
 #[tauri::command]

@@ -6,6 +6,15 @@ use crate::{IndexDb, IndexError};
 
 pub trait SessionQuery {
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, IndexError>;
+    fn list_sessions_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, IndexError> {
+        let _ = workspace_id;
+        self.list_sessions(limit, offset)
+    }
     fn list_workspaces(&self, limit: u32, offset: u32)
     -> Result<Vec<WorkspaceSummary>, IndexError>;
     fn show_session(&self, id: Uuid) -> Result<SessionDetail, IndexError>;
@@ -74,6 +83,33 @@ impl SessionQuery for IndexDb {
                 stale: row.get::<_, i64>(5)? != 0,
             })
         })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn list_sessions_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, IndexError> {
+        let mut statement = self.connection().prepare(
+            "SELECT id, search_title, source_kind, archived, completeness, stale
+             FROM sessions WHERE workspace_id = ?1
+             ORDER BY rowid DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = statement.query_map(
+            params![workspace_id.to_string(), limit.min(100), offset],
+            |row| {
+                Ok(SessionSummary {
+                    id: parse_uuid(row.get::<_, String>(0)?)?,
+                    title: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    archived: row.get::<_, i64>(3)? != 0,
+                    completeness: parse_completeness(&row.get::<_, String>(4)?)?,
+                    stale: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
