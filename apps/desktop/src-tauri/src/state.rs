@@ -226,8 +226,13 @@ fn resolve_codex_executable() -> PathBuf {
     if let Some(path) = std::env::var_os("AGENTARK_CODEX_BIN") {
         return PathBuf::from(path);
     }
-    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-        for candidate in ["codex.cmd", "codex.exe", "codex"] {
+    let directories = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .collect::<Vec<_>>();
+    // Prefer the npm shim when it is present. On Windows, PATH can also expose
+    // a packaged WindowsApps `codex.exe` that is not directly executable by a
+    // desktop process, even though the corresponding `codex.cmd` works.
+    for candidate in ["codex.cmd", "codex.exe", "codex"] {
+        for directory in &directories {
             let path = directory.join(candidate);
             if path.is_file() {
                 return path;

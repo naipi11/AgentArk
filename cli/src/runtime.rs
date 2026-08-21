@@ -248,8 +248,10 @@ fn resolve_codex_executable() -> PathBuf {
     if let Some(path) = std::env::var_os("AGENTARK_CODEX_BIN") {
         return PathBuf::from(path);
     }
-    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-        for candidate in ["codex.cmd", "codex.exe", "codex"] {
+    let directories = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .collect::<Vec<_>>();
+    for candidate in ["codex.cmd", "codex.exe", "codex"] {
+        for directory in &directories {
             let path = directory.join(candidate);
             if path.is_file() {
                 return path;
