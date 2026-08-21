@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 type Props = { onScanned: () => void };
 
 export function ScanView({ onScanned }: Props) {
-  const [agent, setAgent] = useState<'codex' | 'claude'>('codex');
+  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes'>('codex');
   const [sourceRoot, setSourceRoot] = useState('');
   const [report, setReport] = useState<ScanReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -13,18 +13,18 @@ export function ScanView({ onScanned }: Props) {
   const { t } = useI18n();
 
   useEffect(() => {
-    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : api.claudeDefaultRoot();
+    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : api.hermesDefaultRoot();
     void rootCall.then((root) => {
       if (root) setSourceRoot(root);
     }).catch(() => undefined);
-  }, []);
+  }, [agent]);
 
   async function submit() {
     setRunning(true);
     setError(null);
     setReport(null);
     try {
-      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : await api.scanClaude(sourceRoot);
+      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : await api.scanHermes(sourceRoot);
       setReport(nextReport);
       onScanned();
     } catch (cause) {
@@ -44,6 +44,7 @@ export function ScanView({ onScanned }: Props) {
       <select id="scan-agent" className="agent-select" value={agent} onChange={(event) => setAgent(event.target.value as typeof agent)} disabled={running}>
         <option value="codex">Codex</option>
         <option value="claude">Claude Code</option>
+        <option value="hermes">Hermes</option>
       </select>
       <div className="scan-form">
         <input

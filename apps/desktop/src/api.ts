@@ -64,7 +64,9 @@ export const api = {
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),
   codexDefaultRoot: () => invoke<string | null>('codex_default_root'),
   claudeDefaultRoot: () => invoke<string | null>('claude_default_root'),
+  hermesDefaultRoot: () => invoke<string | null>('hermes_default_root'),
   scanCodex: (sourceRoot: string) => invoke<ScanReport>('scan_codex', { sourceRoot }),
   scanClaude: (sourceRoot: string) => invoke<ScanReport>('scan_claude', { sourceRoot }),
+  scanHermes: (sourceRoot: string) => invoke<ScanReport>('scan_hermes', { sourceRoot }),
   workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

@@ -20,15 +20,20 @@ fn main() -> ExitCode {
         Command::Probe { agent } => match agent {
             ProbeAgent::Codex => print_result(cli.json, "probe", runtime::probe_codex()),
             ProbeAgent::Claude => print_result(cli.json, "probe", runtime::probe_claude()),
+            ProbeAgent::Hermes => print_result(cli.json, "probe", runtime::probe_hermes()),
         },
         Command::Scan(scan) => {
             let agent = scan.agent;
             let source_root = match scan.source_root {
                 Some(root) => root,
-                None if scan.allow_detected_codex_home || scan.allow_detected_claude_home => {
+                None if scan.allow_detected_codex_home
+                    || scan.allow_detected_claude_home
+                    || scan.allow_detected_hermes_home =>
+                {
                     let root = match agent {
                         args::AgentArg::Codex => runtime::detected_codex_home(),
                         args::AgentArg::Claude => runtime::detected_claude_home(),
+                        args::AgentArg::Hermes => runtime::detected_hermes_home(),
                     };
                     let Some(root) = root else {
                         return print_error(cli.json, "scan", RuntimeError::Authorization);
@@ -43,6 +48,7 @@ fn main() -> ExitCode {
                 match agent {
                     args::AgentArg::Codex => runtime::scan_codex(&source_root, &data_root),
                     args::AgentArg::Claude => runtime::scan_claude(&source_root, &data_root),
+                    args::AgentArg::Hermes => runtime::scan_hermes(&source_root, &data_root),
                 },
             )
         }

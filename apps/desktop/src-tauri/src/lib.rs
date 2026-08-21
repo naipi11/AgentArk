@@ -17,6 +17,8 @@ pub fn run() {
             commands::workspaces_list,
             commands::scan_claude,
             commands::claude_default_root,
+            commands::scan_hermes,
+            commands::hermes_default_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentArk desktop");
@@ -40,7 +42,9 @@ mod tests {
                 "codex_default_root",
                 "workspaces_list",
                 "scan_claude",
-                "claude_default_root"
+                "claude_default_root",
+                "scan_hermes",
+                "hermes_default_root"
             ]
         );
     }

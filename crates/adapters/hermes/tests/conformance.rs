@@ -1,5 +1,5 @@
-use agentark_adapter_sdk::assert_source_adapter_contract;
 use agentark_adapter_hermes::HermesAdapter;
+use agentark_adapter_sdk::assert_source_adapter_contract;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
