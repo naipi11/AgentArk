@@ -239,10 +239,10 @@ where
                         snapshot_id: batch.snapshot_id.clone(),
                     };
                     let mut source_records = vec![source_record];
-                    if let Some(source_session_id) = record.source_session_id.as_deref() {
-                        if let Some(mut evidence) = evidence_by_source.remove(source_session_id) {
-                            source_records.append(&mut evidence);
-                        }
+                    if let Some(source_session_id) = record.source_session_id.as_deref()
+                        && let Some(mut evidence) = evidence_by_source.remove(source_session_id)
+                    {
+                        source_records.append(&mut evidence);
                     }
                     self.journal.record_session(
                         scan_id,
