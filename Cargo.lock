@@ -35,6 +35,7 @@ version = "0.1.0"
 dependencies = [
  "agentark-adapter-claude",
  "agentark-adapter-codex",
+ "agentark-adapter-grok",
  "agentark-adapter-hermes",
  "agentark-adapter-openclaw",
  "agentark-adapter-opencode",
@@ -87,6 +88,22 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "agentark-adapter-grok"
+version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-canonical",
+ "agentark-security",
+ "dunce",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -222,6 +239,7 @@ version = "0.1.0"
 dependencies = [
  "agentark-adapter-claude",
  "agentark-adapter-codex",
+ "agentark-adapter-grok",
  "agentark-adapter-hermes",
  "agentark-adapter-openclaw",
  "agentark-adapter-opencode",

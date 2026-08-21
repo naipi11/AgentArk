@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 type Props = { onScanned: () => void };
 
 export function ScanView({ onScanned }: Props) {
-  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes' | 'openclaw' | 'opencode'>('codex');
+  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes' | 'openclaw' | 'opencode' | 'grok-build'>('codex');
   const [sourceRoot, setSourceRoot] = useState('');
   const [report, setReport] = useState<ScanReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -13,7 +13,7 @@ export function ScanView({ onScanned }: Props) {
   const { t } = useI18n();
 
   useEffect(() => {
-    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : agent === 'hermes' ? api.hermesDefaultRoot() : agent === 'openclaw' ? api.openclawDefaultRoot() : api.opencodeDefaultRoot();
+    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : agent === 'hermes' ? api.hermesDefaultRoot() : agent === 'openclaw' ? api.openclawDefaultRoot() : agent === 'opencode' ? api.opencodeDefaultRoot() : api.grokBuildDefaultRoot();
     void rootCall.then((root) => {
       if (root) setSourceRoot(root);
     }).catch(() => undefined);
@@ -24,7 +24,7 @@ export function ScanView({ onScanned }: Props) {
     setError(null);
     setReport(null);
     try {
-      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : agent === 'hermes' ? await api.scanHermes(sourceRoot) : agent === 'openclaw' ? await api.scanOpenClaw(sourceRoot) : await api.scanOpenCode(sourceRoot);
+      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : agent === 'hermes' ? await api.scanHermes(sourceRoot) : agent === 'openclaw' ? await api.scanOpenClaw(sourceRoot) : agent === 'opencode' ? await api.scanOpenCode(sourceRoot) : await api.scanGrokBuild(sourceRoot);
       setReport(nextReport);
       onScanned();
     } catch (cause) {
@@ -47,6 +47,7 @@ export function ScanView({ onScanned }: Props) {
         <option value="hermes">Hermes</option>
         <option value="openclaw">OpenClaw</option>
         <option value="opencode">OpenCode</option>
+        <option value="grok-build">Grok Build</option>
       </select>
       <div className="scan-form">
         <input

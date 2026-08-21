@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use agentark_adapter_claude::ClaudeCodeAdapter;
 use agentark_adapter_codex::{CodexAdapter, CodexProbe};
+use agentark_adapter_grok::GrokBuildAdapter;
 use agentark_adapter_hermes::HermesAdapter;
 use agentark_adapter_openclaw::OpenClawAdapter;
 use agentark_adapter_opencode::OpenCodeAdapter;
@@ -79,6 +80,10 @@ pub fn detected_openclaw_home() -> Option<PathBuf> {
 
 pub fn detected_opencode_home() -> Option<PathBuf> {
     OpenCodeAdapter::default_home()
+}
+
+pub fn detected_grok_build_home() -> Option<PathBuf> {
+    GrokBuildAdapter::default_home()
 }
 
 pub fn doctor(root: &Path) -> DoctorData {
@@ -185,6 +190,31 @@ pub fn probe_openclaw() -> Result<ProbeData, RuntimeError> {
 pub fn probe_opencode() -> Result<ProbeData, RuntimeError> {
     let root = detected_opencode_home().ok_or(RuntimeError::Authorization)?;
     let adapter = OpenCodeAdapter::new(&root).map_err(|_| RuntimeError::Storage)?;
+    let install = adapter
+        .detect(&DetectContext {
+            explicit_roots: vec![root],
+            allow_detected_home: false,
+        })
+        .map_err(|_| RuntimeError::Storage)?
+        .pop()
+        .ok_or(RuntimeError::Authorization)?;
+    let report = adapter.probe(&install).map_err(|_| RuntimeError::Probe)?;
+    Ok(ProbeData {
+        adapter_id: report.adapter_id,
+        executable_version: report.executable_version,
+        schema_fingerprint: report.schema_fingerprint,
+        capabilities: report
+            .capabilities
+            .into_iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect(),
+        quarantine_reason: report.quarantine_reason,
+    })
+}
+
+pub fn probe_grok_build() -> Result<ProbeData, RuntimeError> {
+    let root = detected_grok_build_home().ok_or(RuntimeError::Authorization)?;
+    let adapter = GrokBuildAdapter::new(&root).map_err(|_| RuntimeError::Storage)?;
     let install = adapter
         .detect(&DetectContext {
             explicit_roots: vec![root],
@@ -365,6 +395,40 @@ pub fn scan_opencode(root: &Path, data_root: &Path) -> Result<ScanReport, Runtim
     if probe.quarantine_reason.is_some() {
         return Err(RuntimeError::Probe);
     }
+    install.executable_version = probe.executable_version;
+    install.schema_fingerprint = probe.schema_fingerprint;
+    install.capabilities = probe
+        .capabilities
+        .into_iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect();
+    let (cas, index, keys_store) = open_storage(data_root)?;
+    let _ = keys_store;
+    let mut service = ScanService::new(
+        adapter,
+        cas,
+        index,
+        SecretScanner::v1().map_err(|_| RuntimeError::Storage)?,
+    );
+    service
+        .run(ScanRequest {
+            install,
+            snapshot_hint: None,
+        })
+        .map_err(RuntimeError::App)
+}
+
+pub fn scan_grok_build(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeError> {
+    let adapter = GrokBuildAdapter::new(root).map_err(|_| RuntimeError::Storage)?;
+    let mut install = adapter
+        .detect(&DetectContext {
+            explicit_roots: vec![root.to_path_buf()],
+            allow_detected_home: false,
+        })
+        .map_err(|_| RuntimeError::Storage)?
+        .pop()
+        .ok_or(RuntimeError::Authorization)?;
+    let probe = adapter.probe(&install).map_err(|_| RuntimeError::Probe)?;
     install.executable_version = probe.executable_version;
     install.schema_fingerprint = probe.schema_fingerprint;
     install.capabilities = probe

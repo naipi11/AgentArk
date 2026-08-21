@@ -67,10 +67,12 @@ export const api = {
   hermesDefaultRoot: () => invoke<string | null>('hermes_default_root'),
   openclawDefaultRoot: () => invoke<string | null>('openclaw_default_root'),
   opencodeDefaultRoot: () => invoke<string | null>('opencode_default_root'),
+  grokBuildDefaultRoot: () => invoke<string | null>('grok_build_default_root'),
   scanCodex: (sourceRoot: string) => invoke<ScanReport>('scan_codex', { sourceRoot }),
   scanClaude: (sourceRoot: string) => invoke<ScanReport>('scan_claude', { sourceRoot }),
   scanHermes: (sourceRoot: string) => invoke<ScanReport>('scan_hermes', { sourceRoot }),
   scanOpenClaw: (sourceRoot: string) => invoke<ScanReport>('scan_openclaw', { sourceRoot }),
   scanOpenCode: (sourceRoot: string) => invoke<ScanReport>('scan_opencode', { sourceRoot }),
+  scanGrokBuild: (sourceRoot: string) => invoke<ScanReport>('scan_grok_build', { sourceRoot }),
   workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

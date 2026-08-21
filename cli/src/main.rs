@@ -23,6 +23,7 @@ fn main() -> ExitCode {
             ProbeAgent::Hermes => print_result(cli.json, "probe", runtime::probe_hermes()),
             ProbeAgent::OpenClaw => print_result(cli.json, "probe", runtime::probe_openclaw()),
             ProbeAgent::OpenCode => print_result(cli.json, "probe", runtime::probe_opencode()),
+            ProbeAgent::GrokBuild => print_result(cli.json, "probe", runtime::probe_grok_build()),
         },
         Command::Scan(scan) => {
             let agent = scan.agent;
@@ -32,7 +33,8 @@ fn main() -> ExitCode {
                     || scan.allow_detected_claude_home
                     || scan.allow_detected_hermes_home
                     || scan.allow_detected_openclaw_home
-                    || scan.allow_detected_opencode_home =>
+                    || scan.allow_detected_opencode_home
+                    || scan.allow_detected_grok_build_home =>
                 {
                     let root = match agent {
                         args::AgentArg::Codex => runtime::detected_codex_home(),
@@ -40,6 +42,7 @@ fn main() -> ExitCode {
                         args::AgentArg::Hermes => runtime::detected_hermes_home(),
                         args::AgentArg::OpenClaw => runtime::detected_openclaw_home(),
                         args::AgentArg::OpenCode => runtime::detected_opencode_home(),
+                        args::AgentArg::GrokBuild => runtime::detected_grok_build_home(),
                     };
                     let Some(root) = root else {
                         return print_error(cli.json, "scan", RuntimeError::Authorization);
@@ -57,6 +60,7 @@ fn main() -> ExitCode {
                     args::AgentArg::Hermes => runtime::scan_hermes(&source_root, &data_root),
                     args::AgentArg::OpenClaw => runtime::scan_openclaw(&source_root, &data_root),
                     args::AgentArg::OpenCode => runtime::scan_opencode(&source_root, &data_root),
+                    args::AgentArg::GrokBuild => runtime::scan_grok_build(&source_root, &data_root),
                 },
             )
         }

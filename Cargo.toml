@@ -12,6 +12,7 @@ members = [
   "crates/adapters/hermes",
   "crates/adapters/openclaw",
   "crates/adapters/opencode",
+  "crates/adapters/grok",
   "apps/desktop/src-tauri",
   "cli",
   "fuzz",
