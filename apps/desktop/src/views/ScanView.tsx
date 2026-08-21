@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 type Props = { onScanned: () => void };
 
 export function ScanView({ onScanned }: Props) {
-  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes' | 'openclaw'>('codex');
+  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes' | 'openclaw' | 'opencode'>('codex');
   const [sourceRoot, setSourceRoot] = useState('');
   const [report, setReport] = useState<ScanReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -13,7 +13,7 @@ export function ScanView({ onScanned }: Props) {
   const { t } = useI18n();
 
   useEffect(() => {
-    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : agent === 'hermes' ? api.hermesDefaultRoot() : api.openclawDefaultRoot();
+    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : agent === 'hermes' ? api.hermesDefaultRoot() : agent === 'openclaw' ? api.openclawDefaultRoot() : api.opencodeDefaultRoot();
     void rootCall.then((root) => {
       if (root) setSourceRoot(root);
     }).catch(() => undefined);
@@ -24,7 +24,7 @@ export function ScanView({ onScanned }: Props) {
     setError(null);
     setReport(null);
     try {
-      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : agent === 'hermes' ? await api.scanHermes(sourceRoot) : await api.scanOpenClaw(sourceRoot);
+      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : agent === 'hermes' ? await api.scanHermes(sourceRoot) : agent === 'openclaw' ? await api.scanOpenClaw(sourceRoot) : await api.scanOpenCode(sourceRoot);
       setReport(nextReport);
       onScanned();
     } catch (cause) {
@@ -46,6 +46,7 @@ export function ScanView({ onScanned }: Props) {
         <option value="claude">Claude Code</option>
         <option value="hermes">Hermes</option>
         <option value="openclaw">OpenClaw</option>
+        <option value="opencode">OpenCode</option>
       </select>
       <div className="scan-form">
         <input

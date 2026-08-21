@@ -22,6 +22,7 @@ agentark-adapter-codex = { path = "../../../crates/adapters/codex" }
 agentark-adapter-claude = { path = "../../../crates/adapters/claude" }
 agentark-adapter-hermes = { path = "../../../crates/adapters/hermes" }
 agentark-adapter-openclaw = { path = "../../../crates/adapters/openclaw" }
+agentark-adapter-opencode = { path = "../../../crates/adapters/opencode" }
 agentark-adapter-sdk = { path = "../../../crates/adapter-sdk" }
 agentark-cas = { path = "../../../crates/cas" }
 agentark-index = { path = "../../../crates/index" }

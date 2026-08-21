@@ -21,6 +21,8 @@ pub fn run() {
             commands::hermes_default_root,
             commands::scan_openclaw,
             commands::openclaw_default_root,
+            commands::scan_opencode,
+            commands::opencode_default_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentArk desktop");
@@ -48,7 +50,9 @@ mod tests {
                 "scan_hermes",
                 "hermes_default_root",
                 "scan_openclaw",
-                "openclaw_default_root"
+                "openclaw_default_root",
+                "scan_opencode",
+                "opencode_default_root"
             ]
         );
     }

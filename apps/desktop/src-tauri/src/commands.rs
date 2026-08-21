@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[allow(dead_code)]
-pub const REGISTERED_COMMANDS: [&str; 14] = [
+pub const REGISTERED_COMMANDS: [&str; 16] = [
     "status",
     "sessions_list",
     "sessions_show",
@@ -25,6 +25,8 @@ pub const REGISTERED_COMMANDS: [&str; 14] = [
     "hermes_default_root",
     "scan_openclaw",
     "openclaw_default_root",
+    "scan_opencode",
+    "opencode_default_root",
 ];
 
 #[tauri::command]
@@ -132,6 +134,19 @@ pub fn scan_openclaw(
 #[tauri::command]
 pub fn openclaw_default_root() -> Option<String> {
     crate::state::detected_openclaw_home().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn scan_opencode(
+    state: State<'_, AppState>,
+    source_root: String,
+) -> Result<ScanReport, String> {
+    state.scan_opencode(std::path::PathBuf::from(source_root.trim()))
+}
+
+#[tauri::command]
+pub fn opencode_default_root() -> Option<String> {
+    crate::state::detected_opencode_home().map(|path| path.to_string_lossy().into_owned())
 }
 
 fn with_query<T>(

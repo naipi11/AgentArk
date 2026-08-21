@@ -37,6 +37,7 @@ dependencies = [
  "agentark-adapter-codex",
  "agentark-adapter-hermes",
  "agentark-adapter-openclaw",
+ "agentark-adapter-opencode",
  "agentark-adapter-sdk",
  "agentark-app",
  "agentark-canonical",
@@ -119,6 +120,22 @@ dependencies = [
  "tempfile",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "agentark-adapter-opencode"
+version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-canonical",
+ "agentark-security",
+ "dunce",
+ "hex",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -207,6 +224,7 @@ dependencies = [
  "agentark-adapter-codex",
  "agentark-adapter-hermes",
  "agentark-adapter-openclaw",
+ "agentark-adapter-opencode",
  "agentark-adapter-sdk",
  "agentark-app",
  "agentark-cas",
