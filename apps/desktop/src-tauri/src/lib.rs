@@ -14,6 +14,7 @@ pub fn run() {
             commands::quarantines_list,
             commands::scan_codex,
             commands::codex_default_root,
+            commands::workspaces_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentArk desktop");
@@ -34,7 +35,8 @@ mod tests {
                 "search",
                 "quarantines_list",
                 "scan_codex",
-                "codex_default_root"
+                "codex_default_root",
+                "workspaces_list"
             ]
         );
     }

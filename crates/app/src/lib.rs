@@ -10,6 +10,7 @@ pub use scan::{ScanReport, ScanRequest, ScanService, ScanStatus};
 pub use services::{
     AppServices, IndexQueryService, LockedIndexQueryService, PublicMessage, PublicSessionDetail,
     PublicToolEvent, QuarantineDto, QueryUseCase, ScanUseCase, StatusDto, VerifyUseCase,
+    WorkspaceDto,
 };
 pub use verify::{
     VerificationFailure, VerificationJournal, VerificationReport, VerificationService,

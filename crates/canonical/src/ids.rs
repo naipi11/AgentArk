@@ -18,6 +18,13 @@ pub fn session_id(install_id: Uuid, source_session_id: &str) -> Uuid {
     )
 }
 
+pub fn workspace_id(canonical_uri: &str) -> Uuid {
+    Uuid::new_v5(
+        &AGENTARK_NAMESPACE,
+        format!("workspace\0{canonical_uri}").as_bytes(),
+    )
+}
+
 pub fn message_id(
     session_id: Uuid,
     source_record_id: Option<&str>,

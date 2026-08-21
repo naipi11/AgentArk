@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use agentark_app::{
-    AppError, PublicSessionDetail, QuarantineDto, QueryUseCase, ScanReport, StatusDto,
+    AppError, PublicSessionDetail, QuarantineDto, QueryUseCase, ScanReport, StatusDto, WorkspaceDto,
 };
 use agentark_index::{SearchHit, SessionSummary};
 use tauri::State;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[allow(dead_code)]
-pub const REGISTERED_COMMANDS: [&str; 7] = [
+pub const REGISTERED_COMMANDS: [&str; 8] = [
     "status",
     "sessions_list",
     "sessions_show",
@@ -18,6 +18,7 @@ pub const REGISTERED_COMMANDS: [&str; 7] = [
     "quarantines_list",
     "scan_codex",
     "codex_default_root",
+    "workspaces_list",
 ];
 
 #[tauri::command]
@@ -66,6 +67,17 @@ pub fn search(
 #[tauri::command]
 pub fn quarantines_list(state: State<'_, AppState>) -> Result<Vec<QuarantineDto>, String> {
     with_query(&state.services, |query| query.list_quarantines())
+}
+
+#[tauri::command]
+pub fn workspaces_list(
+    state: State<'_, AppState>,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<WorkspaceDto>, String> {
+    with_query(&state.services, |query| {
+        query.list_workspaces(limit, offset)
+    })
 }
 
 #[tauri::command]

@@ -45,6 +45,14 @@ impl QueryUseCase for EmptyQuery {
         Ok(Vec::new())
     }
 
+    fn list_workspaces(
+        &self,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<Vec<agentark_app::WorkspaceDto>, AppError> {
+        Ok(Vec::new())
+    }
+
     fn show_session(&self, _id: uuid::Uuid) -> Result<agentark_app::PublicSessionDetail, AppError> {
         Err(AppError::Invariant("session is not available".into()))
     }

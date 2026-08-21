@@ -1,5 +1,5 @@
 use agentark_canonical::{CanonicalRole, Completeness};
-use agentark_index::{SearchHit, SessionQuery, SessionSummary};
+use agentark_index::{SearchHit, SessionQuery, SessionSummary, WorkspaceSummary};
 use agentark_security::SecretScanner;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -19,6 +19,7 @@ pub trait VerifyUseCase: Send + Sync {}
 pub trait QueryUseCase: Send + Sync {
     fn status(&self) -> Result<StatusDto, AppError>;
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, AppError>;
+    fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError>;
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, AppError>;
     fn list_quarantines(&self) -> Result<Vec<QuarantineDto>, AppError>;
@@ -72,6 +73,16 @@ pub struct QuarantineDto {
     pub sanitized_locator: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDto {
+    pub id: Uuid,
+    pub path_native: String,
+    pub canonical_uri: String,
+    pub git_commit: Option<String>,
+    pub session_count: u64,
+}
+
 pub struct IndexQueryService<I> {
     index: I,
     scanner: SecretScanner,
@@ -116,6 +127,15 @@ impl<I: SessionQuery + Send + Sync> QueryUseCase for IndexQueryService<I> {
         Ok(self.index.list_sessions(limit, offset)?)
     }
 
+    fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError> {
+        Ok(self
+            .index
+            .list_workspaces(limit, offset)?
+            .into_iter()
+            .map(workspace_dto)
+            .collect())
+    }
+
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError> {
         public_detail_from_index(&self.index, &self.scanner, id)
     }
@@ -158,6 +178,15 @@ impl<I: SessionQuery + Send> QueryUseCase for LockedIndexQueryService<I> {
             .map_err(AppError::from)
     }
 
+    fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError> {
+        self.index
+            .lock()
+            .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
+            .list_workspaces(limit, offset)
+            .map(|rows| rows.into_iter().map(workspace_dto).collect())
+            .map_err(AppError::from)
+    }
+
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError> {
         let guard = self
             .index
@@ -188,6 +217,16 @@ impl<I: SessionQuery + Send> QueryUseCase for LockedIndexQueryService<I> {
                 sanitized_locator: item.sanitized_locator,
             })
             .collect())
+    }
+}
+
+fn workspace_dto(row: WorkspaceSummary) -> WorkspaceDto {
+    WorkspaceDto {
+        id: row.id,
+        path_native: row.path_native,
+        canonical_uri: row.canonical_uri,
+        git_commit: row.git_commit,
+        session_count: row.session_count,
     }
 }
 

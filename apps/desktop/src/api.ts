@@ -40,6 +40,13 @@ export type QuarantineDto = {
   fingerprint: string;
   sanitizedLocator: string;
 };
+export type WorkspaceDto = {
+  id: string;
+  pathNative: string;
+  canonicalUri: string;
+  gitCommit?: string;
+  sessionCount: number;
+};
 export type ScanReport = {
   scanId: string;
   status: 'complete' | 'partial' | 'failed';
@@ -57,4 +64,5 @@ export const api = {
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),
   codexDefaultRoot: () => invoke<string | null>('codex_default_root'),
   scanCodex: (sourceRoot: string) => invoke<ScanReport>('scan_codex', { sourceRoot }),
+  workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

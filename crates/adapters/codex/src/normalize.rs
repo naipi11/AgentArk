@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use agentark_canonical::{
     CanonicalMessage, CanonicalRole, CanonicalSchemaVersion, CanonicalSession, Completeness,
-    ContentPart, ContentPartKind, Sha256Digest, ToolEvent, message_id, session_id,
+    ContentPart, ContentPartKind, Sha256Digest, ToolEvent, Workspace, message_id, session_id,
+    workspace_id,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -101,17 +102,25 @@ pub fn normalize_thread_read_bytes_for_install(
     } else {
         partial = true;
     }
-    let title = messages
-        .iter()
-        .find(|message| message.role == CanonicalRole::User)
-        .map(CanonicalMessage::visible_text);
+    let title = thread
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            messages
+                .iter()
+                .find(|message| message.role == CanonicalRole::User)
+                .map(CanonicalMessage::visible_text)
+        });
+    let workspace = workspace_from_thread(thread);
     Ok(CanonicalSession {
         schema_version: CanonicalSchemaVersion::V0_1_0,
         id: session,
         install_id,
         source_session_id,
         source_kind: "app-server".into(),
-        workspace: None,
+        workspace,
         title,
         archived: false,
         created_at_raw: thread
@@ -133,6 +142,40 @@ pub fn normalize_thread_read_bytes_for_install(
         tool_events,
         attachments: Vec::new(),
         raw_extra: BTreeMap::new(),
+    })
+}
+
+fn workspace_from_thread(thread: &Value) -> Option<Workspace> {
+    let raw_path = thread
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            thread
+                .get("workspace")
+                .and_then(|workspace| workspace.get("path").or_else(|| workspace.get("cwd")))
+                .and_then(Value::as_str)
+        })?
+        .trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+    let path_native = raw_path.strip_prefix("\\\\?\\").unwrap_or(raw_path);
+    let canonical_path = std::fs::canonicalize(path_native)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path_native.to_owned());
+    let canonical_uri = format!("file://{}", canonical_path.replace('\\', "/"));
+    let git_commit = thread
+        .get("gitInfo")
+        .and_then(|git| git.get("sha"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some(Workspace {
+        id: workspace_id(&canonical_uri),
+        path_native: canonical_path,
+        canonical_uri,
+        git_commit,
     })
 }
 

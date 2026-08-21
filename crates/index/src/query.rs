@@ -6,6 +6,8 @@ use crate::{IndexDb, IndexError};
 
 pub trait SessionQuery {
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, IndexError>;
+    fn list_workspaces(&self, limit: u32, offset: u32)
+    -> Result<Vec<WorkspaceSummary>, IndexError>;
     fn show_session(&self, id: Uuid) -> Result<SessionDetail, IndexError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, IndexError>;
     fn list_quarantines(&self) -> Result<Vec<QuarantineSummary>, IndexError>;
@@ -20,6 +22,16 @@ pub struct SessionSummary {
     pub archived: bool,
     pub completeness: Completeness,
     pub stale: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSummary {
+    pub id: Uuid,
+    pub path_native: String,
+    pub canonical_uri: String,
+    pub git_commit: Option<String>,
+    pub session_count: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -60,6 +72,34 @@ impl SessionQuery for IndexDb {
                 archived: row.get::<_, i64>(3)? != 0,
                 completeness: parse_completeness(&row.get::<_, String>(4)?)?,
                 stale: row.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn list_workspaces(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WorkspaceSummary>, IndexError> {
+        let mut statement = self.connection().prepare(
+            "SELECT w.id, w.path_native, w.canonical_uri, w.git_commit, COUNT(s.id)
+             FROM workspaces w
+             LEFT JOIN sessions s ON s.workspace_id = w.id
+             GROUP BY w.id, w.path_native, w.canonical_uri, w.git_commit
+             ORDER BY MAX(s.rowid) DESC, w.rowid DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![limit.min(100), offset], |row| {
+            Ok(WorkspaceSummary {
+                id: parse_uuid(row.get::<_, String>(0)?)?,
+                path_native: row.get(1)?,
+                canonical_uri: row.get(2)?,
+                git_commit: row.get(3)?,
+                session_count: row
+                    .get::<_, i64>(4)?
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, i64::MAX))?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
