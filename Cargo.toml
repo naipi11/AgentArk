@@ -8,6 +8,7 @@ members = [
   "crates/app",
   "crates/adapters/synthetic",
   "crates/adapters/codex",
+  "crates/adapters/claude",
   "apps/desktop/src-tauri",
   "cli",
   "fuzz",

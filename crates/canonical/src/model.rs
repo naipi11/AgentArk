@@ -28,6 +28,11 @@ impl CanonicalSchemaVersion {
 #[serde(rename_all = "camelCase")]
 pub enum AgentKind {
     Codex,
+    ClaudeCode,
+    Hermes,
+    OpenClaw,
+    OpenCode,
+    GrokBuild,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

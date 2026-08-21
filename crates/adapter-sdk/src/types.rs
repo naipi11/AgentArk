@@ -48,6 +48,8 @@ pub struct CapturedRecord {
 pub enum CapturedSource {
     /// A semantic record returned by the agent's read-only protocol.
     AppServerSemantic,
+    /// A filesystem record that the adapter can normalize semantically.
+    FilesystemSemantic,
     /// Raw filesystem bytes that corroborate a semantic record.
     FilesystemEvidence,
     /// Raw filesystem bytes with no matching semantic record.
