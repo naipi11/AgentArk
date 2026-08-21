@@ -87,6 +87,7 @@ impl SessionQuery for IndexDb {
              FROM workspaces w
              LEFT JOIN sessions s ON s.workspace_id = w.id
              GROUP BY w.id, w.path_native, w.canonical_uri, w.git_commit
+             HAVING COUNT(s.id) > 0
              ORDER BY MAX(s.rowid) DESC, w.rowid DESC
              LIMIT ?1 OFFSET ?2",
         )?;
