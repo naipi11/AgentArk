@@ -85,6 +85,20 @@ fn encrypts_canonical_text_and_searches_only_sanitized_fts() {
 }
 
 #[test]
+fn reopens_existing_encrypted_index_without_reapplying_migrations() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let db_path = dir.path().join("agentark.db");
+    let first = IndexDb::open(&db_path, keys.sqlcipher_key()).unwrap();
+    assert!(first.fts5_enabled().unwrap());
+    drop(first);
+    let second = IndexDb::open(&db_path, keys.sqlcipher_key()).unwrap();
+    assert!(second.fts5_enabled().unwrap());
+}
+
+#[test]
 fn search_limit_is_applied_after_rank_ordering() {
     let dir = tempdir().unwrap();
     let store = MemoryMasterKeyStore::empty();

@@ -37,7 +37,27 @@ impl IndexDb {
         if fts5 != 1 {
             return Err(IndexError::UnsupportedStorageBuild);
         }
-        connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+        let has_schema_meta: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_schema_meta {
+            let schema_version: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if schema_version.as_deref() != Some("1") {
+                return Err(IndexError::UnsupportedStorageBuild);
+            }
+        } else {
+            connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+        }
         Ok(Self {
             connection,
             active_scan_id: None,
