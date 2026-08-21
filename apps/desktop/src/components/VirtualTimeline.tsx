@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { PublicMessage, PublicToolEvent } from '../api';
+import { useI18n } from '../i18n';
 
 type TimelineRow =
   | { kind: 'message'; ordinal: number; role: string; text: string }
@@ -31,6 +32,7 @@ function lowerBound(values: number[], target: number) {
 }
 
 export function VirtualTimeline({ messages, toolEvents, height = 560 }: Props) {
+  const { t } = useI18n();
   const rows = useMemo<TimelineRow[]>(
     () => [
       ...messages.map((message) => ({
@@ -89,7 +91,7 @@ export function VirtualTimeline({ messages, toolEvents, height = 560 }: Props) {
   }, [first, last, measuredHeights, rows.length]);
 
   return (
-    <div className="timeline" ref={scrollRef} style={{ height }} aria-label="Timeline">
+    <div className="timeline" ref={scrollRef} style={{ height }} aria-label={t('timeline.title')}>
       <div style={{ height: layout.total, position: 'relative' }}>
         {visible.map((row, index) => (
           <article

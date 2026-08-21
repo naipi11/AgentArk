@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type WorkspaceDto } from '../api';
+import { useI18n } from '../i18n';
 
 function projectName(path: string) {
   const parts = path.split(/[\\/]/).filter(Boolean);
@@ -9,6 +10,7 @@ function projectName(path: string) {
 export function ProjectsView({ onSelect }: { onSelect: (project: WorkspaceDto) => void }) {
   const [projects, setProjects] = useState<WorkspaceDto[]>([]);
   const [failed, setFailed] = useState(false);
+  const { t } = useI18n();
 
   useEffect(() => {
     void api.workspacesList().then(setProjects).catch(() => {
@@ -20,19 +22,19 @@ export function ProjectsView({ onSelect }: { onSelect: (project: WorkspaceDto) =
   return (
     <section className="card" aria-label="Projects">
       <div className="section-heading">
-        <div><p className="eyebrow">Workspaces</p><h2>Projects</h2></div>
-        <span className="muted">{projects.length} project{projects.length === 1 ? '' : 's'}</span>
+        <div><p className="eyebrow">{t('projects.workspaces')}</p><h2>{t('projects.title')}</h2></div>
+        <span className="muted">{projects.length} {projects.length === 1 ? t('projects.countOne') : t('projects.countMany')}</span>
       </div>
-      {failed && <p className="error-message">无法读取项目索引，请重新打开客户端。</p>}
+      {failed && <p className="error-message">{t('projects.failed')}</p>}
       {!failed && projects.length === 0 && (
-        <p className="muted project-empty">尚未建立项目归属。请在 Scan 页面重新扫描一次 Codex 数据。</p>
+        <p className="muted project-empty">{t('projects.empty')}</p>
       )}
       <div className="project-list">
         {projects.map((project) => (
           <button className="project-item" key={project.id} type="button" onClick={() => onSelect(project)}>
-            <div className="project-heading"><strong>{projectName(project.pathNative)}</strong><span>{project.sessionCount} sessions</span></div>
+            <div className="project-heading"><strong>{projectName(project.pathNative)}</strong><span>{project.sessionCount} {t('projects.sessions')}</span></div>
             <div className="mono project-path">{project.pathNative}</div>
-            {project.gitCommit && <div className="muted mono">Git: {project.gitCommit}</div>}
+            {project.gitCommit && <div className="muted mono">{t('projects.git')}: {project.gitCommit}</div>}
           </button>
         ))}
       </div>

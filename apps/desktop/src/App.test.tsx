@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { expect, test, vi } from 'vitest';
 import { App } from './App';
+import { LocaleProvider } from './i18n';
 
 const { invoke } = vi.hoisted(() => ({
   invoke: vi.fn((command: string) => {
@@ -13,7 +14,7 @@ const { invoke } = vi.hoisted(() => ({
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
 test('status view renders the locked dataset state and capabilities', async () => {
-  render(<App />);
+  render(<LocaleProvider><App /></LocaleProvider>);
   await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
   expect(screen.getByText('read')).toBeInTheDocument();
   expect(screen.getByText('sha256:test')).toBeInTheDocument();
