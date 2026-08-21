@@ -198,13 +198,20 @@ impl SourceAdapter for ClaudeCodeAdapter {
                 fingerprint: format!("sha256:{}", hex::encode(Sha256::digest(&record.bytes))),
             });
         }
-        normalize_jsonl(
+        match normalize_jsonl(
             &record.bytes,
             self.install().id,
             record.source_session_id.as_deref(),
-        )
-        .map(|session| NormalizeOutcome::Normalized(Box::new(session)))
-        .map_err(|error| AdapterError::InvalidData(error))
+        ) {
+            Ok(session) => Ok(NormalizeOutcome::Normalized(Box::new(session))),
+            Err(reason) => Ok(NormalizeOutcome::Quarantined {
+                reason_code: "claude-malformed-transcript".into(),
+                fingerprint: format!(
+                    "sha256:{}:{reason}",
+                    hex::encode(Sha256::digest(&record.bytes))
+                ),
+            }),
+        }
     }
 
     fn capabilities(&self, _install: &AgentInstall) -> BTreeSet<SourceCapability> {
