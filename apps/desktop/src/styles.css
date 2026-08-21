@@ -32,6 +32,7 @@ dl { display: grid; grid-template-columns: 180px 1fr; gap: 10px 20px; margin: 24
 .field-label { display: block; color: #b8c7d2; font-size: 13px; margin: 24px 0 8px; }
 .scan-form { display: flex; gap: 10px; align-items: center; }
 .scan-form input { flex: 1; min-width: 0; }
+.agent-select { width: min(260px, 100%); border: 1px solid #304655; color: #e6edf3; background: #0c151d; border-radius: 9px; padding: 9px 12px; }
 .primary-button { border: 1px solid #4da9e4; color: #06111a; background: #75caff; border-radius: 9px; padding: 9px 16px; font-weight: 700; }
 .primary-button:hover { background: #9bdcff; }
 .primary-button:disabled { cursor: wait; opacity: .65; }
