@@ -88,7 +88,9 @@ pub fn probe_codex() -> Result<ProbeData, RuntimeError> {
 }
 
 pub fn scan_codex(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeError> {
-    let adapter = CodexAdapter::new(root).map_err(|_| RuntimeError::Storage)?;
+    let executable = resolve_codex_executable();
+    let adapter =
+        CodexAdapter::with_executable(root, executable).map_err(|_| RuntimeError::Storage)?;
     let install = adapter
         .detect(&DetectContext {
             explicit_roots: vec![root.to_path_buf()],

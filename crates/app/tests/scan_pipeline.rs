@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use agentark_adapter_sdk::{
-    AdapterError, CaptureBatch, CaptureRequest, CapturedRecord, DetectContext, NormalizeOutcome,
-    ProbeReport, SourceAdapter, SourceCapability,
+    AdapterError, CaptureBatch, CaptureRequest, CapturedRecord, CapturedSource, DetectContext,
+    NormalizeOutcome, ProbeReport, SourceAdapter, SourceCapability,
 };
 use agentark_app::{AppError, ScanRequest, ScanService, ScanStatus};
 use agentark_canonical::{
@@ -49,6 +49,7 @@ impl SourceAdapter for FixtureAdapter {
         Ok(CaptureBatch {
             snapshot_id: "snapshot".into(),
             records: vec![CapturedRecord {
+                source: CapturedSource::AppServerSemantic,
                 source_locator: "fixture.jsonl".into(),
                 source_session_id: Some("fixture-session".into()),
                 source_record_id: Some("record-1".into()),
@@ -56,6 +57,7 @@ impl SourceAdapter for FixtureAdapter {
                 snapshot_id: "snapshot".into(),
                 bytes: b"raw".to_vec(),
             }],
+            issues: Vec::new(),
         })
     }
     fn normalize(&self, record: &CapturedRecord) -> Result<NormalizeOutcome, AdapterError> {

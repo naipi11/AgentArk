@@ -20,4 +20,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      - run: cargo install --locked cargo-deny --version 0.20.2
+      - run: cargo install --locked cargo-audit --version 0.22.2
+      - run: cargo deny check
+      - run: cargo audit
+      - run: pwsh -File ci/check-security-crate-majors.ps1
       - run: pwsh -File ci/enforce-search-benchmark.ps1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir apps/desktop test
+      - run: pnpm --dir apps/desktop build

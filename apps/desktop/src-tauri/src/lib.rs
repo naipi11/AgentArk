@@ -5,7 +5,7 @@ mod state;
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(state::AppState::empty())
+        .manage(state::AppState::open_default())
         .invoke_handler(tauri::generate_handler![
             commands::status,
             commands::sessions_list,

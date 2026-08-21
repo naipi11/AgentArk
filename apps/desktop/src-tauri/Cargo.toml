@@ -25,3 +25,4 @@ serde_json.workspace = true
 tauri.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+directories.workspace = true

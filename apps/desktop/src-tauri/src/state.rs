@@ -1,6 +1,12 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agentark_app::{AppError, AppServices, QueryUseCase, ScanUseCase, VerifyUseCase};
+use agentark_app::{
+    AppError, AppServices, LockedIndexQueryService, QueryUseCase, ScanUseCase, VerifyUseCase,
+};
+use agentark_index::IndexDb;
+use agentark_security::{DatasetBootstrap, OsMasterKeyStore};
+use directories::ProjectDirs;
 
 pub struct AppState {
     pub services: Arc<Mutex<AppServices>>,
@@ -58,4 +64,42 @@ impl AppState {
             })),
         }
     }
+
+    pub fn open_default() -> Self {
+        let Some(index) = open_index(&default_data_dir()) else {
+            return Self::empty();
+        };
+        Self {
+            services: Arc::new(Mutex::new(AppServices {
+                scanner: Box::new(EmptyUseCase),
+                verifier: Box::new(EmptyUseCase),
+                queries: Box::new(LockedIndexQueryService::new(index)),
+            })),
+        }
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("AGENTARK_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    ProjectDirs::from("dev", "AgentArk", "AgentArk")
+        .map(|dirs| dirs.data_local_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".agentark-data"))
+}
+
+fn open_index(root: &Path) -> Option<IndexDb> {
+    let bootstrap_path = root.join("bootstrap.json");
+    if !bootstrap_path.is_file() {
+        return None;
+    }
+    let bootstrap: DatasetBootstrap =
+        serde_json::from_slice(&std::fs::read(bootstrap_path).ok()?).ok()?;
+    let machine_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        root.to_string_lossy().as_bytes(),
+    );
+    let store = OsMasterKeyStore::new(machine_id).ok()?;
+    let keys = bootstrap.unlock(&store).ok()?;
+    IndexDb::open(&root.join("index.db"), keys.sqlcipher_key()).ok()
 }

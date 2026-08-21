@@ -27,9 +27,17 @@ jobs:
           version: 11.22.0
           run_install: false
       - run: pnpm install --frozen-lockfile
+      - run: cargo install --locked cargo-deny --version 0.20.2
+      - run: cargo install --locked cargo-audit --version 0.22.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --doc
+      - run: cargo test -p agentark-desktop
+      - run: cargo deny check
+      - run: cargo audit
+      - run: pwsh -File ci/check-security-crate-majors.ps1
+      - run: pwsh -File ci/enforce-search-benchmark.ps1
       - run: pnpm --dir apps/desktop test
       - run: pnpm --dir apps/desktop build
       - run: pwsh -File ci/check-no-secret-canaries.ps1

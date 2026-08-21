@@ -4,8 +4,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use agentark_adapter_sdk::{
-    AdapterError, CaptureBatch, CaptureRequest, CapturedRecord, DetectContext, NormalizeOutcome,
-    ProbeReport, SourceAdapter, SourceCapability,
+    AdapterError, CaptureBatch, CaptureRequest, CapturedRecord, CapturedSource, DetectContext,
+    NormalizeOutcome, ProbeReport, SourceAdapter, SourceCapability,
 };
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalRole, CanonicalSchemaVersion,
@@ -166,6 +166,7 @@ impl SourceAdapter for SyntheticAdapter {
                 .and_then(|value| value.to_str())
                 .map(|value| format!("synthetic-{value}"));
             records.push(CapturedRecord {
+                source: CapturedSource::AppServerSemantic,
                 source_locator: name.into(),
                 source_session_id,
                 source_record_id: Some(name.into()),
@@ -185,6 +186,7 @@ impl SourceAdapter for SyntheticAdapter {
         Ok(CaptureBatch {
             snapshot_id,
             records,
+            issues: Vec::new(),
         })
     }
 

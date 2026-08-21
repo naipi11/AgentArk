@@ -59,3 +59,30 @@ fn capture_reads_only_sessions_and_preserves_the_source_tree() {
         Some("thread_fixture")
     );
 }
+
+#[test]
+fn capture_reports_unstable_files_as_retryable_issues() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("thread_retry.jsonl"), br#"{"#).unwrap();
+    let adapter = CodexAdapter::new(root.path()).unwrap();
+    let install = adapter
+        .detect(&DetectContext {
+            explicit_roots: vec![root.path().to_path_buf()],
+            allow_detected_home: false,
+        })
+        .unwrap()
+        .pop()
+        .unwrap();
+    let batch = adapter
+        .capture(&CaptureRequest {
+            install,
+            snapshot_hint: None,
+        })
+        .unwrap();
+    assert!(batch.records.is_empty());
+    assert_eq!(batch.issues.len(), 1);
+    assert!(batch.issues[0].retryable);
+    assert_eq!(batch.issues[0].reason_code, "incomplete-final-record");
+}

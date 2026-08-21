@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use agentark_adapter_sdk::CapturedRecord;
+use agentark_adapter_sdk::{CapturedRecord, CapturedSource};
 use agentark_canonical::Sha256Digest;
 use agentark_security::AuthorizedRoot;
 use sha2::{Digest, Sha256};
@@ -52,6 +52,7 @@ pub fn capture_jsonl_file(root: &Path, relative: &Path) -> Result<CapturedRecord
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
     Ok(CapturedRecord {
+        source: CapturedSource::FilesystemRawOnly,
         source_locator: locator.clone(),
         source_session_id,
         source_record_id: Some(locator),

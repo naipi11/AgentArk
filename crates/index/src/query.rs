@@ -91,13 +91,18 @@ impl SessionQuery for IndexDb {
             .collect::<Vec<_>>()
             .join(" ");
         let mut statement = self.connection().prepare(
-            "SELECT s.id, s.search_title,
-             snippet(session_fts, 2, '[', ']', ' … ', 16), bm25(session_fts)
-             FROM session_fts
-             JOIN sessions s ON s.id = session_fts.session_id
-             WHERE session_fts MATCH ?1
-             ORDER BY bm25(session_fts)
-             LIMIT ?2",
+            "WITH matched AS (
+                 SELECT rowid, rank
+                 FROM session_fts
+                 WHERE session_fts MATCH ?1
+                 LIMIT ?2
+             )
+             SELECT s.id, s.search_title,
+                    snippet(session_fts, 2, '[', ']', ' … ', 16), matched.rank
+             FROM matched
+             JOIN session_fts f ON f.rowid = matched.rowid
+             JOIN sessions s ON s.id = f.session_id
+             ORDER BY matched.rank",
         )?;
         let rows = statement.query_map(params![escaped, limit.min(100)], |row| {
             Ok(SearchHit {

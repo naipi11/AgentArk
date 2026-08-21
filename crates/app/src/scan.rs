@@ -127,6 +127,28 @@ where
         let mut retryable = 0;
         let mut rejected = 0;
 
+        for issue in &batch.issues {
+            if let Some(source_session_id) = issue.source_session_id.as_deref() {
+                let id = session_id(request.install.id, source_session_id);
+                if !self.pending_session_ids.contains(&id) {
+                    self.pending_session_ids.push(id);
+                }
+                if !self
+                    .pending_source_session_ids
+                    .iter()
+                    .any(|value| value == source_session_id)
+                {
+                    self.pending_source_session_ids
+                        .push(source_session_id.to_owned());
+                }
+            }
+            if issue.retryable {
+                retryable += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+
         for record in batch.records {
             if let Some(source_session_id) = record.source_session_id.as_deref() {
                 let id = session_id(request.install.id, source_session_id);
@@ -155,6 +177,33 @@ where
                 sanitized_title: None,
                 sanitized_body: None,
             })?;
+
+            if matches!(
+                record.source,
+                agentark_adapter_sdk::CapturedSource::FilesystemEvidence
+            ) {
+                continue;
+            }
+            if matches!(
+                record.source,
+                agentark_adapter_sdk::CapturedSource::FilesystemRawOnly
+            ) {
+                self.index.record_quarantine(QuarantineRecord {
+                    id: Uuid::new_v5(
+                        &scan_id,
+                        format!("{}:{}", record.source_locator, record.ordinal).as_bytes(),
+                    ),
+                    scan_id,
+                    source_locator: sanitize_locator(&record.source_locator),
+                    fingerprint: format!("sha256:{}", stored.plaintext_hash.as_str()),
+                    reason_code: "filesystem-raw-only".into(),
+                    raw_sha256: stored.plaintext_hash,
+                    cas_object_id: stored.object_id,
+                })?;
+                quarantined += 1;
+                continue;
+            }
+
             let outcome = self.adapter.normalize(&record)?;
             match outcome {
                 NormalizeOutcome::Normalized(session) => {

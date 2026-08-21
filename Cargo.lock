@@ -153,6 +153,7 @@ dependencies = [
  "agentark-app",
  "agentark-index",
  "agentark-security",
+ "directories",
  "serde",
  "serde_json",
  "tauri",

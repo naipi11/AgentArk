@@ -6,6 +6,7 @@ mod runtime;
 
 use std::process::ExitCode;
 
+use agentark_app::{ScanReport, ScanStatus};
 use args::{Cli, Command, ProbeAgent, SessionsCommand};
 use clap::Parser;
 use output::{failure, success};
@@ -31,7 +32,7 @@ fn main() -> ExitCode {
                 }
                 None => return print_error(cli.json, "scan", RuntimeError::Authorization),
             };
-            print_result(
+            print_scan_result(
                 cli.json,
                 "scan",
                 runtime::scan_codex(&source_root, &data_root),
@@ -60,6 +61,34 @@ fn main() -> ExitCode {
             };
             print_result(cli.json, "verify", runtime::verify(&data_root, scan_id))
         }
+    }
+}
+
+fn print_scan_result(
+    json_mode: bool,
+    command: &'static str,
+    result: Result<ScanReport, RuntimeError>,
+) -> ExitCode {
+    match result {
+        Ok(data) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string(&success(command, &data)).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_else(|_| "{}".into())
+                );
+            }
+            if data.status == ScanStatus::Partial {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => print_error(json_mode, command, error),
     }
 }
 

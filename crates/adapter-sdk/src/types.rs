@@ -35,6 +35,7 @@ pub struct CaptureRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedRecord {
+    pub source: CapturedSource,
     pub source_locator: String,
     pub source_session_id: Option<String>,
     pub source_record_id: Option<String>,
@@ -43,10 +44,29 @@ pub struct CapturedRecord {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturedSource {
+    /// A semantic record returned by the agent's read-only protocol.
+    AppServerSemantic,
+    /// Raw filesystem bytes that corroborate a semantic record.
+    FilesystemEvidence,
+    /// Raw filesystem bytes with no matching semantic record.
+    FilesystemRawOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureIssue {
+    pub source_locator: String,
+    pub source_session_id: Option<String>,
+    pub reason_code: String,
+    pub retryable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureBatch {
     pub snapshot_id: String,
     pub records: Vec<CapturedRecord>,
+    pub issues: Vec<CaptureIssue>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

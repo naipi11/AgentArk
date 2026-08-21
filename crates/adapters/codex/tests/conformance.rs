@@ -17,5 +17,6 @@ fn codex_filesystem_adapter_meets_read_only_contract() {
     let report = assert_source_adapter_contract(&CodexAdapter::new(root.path()).unwrap()).unwrap();
     let after = CodexAdapter::tree_digest(root.path()).unwrap();
     assert_eq!(before, after);
-    assert_eq!(report.normalized, 1);
+    assert_eq!(report.normalized, 0);
+    assert_eq!(report.quarantined, 1);
 }

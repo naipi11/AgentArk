@@ -68,6 +68,13 @@ pub fn assert_source_adapter_contract<A: SourceAdapter>(
     }
 
     let mut report = ContractReport::default();
+    for issue in &first.issues {
+        if issue.retryable {
+            report.retryable += 1;
+        } else {
+            report.rejected += 1;
+        }
+    }
     for record in first.records {
         match adapter.normalize(&record)? {
             NormalizeOutcome::Normalized(_) => report.normalized += 1,
