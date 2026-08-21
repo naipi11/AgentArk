@@ -10,6 +10,7 @@ use crate::CodexError;
 pub const CODEX_VERSION: &str = "0.146.0";
 pub const CODEX_SCHEMA_SHA256: &str =
     "fcb6b8b329c3436b4af8c5b180b7cb06f05cbcefdf31462aeefa579b0ca99cd";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CodexProbe;
 
@@ -85,7 +86,7 @@ fn run_bounded(executable: &Path, args: &[&str]) -> Result<String, CodexError> {
             combined.extend_from_slice(&output.stderr);
             return String::from_utf8(combined).map_err(|_| CodexError::InvalidOutput);
         }
-        if started.elapsed() >= Duration::from_secs(5) {
+        if started.elapsed() >= PROBE_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
             return Err(CodexError::Timeout);
