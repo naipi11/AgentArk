@@ -106,7 +106,7 @@ impl AppState {
         }
 
         let executable = resolve_codex_executable();
-        let adapter = CodexAdapter::with_executable(&source_root, executable)
+        let adapter = CodexAdapter::with_executable(&source_root, executable.clone())
             .map_err(|_| "无法打开 Codex 数据目录".to_owned())?;
         let mut install = adapter
             .detect(&DetectContext {
