@@ -83,3 +83,44 @@ fn encrypts_canonical_text_and_searches_only_sanitized_fts() {
     assert!(db.cipher_version().unwrap().starts_with("4."));
     assert!(db.fts5_enabled().unwrap());
 }
+
+#[test]
+fn search_limit_is_applied_after_rank_ordering() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let mut db = IndexDb::open(&dir.path().join("agentark.db"), keys.sqlcipher_key()).unwrap();
+    let (install, mut best, _) = fixture();
+    best.id = Uuid::from_u128(10);
+    best.source_session_id = "best".into();
+    let best_hash = canonical_hash("session", &best).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &best,
+        source_records: &[],
+        sanitized_title: "best",
+        sanitized_body: "needle needle needle",
+        findings: &[],
+        canonical_hash: &best_hash,
+    })
+    .unwrap();
+    let mut weaker = best.clone();
+    weaker.id = Uuid::from_u128(11);
+    weaker.source_session_id = "weaker".into();
+    weaker.messages.clear();
+    let weaker_hash = canonical_hash("session", &weaker).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &weaker,
+        source_records: &[],
+        sanitized_title: "weaker",
+        sanitized_body: "needle",
+        findings: &[],
+        canonical_hash: &weaker_hash,
+    })
+    .unwrap();
+    let hits = db.search("needle", 1).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, best.id);
+}

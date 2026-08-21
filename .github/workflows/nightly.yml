@@ -14,6 +14,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-08-20
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl file libayatana-appindicator3-dev \
+            libgtk-3-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
       - run: cargo install --locked cargo-fuzz --version 0.13.2
       - run: cargo fuzz run codex_jsonl -- -max_total_time=900
       - run: cargo fuzz run path_policy -- -max_total_time=900

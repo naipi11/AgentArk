@@ -14,6 +14,13 @@ pub fn normalize_thread_read(text: &str) -> Result<CanonicalSession, CodexError>
 }
 
 pub fn normalize_thread_read_bytes(bytes: &[u8]) -> Result<CanonicalSession, CodexError> {
+    normalize_thread_read_bytes_for_install(bytes, Uuid::nil())
+}
+
+pub fn normalize_thread_read_bytes_for_install(
+    bytes: &[u8],
+    install_id: Uuid,
+) -> Result<CanonicalSession, CodexError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| CodexError::MalformedJson)?;
     let thread = value
         .get("result")
@@ -26,7 +33,7 @@ pub fn normalize_thread_read_bytes(bytes: &[u8]) -> Result<CanonicalSession, Cod
         .filter(|id| !id.is_empty())
         .ok_or(CodexError::InvalidOutput)?
         .to_owned();
-    let session = session_id(Uuid::nil(), &source_session_id);
+    let session = session_id(install_id, &source_session_id);
     let raw_hash = Sha256Digest::from_bytes(bytes);
     let mut messages = Vec::new();
     let mut tool_events = Vec::new();
@@ -101,7 +108,7 @@ pub fn normalize_thread_read_bytes(bytes: &[u8]) -> Result<CanonicalSession, Cod
     Ok(CanonicalSession {
         schema_version: CanonicalSchemaVersion::V0_1_0,
         id: session,
-        install_id: Uuid::nil(),
+        install_id,
         source_session_id,
         source_kind: "app-server".into(),
         workspace: None,

@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     CODEX_SCHEMA_SHA256, CODEX_VERSION, CodexError, CodexProbe, JsonRpcTransport, ProcessTransport,
-    ReadOnlyAppServerClient, capture_jsonl_file, collect_jsonl_paths, normalize_thread_read_bytes,
-    tree_digest,
+    ReadOnlyAppServerClient, capture_jsonl_file, collect_jsonl_paths,
+    normalize_thread_read_bytes_for_install, tree_digest,
 };
 
 pub struct CodexAdapter {
@@ -144,11 +144,15 @@ impl SourceAdapter for CodexAdapter {
                 "Codex install does not belong to this adapter".into(),
             ));
         }
-        CodexProbe::from_outputs(
-            &format!("codex-cli {}", install.executable_version),
-            "--listen stdio://",
-        )
-        .map_err(|_| AdapterError::InvalidData("Codex probe failed".into()))
+        let report = match self.executable.as_deref() {
+            Some(executable) => CodexProbe::run(executable),
+            None => CodexProbe::from_outputs(
+                &format!("codex-cli {}", install.executable_version),
+                "--listen stdio://",
+            ),
+        }
+        .map_err(|_| AdapterError::InvalidData("Codex probe failed".into()))?;
+        Ok(report)
     }
 
     fn capture(&self, request: &CaptureRequest) -> Result<CaptureBatch, AdapterError> {
@@ -245,7 +249,7 @@ impl SourceAdapter for CodexAdapter {
                 fingerprint: format!("sha256:{}", hex::encode(Sha256::digest(&record.bytes))),
             });
         }
-        match normalize_thread_read_bytes(&record.bytes) {
+        match normalize_thread_read_bytes_for_install(&record.bytes, self.install().id) {
             Ok(mut session) => {
                 if record.source_locator.contains("/archived/") {
                     session.archived = true;
@@ -368,5 +372,33 @@ mod tests {
         assert_eq!(records[0].source_session_id.as_deref(), Some("thread-a"));
         let outcome = adapter.normalize(&records[0]).unwrap();
         assert!(matches!(outcome, NormalizeOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn canonical_identity_is_scoped_to_the_authorized_install() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let adapter_a = CodexAdapter::new(root_a.path()).unwrap();
+        let adapter_b = CodexAdapter::new(root_b.path()).unwrap();
+        let record = |_adapter: &CodexAdapter| CapturedRecord {
+            source: CapturedSource::AppServerSemantic,
+            source_locator: "app-server/active/thread-a.json".into(),
+            source_session_id: Some("thread-a".into()),
+            source_record_id: Some("thread-a".into()),
+            ordinal: 0,
+            snapshot_id: "snapshot".into(),
+            bytes: br#"{"result":{"thread":{"id":"thread-a","turns":[]}}}"#.to_vec(),
+        };
+        let first = adapter_a.normalize(&record(&adapter_a)).unwrap();
+        let second = adapter_b.normalize(&record(&adapter_b)).unwrap();
+        let first_id = match first {
+            NormalizeOutcome::Normalized(session) => session.id,
+            _ => panic!("expected normalized session"),
+        };
+        let second_id = match second {
+            NormalizeOutcome::Normalized(session) => session.id,
+            _ => panic!("expected normalized session"),
+        };
+        assert_ne!(first_id, second_id);
     }
 }

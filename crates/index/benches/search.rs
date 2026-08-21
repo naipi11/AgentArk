@@ -78,7 +78,11 @@ fn main() {
         let session_id = Uuid::from_u128(ordinal + 1);
         let messages = (0..message_parts_per_session)
             .map(|message_ordinal| {
-                let text = format!("deterministic needle {ordinal}-{message_ordinal}");
+                let text = if ordinal % 100 == 0 {
+                    format!("deterministic needle {ordinal}-{message_ordinal}")
+                } else {
+                    format!("background fixture {ordinal}-{message_ordinal}")
+                };
                 let raw_ref = Sha256Digest::from_bytes(text.as_bytes());
                 CanonicalMessage {
                     id: message_id(

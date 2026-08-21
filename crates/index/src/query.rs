@@ -95,6 +95,7 @@ impl SessionQuery for IndexDb {
                  SELECT rowid, rank
                  FROM session_fts
                  WHERE session_fts MATCH ?1
+                 ORDER BY rank
                  LIMIT ?2
              )
              SELECT s.id, s.search_title,

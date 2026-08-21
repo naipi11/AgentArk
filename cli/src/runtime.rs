@@ -91,7 +91,7 @@ pub fn scan_codex(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeEr
     let executable = resolve_codex_executable();
     let adapter =
         CodexAdapter::with_executable(root, executable).map_err(|_| RuntimeError::Storage)?;
-    let install = adapter
+    let mut install = adapter
         .detect(&DetectContext {
             explicit_roots: vec![root.to_path_buf()],
             allow_detected_home: false,
@@ -99,6 +99,17 @@ pub fn scan_codex(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeEr
         .map_err(|_| RuntimeError::Storage)?
         .pop()
         .ok_or(RuntimeError::Authorization)?;
+    let probe = adapter.probe(&install).map_err(|_| RuntimeError::Probe)?;
+    if probe.quarantine_reason.is_some() {
+        return Err(RuntimeError::Probe);
+    }
+    install.executable_version = probe.executable_version;
+    install.schema_fingerprint = probe.schema_fingerprint;
+    install.capabilities = probe
+        .capabilities
+        .into_iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect();
     let (cas, index, keys_store) = open_storage(data_root)?;
     let _ = keys_store;
     let mut service = ScanService::new(
