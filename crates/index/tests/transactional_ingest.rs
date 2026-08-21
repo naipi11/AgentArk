@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession,
-    Completeness, canonical_hash,
+    Completeness, Workspace, canonical_hash, workspace_id,
 };
 use agentark_index::{
     IndexDb, ScanManifest, ScanManifestStatus, SessionIndex, SessionIngest, SessionQuery,
@@ -229,4 +229,60 @@ fn interleaved_messages_and_tool_events_follow_global_ordinal_order() {
     })
     .unwrap();
     assert_eq!(db.list_sessions(10, 0).unwrap().len(), 1);
+}
+
+#[test]
+fn workspace_upsert_updates_existing_session_assignment() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let db_path = dir.path().join("agentark.db");
+    let mut db = IndexDb::open(&db_path, keys.sqlcipher_key()).unwrap();
+    let install = AgentInstall {
+        id: Uuid::new_v4(),
+        kind: AgentKind::Codex,
+        executable_version: "0.146.0".into(),
+        authorized_root_uri: "file:///fixture".into(),
+        adapter_version: "0.1.0".into(),
+        schema_fingerprint: "sha256:fixture".into(),
+        capabilities: BTreeSet::new(),
+        quarantine_reason: None,
+    };
+    let first = session(
+        install.id,
+        vec![CanonicalMessage::text_fixture(1, "same", "first")],
+    );
+    let first_hash = canonical_hash("session", &first).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &first,
+        source_records: &[],
+        sanitized_title: "first",
+        sanitized_body: "first",
+        findings: &[],
+        canonical_hash: &first_hash,
+    })
+    .unwrap();
+    let mut second = first.clone();
+    second.workspace = Some(Workspace {
+        id: workspace_id("file:///C:/project"),
+        path_native: "C:\\project".into(),
+        canonical_uri: "file:///C:/project".into(),
+        git_commit: None,
+    });
+    let second_hash = canonical_hash("session", &second).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &second,
+        source_records: &[],
+        sanitized_title: "second",
+        sanitized_body: "second",
+        findings: &[],
+        canonical_hash: &second_hash,
+    })
+    .unwrap();
+    let workspaces = db.list_workspaces(10, 0).unwrap();
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].session_count, 1);
 }

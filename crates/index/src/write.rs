@@ -209,7 +209,8 @@ impl SessionIndex for IndexDb {
              title, archived, completeness, canonical_hash, canonical_json, search_title,
              search_body, model_provider, model_name, revision, stale, last_scan_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)
-             ON CONFLICT(id) DO UPDATE SET title=excluded.title, archived=excluded.archived,
+             ON CONFLICT(id) DO UPDATE SET install_id=excluded.install_id,
+               workspace_id=excluded.workspace_id, title=excluded.title, archived=excluded.archived,
                completeness=excluded.completeness, canonical_hash=excluded.canonical_hash,
                canonical_json=excluded.canonical_json, search_title=excluded.search_title,
                search_body=excluded.search_body, model_provider=excluded.model_provider,
