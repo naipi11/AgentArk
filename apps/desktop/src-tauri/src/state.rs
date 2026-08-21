@@ -133,18 +133,37 @@ impl AppState {
             .map(|capability| format!("{capability:?}"))
             .collect();
 
-        let (cas, index) = open_storage(&self.data_root)?;
-        let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
-        let mut service = ScanService::new(adapter, cas, index, scanner);
-        let report = service
-            .run(ScanRequest {
-                install,
-                snapshot_hint: None,
-            })
-            .map_err(|error| format!("扫描失败：{error}"))?;
-        drop(service);
-        self.refresh_query_index()?;
-        Ok(report)
+        self.release_query_index()?;
+        let scan_result = (|| {
+            let (cas, index) = open_storage(&self.data_root)?;
+            let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+            let mut service = ScanService::new(adapter, cas, index, scanner);
+            service
+                .run(ScanRequest {
+                    install,
+                    snapshot_hint: None,
+                })
+                .map_err(|error| format!("扫描失败：{error}"))
+        })();
+        match scan_result {
+            Ok(report) => {
+                self.refresh_query_index()?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = self.refresh_query_index();
+                Err(error)
+            }
+        }
+    }
+
+    fn release_query_index(&self) -> Result<(), String> {
+        let mut services = self
+            .services
+            .lock()
+            .map_err(|_| "桌面端状态不可用".to_owned())?;
+        services.queries = Box::new(EmptyQuery);
+        Ok(())
     }
 
     fn refresh_query_index(&self) -> Result<(), String> {
