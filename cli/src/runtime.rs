@@ -9,6 +9,7 @@ use agentark_adapter_openclaw::OpenClawAdapter;
 use agentark_adapter_opencode::OpenCodeAdapter;
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{AppError, ScanReport, ScanRequest, ScanService, VerificationService};
+use agentark_bundle::{BundleError, read_bundle, write_sessions};
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
@@ -46,6 +47,17 @@ pub struct ProbeData {
     pub schema_fingerprint: String,
     pub capabilities: Vec<String>,
     pub quarantine_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleData {
+    pub format: String,
+    pub session_count: u64,
+    pub entry_count: usize,
+    pub redacted: bool,
+    pub redaction_count: u64,
+    pub restore_scan_id: Option<Uuid>,
 }
 
 pub fn data_dir(override_dir: Option<PathBuf>) -> PathBuf {
@@ -94,6 +106,55 @@ pub fn doctor(root: &Path) -> DoctorData {
             "notInitialized"
         },
     }
+}
+
+pub fn export_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeError> {
+    let (_cas, index, _store) = open_storage_existing(root)?;
+    let sessions = index.all_sessions().map_err(|_| RuntimeError::Storage)?;
+    let scanner = SecretScanner::v1().map_err(|_| RuntimeError::Storage)?;
+    let manifest = write_sessions(path, &sessions, &scanner).map_err(bundle_error)?;
+    Ok(BundleData {
+        format: manifest.format,
+        session_count: manifest.session_count,
+        entry_count: manifest.entries.len() + 1,
+        redacted: manifest.redacted,
+        redaction_count: manifest.redaction_count,
+        restore_scan_id: None,
+    })
+}
+
+pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
+    let bundle = read_bundle(path).map_err(bundle_error)?;
+    Ok(BundleData {
+        format: bundle.manifest.format.clone(),
+        session_count: bundle.manifest.session_count,
+        entry_count: bundle.entries.len(),
+        redacted: bundle.manifest.redacted,
+        redaction_count: bundle.manifest.redaction_count,
+        restore_scan_id: None,
+    })
+}
+
+pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeError> {
+    let bundle = read_bundle(path).map_err(bundle_error)?;
+    let sessions = bundle.session_records().map_err(bundle_error)?;
+    let (_cas, mut index, _store) = open_storage_existing(root)?;
+    let scan_id = index
+        .restore_sessions(&sessions)
+        .map_err(|_| RuntimeError::Storage)?;
+    Ok(BundleData {
+        format: bundle.manifest.format.clone(),
+        session_count: bundle.manifest.session_count,
+        entry_count: bundle.entries.len(),
+        redacted: bundle.manifest.redacted,
+        redaction_count: bundle.manifest.redaction_count,
+        restore_scan_id: Some(scan_id),
+    })
+}
+
+fn bundle_error(error: BundleError) -> RuntimeError {
+    let _ = error;
+    RuntimeError::Storage
 }
 
 pub fn probe_codex() -> Result<ProbeData, RuntimeError> {

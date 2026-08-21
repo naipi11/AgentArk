@@ -41,6 +41,7 @@ dependencies = [
  "agentark-adapter-opencode",
  "agentark-adapter-sdk",
  "agentark-app",
+ "agentark-bundle",
  "agentark-canonical",
  "agentark-cas",
  "agentark-index",
@@ -202,6 +203,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentark-bundle"
+version = "0.1.0"
+dependencies = [
+ "agentark-canonical",
+ "agentark-security",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "agentark-canonical"
 version = "0.1.0"
 dependencies = [
@@ -245,6 +262,7 @@ dependencies = [
  "agentark-adapter-opencode",
  "agentark-adapter-sdk",
  "agentark-app",
+ "agentark-bundle",
  "agentark-cas",
  "agentark-index",
  "agentark-security",

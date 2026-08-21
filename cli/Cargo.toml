@@ -12,6 +12,7 @@ agentark-adapter-hermes = { path = "../crates/adapters/hermes" }
 agentark-adapter-openclaw = { path = "../crates/adapters/openclaw" }
 agentark-adapter-opencode = { path = "../crates/adapters/opencode" }
 agentark-adapter-grok = { path = "../crates/adapters/grok" }
+agentark-bundle = { path = "../crates/bundle" }
 agentark-adapter-sdk = { path = "../crates/adapter-sdk" }
 agentark-app = { path = "../crates/app" }
 agentark-canonical = { path = "../crates/canonical" }

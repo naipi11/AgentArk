@@ -39,6 +39,17 @@ pub enum Command {
         #[arg(long)]
         scan_id: Option<Uuid>,
     },
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BundleCommand {
+    Export { path: PathBuf },
+    Verify { path: PathBuf },
+    Restore { path: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]

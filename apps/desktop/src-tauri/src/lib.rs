@@ -25,6 +25,9 @@ pub fn run() {
             commands::opencode_default_root,
             commands::scan_grok_build,
             commands::grok_build_default_root,
+            commands::bundle_export,
+            commands::bundle_verify,
+            commands::bundle_restore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentArk desktop");
@@ -56,7 +59,10 @@ mod tests {
                 "scan_opencode",
                 "opencode_default_root",
                 "scan_grok_build",
-                "grok_build_default_root"
+                "grok_build_default_root",
+                "bundle_export",
+                "bundle_verify",
+                "bundle_restore"
             ]
         );
     }

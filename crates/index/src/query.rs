@@ -210,6 +210,21 @@ impl SessionQuery for IndexDb {
     }
 }
 
+impl IndexDb {
+    /// Returns every canonical session for portable backup/export.
+    pub fn all_sessions(&self) -> Result<Vec<CanonicalSession>, IndexError> {
+        let mut statement = self
+            .connection()
+            .prepare("SELECT canonical_json FROM sessions ORDER BY rowid ASC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let json = row?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .collect()
+    }
+}
+
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))

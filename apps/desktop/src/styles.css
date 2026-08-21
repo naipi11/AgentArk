@@ -36,6 +36,10 @@ dl { display: grid; grid-template-columns: 180px 1fr; gap: 10px 20px; margin: 24
 .primary-button { border: 1px solid #4da9e4; color: #06111a; background: #75caff; border-radius: 9px; padding: 9px 16px; font-weight: 700; }
 .primary-button:hover { background: #9bdcff; }
 .primary-button:disabled { cursor: wait; opacity: .65; }
+.backup-panel { margin-top: 30px; padding-top: 22px; border-top: 1px solid #243745; }
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.button-row button { border: 1px solid #304655; color: #dce8ef; background: #101d27; border-radius: 9px; padding: 9px 13px; }
+.button-row button:hover { border-color: #55b8ff; }
 .scan-hint { margin-top: 12px; font-size: 12px; }
 .error-message { margin-top: 18px; color: #ffab9d; }
 .scan-result { display: grid; gap: 7px; margin-top: 24px; border: 1px solid #2e7f9d; border-radius: 12px; padding: 14px; background: #102731; }

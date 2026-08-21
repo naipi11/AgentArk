@@ -55,6 +55,14 @@ export type ScanReport = {
   retryable: number;
   rejected: number;
 };
+export type BundleReport = {
+  format: string;
+  sessionCount: number;
+  entryCount: number;
+  redacted: boolean;
+  redactionCount: number;
+  restoreScanId?: string;
+};
 
 export const api = {
   status: () => invoke<StatusDto>('status'),
@@ -74,5 +82,8 @@ export const api = {
   scanOpenClaw: (sourceRoot: string) => invoke<ScanReport>('scan_openclaw', { sourceRoot }),
   scanOpenCode: (sourceRoot: string) => invoke<ScanReport>('scan_opencode', { sourceRoot }),
   scanGrokBuild: (sourceRoot: string) => invoke<ScanReport>('scan_grok_build', { sourceRoot }),
+  bundleExport: (path: string) => invoke<BundleReport>('bundle_export', { path }),
+  bundleVerify: (path: string) => invoke<BundleReport>('bundle_verify', { path }),
+  bundleRestore: (path: string) => invoke<BundleReport>('bundle_restore', { path }),
   workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

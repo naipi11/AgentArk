@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[allow(dead_code)]
-pub const REGISTERED_COMMANDS: [&str; 18] = [
+pub const REGISTERED_COMMANDS: [&str; 21] = [
     "status",
     "sessions_list",
     "sessions_show",
@@ -29,6 +29,9 @@ pub const REGISTERED_COMMANDS: [&str; 18] = [
     "opencode_default_root",
     "scan_grok_build",
     "grok_build_default_root",
+    "bundle_export",
+    "bundle_verify",
+    "bundle_restore",
 ];
 
 #[tauri::command]
@@ -162,6 +165,27 @@ pub fn scan_grok_build(
 #[tauri::command]
 pub fn grok_build_default_root() -> Option<String> {
     crate::state::detected_grok_build_home().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn bundle_export(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::state::BundleReport, String> {
+    state.bundle_export(std::path::PathBuf::from(path.trim()))
+}
+
+#[tauri::command]
+pub fn bundle_verify(path: String) -> Result<crate::state::BundleReport, String> {
+    AppState::empty().bundle_verify(std::path::PathBuf::from(path.trim()))
+}
+
+#[tauri::command]
+pub fn bundle_restore(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::state::BundleReport, String> {
+    state.bundle_restore(std::path::PathBuf::from(path.trim()))
 }
 
 fn with_query<T>(

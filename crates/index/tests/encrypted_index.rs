@@ -99,6 +99,29 @@ fn reopens_existing_encrypted_index_without_reapplying_migrations() {
 }
 
 #[test]
+fn restores_bundle_sessions_into_searchable_archive() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let mut db = IndexDb::open(&dir.path().join("agentark.db"), keys.sqlcipher_key()).unwrap();
+    let (_install, session, _) = fixture();
+    let scan_id = db.restore_sessions(std::slice::from_ref(&session)).unwrap();
+    assert!(db.show_session(session.id).is_ok());
+    assert_eq!(db.search("CanonicalVisibleCanary", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.connection()
+            .query_row(
+                "SELECT status FROM scan_runs WHERE id = ?1",
+                [scan_id.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "complete"
+    );
+}
+
+#[test]
 fn search_limit_is_applied_after_rank_ordering() {
     let dir = tempdir().unwrap();
     let store = MemoryMasterKeyStore::empty();

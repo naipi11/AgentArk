@@ -3,6 +3,7 @@ members = [
   "crates/canonical",
   "crates/security",
   "crates/cas",
+  "crates/bundle",
   "crates/index",
   "crates/adapter-sdk",
   "crates/app",

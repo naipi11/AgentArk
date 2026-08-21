@@ -14,7 +14,8 @@ type MessageKey =
   | 'sessions.archive' | 'sessions.project' | 'sessions.title' | 'sessions.filter'
   | 'sessions.untitled' | 'sessions.noResults' | 'sessions.stale'
   | 'timeline.title' | 'timeline.untitled' | 'timeline.select'
-  | 'quarantine.safety' | 'quarantine.title' | 'quarantine.empty';
+  | 'quarantine.safety' | 'quarantine.title' | 'quarantine.empty'
+  | 'backup.title' | 'backup.path' | 'backup.placeholder' | 'backup.export' | 'backup.verify' | 'backup.restore' | 'backup.success' | 'backup.error';
 
 const messages: Record<Locale, Record<MessageKey, string>> = {
   'en-US': {
@@ -27,6 +28,7 @@ const messages: Record<Locale, Record<MessageKey, string>> = {
     'sessions.archive': 'Archive', 'sessions.project': 'Project', 'sessions.title': 'Sessions', 'sessions.filter': 'Filter sessions', 'sessions.untitled': 'Untitled session', 'sessions.noResults': 'No sessions found.', 'sessions.stale': 'stale',
     'timeline.title': 'Timeline', 'timeline.untitled': 'Untitled session', 'timeline.select': 'Select a session to inspect its timeline.',
     'quarantine.safety': 'Safety boundary', 'quarantine.title': 'Quarantine', 'quarantine.empty': 'No quarantined records.',
+    'backup.title': 'Portable backup (.ahbundle)', 'backup.path': 'Bundle path', 'backup.placeholder': 'C:\\Users\\YourName\\agentark-backup.ahbundle', 'backup.export': 'Create backup', 'backup.verify': 'Verify backup', 'backup.restore': 'Restore backup', 'backup.success': 'Backup operation completed', 'backup.error': 'Backup operation failed.',
   },
   'zh-CN': {
     'brand.eyebrow': '本地归档', 'brand.sourceReadonly': '源目录只读',
@@ -38,6 +40,7 @@ const messages: Record<Locale, Record<MessageKey, string>> = {
     'sessions.archive': '归档', 'sessions.project': '项目', 'sessions.title': '会话', 'sessions.filter': '筛选会话', 'sessions.untitled': '未命名会话', 'sessions.noResults': '没有找到会话。', 'sessions.stale': '过期',
     'timeline.title': '时间线', 'timeline.untitled': '未命名会话', 'timeline.select': '请选择一个会话查看时间线。',
     'quarantine.safety': '安全边界', 'quarantine.title': '隔离区', 'quarantine.empty': '没有隔离记录。',
+    'backup.title': '可携带备份（.ahbundle）', 'backup.path': '备份路径', 'backup.placeholder': 'C:\\Users\\你的用户名\\agentark-backup.ahbundle', 'backup.export': '创建备份', 'backup.verify': '验证备份', 'backup.restore': '恢复备份', 'backup.success': '备份操作已完成', 'backup.error': '备份操作失败。',
   },
 };
 

@@ -13,11 +13,24 @@ use agentark_app::{
     AppError, AppServices, LockedIndexQueryService, QueryUseCase, ScanReport, ScanRequest,
     ScanService, ScanUseCase, VerifyUseCase,
 };
+use agentark_bundle::{read_bundle, write_sessions};
 use agentark_cas::EncryptedCas;
 use agentark_index::IndexDb;
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
 use directories::ProjectDirs;
+use serde::Serialize;
 use uuid::Uuid;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleReport {
+    pub format: String,
+    pub session_count: u64,
+    pub entry_count: usize,
+    pub redacted: bool,
+    pub redaction_count: u64,
+    pub restore_scan_id: Option<Uuid>,
+}
 
 pub struct AppState {
     pub services: Arc<Mutex<AppServices>>,
@@ -457,6 +470,72 @@ impl AppState {
                 Err(error)
             }
         }
+    }
+
+    pub fn bundle_export(&self, path: PathBuf) -> Result<BundleReport, String> {
+        if path.as_os_str().is_empty() {
+            return Err("备份路径不能为空".into());
+        }
+        self.release_query_index()?;
+        let result = (|| {
+            let index =
+                open_index(&self.data_root).ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
+            let sessions = index
+                .all_sessions()
+                .map_err(|_| "无法读取本地会话".to_owned())?;
+            let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+            let manifest = write_sessions(&path, &sessions, &scanner)
+                .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
+            Ok(BundleReport {
+                format: manifest.format,
+                session_count: manifest.session_count,
+                entry_count: manifest.entries.len() + 1,
+                redacted: manifest.redacted,
+                redaction_count: manifest.redaction_count,
+                restore_scan_id: None,
+            })
+        })();
+        let _ = self.refresh_query_index();
+        result
+    }
+
+    pub fn bundle_verify(&self, path: PathBuf) -> Result<BundleReport, String> {
+        let bundle = read_bundle(&path).map_err(|_| "无法验证 .ahbundle 文件".to_owned())?;
+        Ok(BundleReport {
+            format: bundle.manifest.format.clone(),
+            session_count: bundle.manifest.session_count,
+            entry_count: bundle.entries.len(),
+            redacted: bundle.manifest.redacted,
+            redaction_count: bundle.manifest.redaction_count,
+            restore_scan_id: None,
+        })
+    }
+
+    pub fn bundle_restore(&self, path: PathBuf) -> Result<BundleReport, String> {
+        if path.as_os_str().is_empty() {
+            return Err("备份路径不能为空".into());
+        }
+        let bundle = read_bundle(&path).map_err(|_| "无法读取 .ahbundle 备份".to_owned())?;
+        let sessions = bundle
+            .session_records()
+            .map_err(|_| "备份中的会话数据无效".to_owned())?;
+        self.release_query_index()?;
+        let result = (|| {
+            let (_cas, mut index) = open_storage(&self.data_root)?;
+            let scan_id = index
+                .restore_sessions(&sessions)
+                .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
+            Ok(BundleReport {
+                format: bundle.manifest.format.clone(),
+                session_count: bundle.manifest.session_count,
+                entry_count: bundle.entries.len(),
+                redacted: bundle.manifest.redacted,
+                redaction_count: bundle.manifest.redaction_count,
+                restore_scan_id: Some(scan_id),
+            })
+        })();
+        let _ = self.refresh_query_index();
+        result
     }
 
     fn release_query_index(&self) -> Result<(), String> {

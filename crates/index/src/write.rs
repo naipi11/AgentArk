@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use agentark_canonical::{
-    AgentInstall, CanonicalSession, Completeness, Sha256Digest, SourceRecord, ToolEvent,
+    AgentInstall, AgentKind, CanonicalSession, Completeness, Sha256Digest, SourceRecord, ToolEvent,
+    canonical_hash,
 };
-use agentark_security::SecretFinding;
+use agentark_security::{SecretFinding, SecretScanner};
 use rusqlite::{OptionalExtension, params};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -425,6 +426,162 @@ impl SessionIndex for IndexDb {
             ],
         )?;
         Ok(())
+    }
+}
+
+impl IndexDb {
+    /// Restore canonical sessions from a verified portable bundle in one transaction.
+    /// Vendor state is never touched; restored rows remain AgentArk-owned archive data.
+    pub fn restore_sessions(&mut self, sessions: &[CanonicalSession]) -> Result<Uuid, IndexError> {
+        let scan_id = Uuid::new_v4();
+        let scanner = SecretScanner::v1().map_err(|_| IndexError::InvariantViolation)?;
+        let tx = self.connection_mut().transaction()?;
+        tx.execute(
+            "INSERT INTO scan_runs(id, adapter_id, snapshot_id, status, started_at)
+             VALUES (?1, 'bundle-restore', ?2, 'running', ?3)",
+            params![
+                scan_id.to_string(),
+                format!("bundle:{scan_id}"),
+                now_string()
+            ],
+        )?;
+        for session in sessions {
+            let install_json = serde_json::to_string(&agent_kind(&session.source_kind))?;
+            let capabilities_json = serde_json::to_string(&vec!["bundle-restore"])?;
+            tx.execute(
+                "INSERT INTO agent_installs(id, kind, executable_version, authorized_root_uri,
+                 adapter_version, schema_fingerprint, capabilities_json, quarantine_reason)
+                 VALUES (?1, ?2, 'bundle', 'bundle://restore', 'bundle-v1', 'sha256:bundle-v1', ?3, NULL)
+                 ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json",
+                params![session.install_id.to_string(), install_json, capabilities_json],
+            )?;
+            let workspace_id = if let Some(workspace) = session.workspace.as_ref() {
+                tx.execute(
+                    "INSERT INTO workspaces(id, path_native, canonical_uri, git_commit)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET path_native=excluded.path_native,
+                       canonical_uri=excluded.canonical_uri, git_commit=excluded.git_commit",
+                    params![
+                        workspace.id.to_string(),
+                        workspace.path_native,
+                        workspace.canonical_uri,
+                        workspace.git_commit
+                    ],
+                )?;
+                Some(workspace.id.to_string())
+            } else {
+                None
+            };
+            let canonical_json = serde_json::to_string(session)?;
+            let canonical_hash = canonical_hash("session", session)
+                .map_err(|_| IndexError::InvariantViolation)?
+                .as_str()
+                .to_owned();
+            let sanitized_title = scanner
+                .sanitize(session.title.as_deref().unwrap_or(""))
+                .text;
+            let sanitized_body = scanner.sanitize(&session.searchable_text()).text;
+            let prior_revision: Option<i64> = tx
+                .query_row(
+                    "SELECT revision FROM sessions WHERE id = ?1",
+                    params![session.id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            tx.execute(
+                "DELETE FROM session_fts WHERE session_id = ?1",
+                params![session.id.to_string()],
+            )?;
+            for table in [
+                "messages",
+                "tool_events",
+                "attachments",
+                "secret_findings",
+                "source_records",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                    params![session.id.to_string()],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO sessions(id, install_id, workspace_id, source_session_id, source_kind,
+                 title, archived, completeness, canonical_hash, canonical_json, search_title,
+                 search_body, model_provider, model_name, revision, stale, last_scan_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)
+                 ON CONFLICT(id) DO UPDATE SET install_id=excluded.install_id,
+                   workspace_id=excluded.workspace_id, title=excluded.title, archived=excluded.archived,
+                   completeness=excluded.completeness, canonical_hash=excluded.canonical_hash,
+                   canonical_json=excluded.canonical_json, search_title=excluded.search_title,
+                   search_body=excluded.search_body, model_provider=excluded.model_provider,
+                   model_name=excluded.model_name, revision=excluded.revision, stale=0,
+                   last_scan_id=excluded.last_scan_id",
+                params![
+                    session.id.to_string(), session.install_id.to_string(), workspace_id,
+                    session.source_session_id, session.source_kind, sanitized_title,
+                    session.archived, completeness_label(&session.completeness), canonical_hash,
+                    canonical_json, sanitized_title, sanitized_body, session.model_provider,
+                    session.model_name, prior_revision.unwrap_or(0) + 1, scan_id.to_string(),
+                ],
+            )?;
+            for message in &session.messages {
+                tx.execute(
+                    "INSERT INTO messages(id, session_id, ordinal, role, raw_role, visible_text,
+                     raw_ref, message_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        message.id.to_string(),
+                        session.id.to_string(),
+                        message.ordinal as i64,
+                        serde_json::to_string(&message.role)?,
+                        message.raw_role,
+                        scanner.sanitize(&message.visible_text()).text,
+                        message.raw_ref.as_str(),
+                        serde_json::to_string(message)?
+                    ],
+                )?;
+            }
+            for event in &session.tool_events {
+                insert_tool_event(&tx, session.id, event)?;
+            }
+            for attachment in &session.attachments {
+                tx.execute(
+                    "INSERT INTO attachments(id, session_id, source_locator, media_type, size,
+                     sha256, raw_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id.to_string(),
+                        session.id.to_string(),
+                        attachment.source_locator,
+                        attachment.media_type,
+                        attachment.size as i64,
+                        attachment.sha256.as_str(),
+                        attachment.raw_ref.as_str()
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO session_fts(session_id, title, body) VALUES (?1, ?2, ?3)",
+                params![session.id.to_string(), sanitized_title, sanitized_body],
+            )?;
+        }
+        tx.execute(
+            "UPDATE scan_runs SET status='complete', completed_at=?1, indexed_count=?2,
+             quarantined_count=0, retryable_count=0, rejected_count=0 WHERE id=?3",
+            params![now_string(), sessions.len() as i64, scan_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(scan_id)
+    }
+}
+
+fn agent_kind(source_kind: &str) -> AgentKind {
+    match source_kind {
+        "codex" => AgentKind::Codex,
+        "claude" | "claude-code" => AgentKind::ClaudeCode,
+        "hermes" => AgentKind::Hermes,
+        "openclaw" => AgentKind::OpenClaw,
+        "opencode" => AgentKind::OpenCode,
+        "grok" | "grok-build" => AgentKind::GrokBuild,
+        _ => AgentKind::Codex,
     }
 }
 
