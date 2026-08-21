@@ -116,9 +116,12 @@ impl AppState {
             .map_err(|_| "无法识别 Codex 数据目录".to_owned())?
             .pop()
             .ok_or_else(|| "未授权的 Codex 数据目录".to_owned())?;
-        let probe = adapter
-            .probe(&install)
-            .map_err(|_| "未找到可用的 Codex，或 Codex App Server 不兼容".to_owned())?;
+        let probe = adapter.probe(&install).map_err(|error| {
+            format!(
+                "未找到可用的 Codex（{}）：{error}",
+                executable.to_string_lossy()
+            )
+        })?;
         if probe.quarantine_reason.is_some() {
             return Err("当前 Codex 版本不受支持，扫描已停止".into());
         }
@@ -227,9 +230,12 @@ fn resolve_codex_executable() -> PathBuf {
         return PathBuf::from(path);
     }
     if let Some(app_data) = std::env::var_os("APPDATA") {
-        let npm_shim = PathBuf::from(app_data).join("npm").join("codex.cmd");
-        if npm_shim.is_file() {
-            return npm_shim;
+        let npm_dir = PathBuf::from(app_data).join("npm");
+        for candidate in ["codex.opencodex-real.cmd", "codex.cmd"] {
+            let path = npm_dir.join(candidate);
+            if path.is_file() {
+                return path;
+            }
         }
     }
     let directories =

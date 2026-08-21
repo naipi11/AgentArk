@@ -151,7 +151,7 @@ impl SourceAdapter for CodexAdapter {
                 "--listen stdio://",
             ),
         }
-        .map_err(|_| AdapterError::InvalidData("Codex probe failed".into()))?;
+        .map_err(|error| AdapterError::InvalidData(format!("Codex probe failed: {error}")))?;
         Ok(report)
     }
 

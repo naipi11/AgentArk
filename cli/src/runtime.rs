@@ -249,9 +249,12 @@ fn resolve_codex_executable() -> PathBuf {
         return PathBuf::from(path);
     }
     if let Some(app_data) = std::env::var_os("APPDATA") {
-        let npm_shim = PathBuf::from(app_data).join("npm").join("codex.cmd");
-        if npm_shim.is_file() {
-            return npm_shim;
+        let npm_dir = PathBuf::from(app_data).join("npm");
+        for candidate in ["codex.opencodex-real.cmd", "codex.cmd"] {
+            let path = npm_dir.join(candidate);
+            if path.is_file() {
+                return path;
+            }
         }
     }
     let directories =
