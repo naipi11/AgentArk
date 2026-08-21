@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use agentark_adapter_claude::ClaudeCodeAdapter;
 use agentark_adapter_codex::CodexAdapter;
 use agentark_adapter_hermes::HermesAdapter;
+use agentark_adapter_openclaw::OpenClawAdapter;
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{
     AppError, AppServices, LockedIndexQueryService, QueryUseCase, ScanReport, ScanRequest,
@@ -282,6 +283,63 @@ impl AppState {
         }
     }
 
+    pub fn scan_openclaw(&self, source_root: PathBuf) -> Result<ScanReport, String> {
+        let _scan_guard = self
+            .scan_lock
+            .lock()
+            .map_err(|_| "扫描状态不可用".to_owned())?;
+        let source_root = if source_root.as_os_str().is_empty() {
+            detected_openclaw_home().ok_or_else(|| "找不到默认 OpenClaw 数据目录".to_owned())?
+        } else {
+            source_root
+        };
+        if !source_root.is_dir() {
+            return Err("OpenClaw 数据目录不存在或不是目录".into());
+        }
+        let adapter = OpenClawAdapter::new(&source_root)
+            .map_err(|_| "无法打开 OpenClaw 数据目录".to_owned())?;
+        let mut install = adapter
+            .detect(&DetectContext {
+                explicit_roots: vec![source_root],
+                allow_detected_home: false,
+            })
+            .map_err(|_| "无法识别 OpenClaw 数据目录".to_owned())?
+            .pop()
+            .ok_or_else(|| "未找到 OpenClaw SQLite 数据库".to_owned())?;
+        let probe = adapter
+            .probe(&install)
+            .map_err(|error| format!("OpenClaw 探测失败：{error}"))?;
+        install.executable_version = probe.executable_version;
+        install.schema_fingerprint = probe.schema_fingerprint;
+        install.capabilities = probe
+            .capabilities
+            .into_iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect();
+        self.release_query_index()?;
+        let scan_result = (|| {
+            let (cas, index) = open_storage(&self.data_root)?;
+            let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+            let mut service = ScanService::new(adapter, cas, index, scanner);
+            service
+                .run(ScanRequest {
+                    install,
+                    snapshot_hint: None,
+                })
+                .map_err(|error| format!("扫描失败：{error}"))
+        })();
+        match scan_result {
+            Ok(report) => {
+                self.refresh_query_index()?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = self.refresh_query_index();
+                Err(error)
+            }
+        }
+    }
+
     fn release_query_index(&self) -> Result<(), String> {
         let mut services = self
             .services
@@ -319,6 +377,10 @@ pub fn detected_claude_home() -> Option<PathBuf> {
 
 pub fn detected_hermes_home() -> Option<PathBuf> {
     HermesAdapter::default_home()
+}
+
+pub fn detected_openclaw_home() -> Option<PathBuf> {
+    OpenClawAdapter::default_home()
 }
 
 fn default_data_dir() -> PathBuf {

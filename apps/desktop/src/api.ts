@@ -65,8 +65,10 @@ export const api = {
   codexDefaultRoot: () => invoke<string | null>('codex_default_root'),
   claudeDefaultRoot: () => invoke<string | null>('claude_default_root'),
   hermesDefaultRoot: () => invoke<string | null>('hermes_default_root'),
+  openclawDefaultRoot: () => invoke<string | null>('openclaw_default_root'),
   scanCodex: (sourceRoot: string) => invoke<ScanReport>('scan_codex', { sourceRoot }),
   scanClaude: (sourceRoot: string) => invoke<ScanReport>('scan_claude', { sourceRoot }),
   scanHermes: (sourceRoot: string) => invoke<ScanReport>('scan_hermes', { sourceRoot }),
+  scanOpenClaw: (sourceRoot: string) => invoke<ScanReport>('scan_openclaw', { sourceRoot }),
   workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

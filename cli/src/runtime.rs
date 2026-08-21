@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use agentark_adapter_claude::ClaudeCodeAdapter;
 use agentark_adapter_codex::{CodexAdapter, CodexProbe};
 use agentark_adapter_hermes::HermesAdapter;
+use agentark_adapter_openclaw::OpenClawAdapter;
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{AppError, ScanReport, ScanRequest, ScanService, VerificationService};
 use agentark_cas::EncryptedCas;
@@ -71,6 +72,10 @@ pub fn detected_hermes_home() -> Option<PathBuf> {
     HermesAdapter::default_home()
 }
 
+pub fn detected_openclaw_home() -> Option<PathBuf> {
+    OpenClawAdapter::default_home()
+}
+
 pub fn doctor(root: &Path) -> DoctorData {
     DoctorData {
         dataset_state: if root.join("bootstrap.json").is_file() {
@@ -125,6 +130,31 @@ pub fn probe_claude() -> Result<ProbeData, RuntimeError> {
 pub fn probe_hermes() -> Result<ProbeData, RuntimeError> {
     let root = detected_hermes_home().ok_or(RuntimeError::Authorization)?;
     let adapter = HermesAdapter::new(&root).map_err(|_| RuntimeError::Storage)?;
+    let install = adapter
+        .detect(&DetectContext {
+            explicit_roots: vec![root],
+            allow_detected_home: false,
+        })
+        .map_err(|_| RuntimeError::Storage)?
+        .pop()
+        .ok_or(RuntimeError::Authorization)?;
+    let report = adapter.probe(&install).map_err(|_| RuntimeError::Probe)?;
+    Ok(ProbeData {
+        adapter_id: report.adapter_id,
+        executable_version: report.executable_version,
+        schema_fingerprint: report.schema_fingerprint,
+        capabilities: report
+            .capabilities
+            .into_iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect(),
+        quarantine_reason: report.quarantine_reason,
+    })
+}
+
+pub fn probe_openclaw() -> Result<ProbeData, RuntimeError> {
+    let root = detected_openclaw_home().ok_or(RuntimeError::Authorization)?;
+    let adapter = OpenClawAdapter::new(&root).map_err(|_| RuntimeError::Storage)?;
     let install = adapter
         .detect(&DetectContext {
             explicit_roots: vec![root],
@@ -225,6 +255,40 @@ pub fn scan_claude(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeE
 
 pub fn scan_hermes(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeError> {
     let adapter = HermesAdapter::new(root).map_err(|_| RuntimeError::Storage)?;
+    let mut install = adapter
+        .detect(&DetectContext {
+            explicit_roots: vec![root.to_path_buf()],
+            allow_detected_home: false,
+        })
+        .map_err(|_| RuntimeError::Storage)?
+        .pop()
+        .ok_or(RuntimeError::Authorization)?;
+    let probe = adapter.probe(&install).map_err(|_| RuntimeError::Probe)?;
+    install.executable_version = probe.executable_version;
+    install.schema_fingerprint = probe.schema_fingerprint;
+    install.capabilities = probe
+        .capabilities
+        .into_iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect();
+    let (cas, index, keys_store) = open_storage(data_root)?;
+    let _ = keys_store;
+    let mut service = ScanService::new(
+        adapter,
+        cas,
+        index,
+        SecretScanner::v1().map_err(|_| RuntimeError::Storage)?,
+    );
+    service
+        .run(ScanRequest {
+            install,
+            snapshot_hint: None,
+        })
+        .map_err(RuntimeError::App)
+}
+
+pub fn scan_openclaw(root: &Path, data_root: &Path) -> Result<ScanReport, RuntimeError> {
+    let adapter = OpenClawAdapter::new(root).map_err(|_| RuntimeError::Storage)?;
     let mut install = adapter
         .detect(&DetectContext {
             explicit_roots: vec![root.to_path_buf()],

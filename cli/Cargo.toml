@@ -9,6 +9,7 @@ publish.workspace = true
 agentark-adapter-codex = { path = "../crates/adapters/codex" }
 agentark-adapter-claude = { path = "../crates/adapters/claude" }
 agentark-adapter-hermes = { path = "../crates/adapters/hermes" }
+agentark-adapter-openclaw = { path = "../crates/adapters/openclaw" }
 agentark-adapter-sdk = { path = "../crates/adapter-sdk" }
 agentark-app = { path = "../crates/app" }
 agentark-canonical = { path = "../crates/canonical" }

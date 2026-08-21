@@ -33,7 +33,10 @@ dependencies = [
 name = "agentark"
 version = "0.1.0"
 dependencies = [
+ "agentark-adapter-claude",
  "agentark-adapter-codex",
+ "agentark-adapter-hermes",
+ "agentark-adapter-openclaw",
  "agentark-adapter-sdk",
  "agentark-app",
  "agentark-canonical",
@@ -52,6 +55,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentark-adapter-claude"
+version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-canonical",
+ "agentark-security",
+ "dunce",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "agentark-adapter-codex"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +86,39 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "agentark-adapter-hermes"
+version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-canonical",
+ "agentark-security",
+ "dunce",
+ "hex",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "agentark-adapter-openclaw"
+version = "0.1.0"
+dependencies = [
+ "agentark-adapter-sdk",
+ "agentark-canonical",
+ "agentark-security",
+ "dunce",
+ "hex",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -150,7 +203,10 @@ dependencies = [
 name = "agentark-desktop"
 version = "0.1.0"
 dependencies = [
+ "agentark-adapter-claude",
  "agentark-adapter-codex",
+ "agentark-adapter-hermes",
+ "agentark-adapter-openclaw",
  "agentark-adapter-sdk",
  "agentark-app",
  "agentark-cas",

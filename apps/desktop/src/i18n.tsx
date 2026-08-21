@@ -6,7 +6,7 @@ type MessageKey =
   | 'tabs.status' | 'tabs.scan' | 'tabs.projects' | 'tabs.sessions' | 'tabs.timeline' | 'tabs.quarantine'
   | 'locale.label' | 'locale.en' | 'locale.zh'
   | 'status.loading' | 'status.dataset' | 'status.adapter' | 'status.executable' | 'status.schema'
-  | 'scan.import' | 'scan.title' | 'scan.description' | 'scan.directory' | 'scan.placeholder'
+  | 'scan.import' | 'scan.title' | 'scan.description' | 'scan.directory' | 'scan.placeholder' | 'scan.agent'
   | 'scan.scanning' | 'scan.now' | 'scan.hint' | 'scan.complete' | 'scan.warnings' | 'scan.failed'
   | 'scan.error' | 'scan.id'
   | 'projects.workspaces' | 'projects.title' | 'projects.countOne' | 'projects.countMany'
@@ -22,7 +22,7 @@ const messages: Record<Locale, Record<MessageKey, string>> = {
     'tabs.status': 'Status', 'tabs.scan': 'Scan', 'tabs.projects': 'Projects', 'tabs.sessions': 'Sessions', 'tabs.timeline': 'Timeline', 'tabs.quarantine': 'Quarantine',
     'locale.label': 'Language', 'locale.en': 'English', 'locale.zh': '中文',
     'status.loading': 'Loading status…', 'status.dataset': 'Dataset', 'status.adapter': 'Adapter', 'status.executable': 'Executable', 'status.schema': 'Schema fingerprint',
-    'scan.import': 'Import', 'scan.title': 'Scan Codex', 'scan.description': 'Read Codex sessions and build a local encrypted index. The Codex source directory is never modified.', 'scan.directory': 'Codex data directory', 'scan.placeholder': 'C:\\Users\\YourName\\.codex', 'scan.scanning': 'Scanning…', 'scan.now': 'Scan now', 'scan.hint': 'Keep the default path for the first scan; AgentArk checks Codex compatibility first.', 'scan.complete': 'Scan complete', 'scan.warnings': 'Scan finished with warnings', 'scan.failed': 'Scan failed', 'scan.error': 'Scan failed. Check the Codex path and version.', 'scan.id': 'Scan ID',
+    'scan.import': 'Import', 'scan.title': 'Scan agent data', 'scan.description': 'Read supported agent sessions and build a local encrypted index. Source data is never modified.', 'scan.directory': 'Agent data directory', 'scan.placeholder': 'Select an agent or enter its data directory', 'scan.agent': 'Agent', 'scan.scanning': 'Scanning…', 'scan.now': 'Scan now', 'scan.hint': 'Keep the detected path for the first scan; AgentArk validates the source before indexing.', 'scan.complete': 'Scan complete', 'scan.warnings': 'Scan finished with warnings', 'scan.failed': 'Scan failed', 'scan.error': 'Scan failed. Check the selected agent path and version.', 'scan.id': 'Scan ID',
     'projects.workspaces': 'Workspaces', 'projects.title': 'Projects', 'projects.countOne': 'project', 'projects.countMany': 'projects', 'projects.failed': 'Unable to read the project index. Reopen the client.', 'projects.empty': 'No project assignment yet. Run a Codex scan from the Scan page.', 'projects.sessions': 'sessions', 'projects.git': 'Git',
     'sessions.archive': 'Archive', 'sessions.project': 'Project', 'sessions.title': 'Sessions', 'sessions.filter': 'Filter sessions', 'sessions.untitled': 'Untitled session', 'sessions.noResults': 'No sessions found.', 'sessions.stale': 'stale',
     'timeline.title': 'Timeline', 'timeline.untitled': 'Untitled session', 'timeline.select': 'Select a session to inspect its timeline.',
@@ -33,7 +33,7 @@ const messages: Record<Locale, Record<MessageKey, string>> = {
     'tabs.status': '状态', 'tabs.scan': '扫描', 'tabs.projects': '项目', 'tabs.sessions': '会话', 'tabs.timeline': '时间线', 'tabs.quarantine': '隔离区',
     'locale.label': '语言', 'locale.en': 'English', 'locale.zh': '中文',
     'status.loading': '正在加载状态…', 'status.dataset': '数据集', 'status.adapter': '适配器', 'status.executable': '可执行版本', 'status.schema': 'Schema 指纹',
-    'scan.import': '导入', 'scan.title': '扫描 Codex', 'scan.description': '读取 Codex 会话并建立本地加密索引，不会修改 Codex 原始目录。', 'scan.directory': 'Codex 数据目录', 'scan.placeholder': 'C:\\Users\\你的用户名\\.codex', 'scan.scanning': '扫描中…', 'scan.now': '开始扫描', 'scan.hint': '首次使用可保留默认路径；应用会先检查 Codex 版本兼容性。', 'scan.complete': '扫描完成', 'scan.warnings': '扫描完成，但有警告', 'scan.failed': '扫描失败', 'scan.error': '扫描失败，请检查 Codex 路径和版本。', 'scan.id': '扫描 ID',
+    'scan.import': '导入', 'scan.title': '扫描 Agent 数据', 'scan.description': '读取已支持 Agent 的会话并建立本地加密索引，不会修改源数据。', 'scan.directory': 'Agent 数据目录', 'scan.placeholder': '请选择 Agent，或输入数据目录', 'scan.agent': 'Agent', 'scan.scanning': '扫描中…', 'scan.now': '开始扫描', 'scan.hint': '首次使用可保留检测到的路径；应用会先验证源数据再建立索引。', 'scan.complete': '扫描完成', 'scan.warnings': '扫描完成，但有警告', 'scan.failed': '扫描失败', 'scan.error': '扫描失败，请检查所选 Agent 的路径和版本。', 'scan.id': '扫描 ID',
     'projects.workspaces': '工作区', 'projects.title': '项目', 'projects.countOne': '个项目', 'projects.countMany': '个项目', 'projects.failed': '无法读取项目索引，请重新打开客户端。', 'projects.empty': '尚未建立项目归属，请在扫描页面重新扫描 Codex。', 'projects.sessions': '个会话', 'projects.git': 'Git',
     'sessions.archive': '归档', 'sessions.project': '项目', 'sessions.title': '会话', 'sessions.filter': '筛选会话', 'sessions.untitled': '未命名会话', 'sessions.noResults': '没有找到会话。', 'sessions.stale': '过期',
     'timeline.title': '时间线', 'timeline.untitled': '未命名会话', 'timeline.select': '请选择一个会话查看时间线。',

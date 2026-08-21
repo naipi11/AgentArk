@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 type Props = { onScanned: () => void };
 
 export function ScanView({ onScanned }: Props) {
-  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes'>('codex');
+  const [agent, setAgent] = useState<'codex' | 'claude' | 'hermes' | 'openclaw'>('codex');
   const [sourceRoot, setSourceRoot] = useState('');
   const [report, setReport] = useState<ScanReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -13,7 +13,7 @@ export function ScanView({ onScanned }: Props) {
   const { t } = useI18n();
 
   useEffect(() => {
-    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : api.hermesDefaultRoot();
+    const rootCall = agent === 'codex' ? api.codexDefaultRoot() : agent === 'claude' ? api.claudeDefaultRoot() : agent === 'hermes' ? api.hermesDefaultRoot() : api.openclawDefaultRoot();
     void rootCall.then((root) => {
       if (root) setSourceRoot(root);
     }).catch(() => undefined);
@@ -24,7 +24,7 @@ export function ScanView({ onScanned }: Props) {
     setError(null);
     setReport(null);
     try {
-      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : await api.scanHermes(sourceRoot);
+      const nextReport = agent === 'codex' ? await api.scanCodex(sourceRoot) : agent === 'claude' ? await api.scanClaude(sourceRoot) : agent === 'hermes' ? await api.scanHermes(sourceRoot) : await api.scanOpenClaw(sourceRoot);
       setReport(nextReport);
       onScanned();
     } catch (cause) {
@@ -35,16 +35,17 @@ export function ScanView({ onScanned }: Props) {
   }
 
   return (
-    <section className="card" aria-label="Scan Codex">
+    <section className="card" aria-label={t('scan.title')}>
       <p className="eyebrow">{t('scan.import')}</p>
       <h2>{t('scan.title')}</h2>
       <p className="muted scan-description">{t('scan.description')}</p>
       <label className="field-label" htmlFor="codex-root">{t('scan.directory')}</label>
-      <label className="field-label" htmlFor="scan-agent">Agent</label>
+      <label className="field-label" htmlFor="scan-agent">{t('scan.agent')}</label>
       <select id="scan-agent" className="agent-select" value={agent} onChange={(event) => setAgent(event.target.value as typeof agent)} disabled={running}>
         <option value="codex">Codex</option>
         <option value="claude">Claude Code</option>
         <option value="hermes">Hermes</option>
+        <option value="openclaw">OpenClaw</option>
       </select>
       <div className="scan-form">
         <input
