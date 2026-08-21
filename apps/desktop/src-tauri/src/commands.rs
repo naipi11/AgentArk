@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use agentark_app::{AppError, PublicSessionDetail, QuarantineDto, QueryUseCase, StatusDto};
+use agentark_app::{
+    AppError, PublicSessionDetail, QuarantineDto, QueryUseCase, ScanReport, StatusDto,
+};
 use agentark_index::{SearchHit, SessionSummary};
 use tauri::State;
 use uuid::Uuid;
@@ -8,12 +10,14 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[allow(dead_code)]
-pub const REGISTERED_COMMANDS: [&str; 5] = [
+pub const REGISTERED_COMMANDS: [&str; 7] = [
     "status",
     "sessions_list",
     "sessions_show",
     "search",
     "quarantines_list",
+    "scan_codex",
+    "codex_default_root",
 ];
 
 #[tauri::command]
@@ -62,6 +66,16 @@ pub fn search(
 #[tauri::command]
 pub fn quarantines_list(state: State<'_, AppState>) -> Result<Vec<QuarantineDto>, String> {
     with_query(&state.services, |query| query.list_quarantines())
+}
+
+#[tauri::command]
+pub fn scan_codex(state: State<'_, AppState>, source_root: String) -> Result<ScanReport, String> {
+    state.scan_codex(std::path::PathBuf::from(source_root.trim()))
+}
+
+#[tauri::command]
+pub fn codex_default_root() -> Option<String> {
+    crate::state::detected_codex_home().map(|path| path.to_string_lossy().into_owned())
 }
 
 fn with_query<T>(

@@ -12,6 +12,8 @@ pub fn run() {
             commands::sessions_show,
             commands::search,
             commands::quarantines_list,
+            commands::scan_codex,
+            commands::codex_default_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentArk desktop");
@@ -22,7 +24,7 @@ mod tests {
     use super::commands::REGISTERED_COMMANDS;
 
     #[test]
-    fn no_mutating_command_is_registered() {
+    fn registered_commands_include_queries_and_codex_scan() {
         assert_eq!(
             REGISTERED_COMMANDS,
             [
@@ -30,7 +32,9 @@ mod tests {
                 "sessions_list",
                 "sessions_show",
                 "search",
-                "quarantines_list"
+                "quarantines_list",
+                "scan_codex",
+                "codex_default_root"
             ]
         );
     }

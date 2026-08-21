@@ -150,7 +150,10 @@ dependencies = [
 name = "agentark-desktop"
 version = "0.1.0"
 dependencies = [
+ "agentark-adapter-codex",
+ "agentark-adapter-sdk",
  "agentark-app",
+ "agentark-cas",
  "agentark-index",
  "agentark-security",
  "directories",

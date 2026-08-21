@@ -40,6 +40,14 @@ export type QuarantineDto = {
   fingerprint: string;
   sanitizedLocator: string;
 };
+export type ScanReport = {
+  scanId: string;
+  status: 'complete' | 'partial' | 'failed';
+  indexed: number;
+  quarantined: number;
+  retryable: number;
+  rejected: number;
+};
 
 export const api = {
   status: () => invoke<StatusDto>('status'),
@@ -47,4 +55,6 @@ export const api = {
   sessionsShow: (sessionId: string) => invoke<PublicSessionDetail>('sessions_show', { sessionId }),
   search: (query: string, limit = 50) => invoke<SearchHit[]>('search', { query, limit }),
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),
+  codexDefaultRoot: () => invoke<string | null>('codex_default_root'),
+  scanCodex: (sourceRoot: string) => invoke<ScanReport>('scan_codex', { sourceRoot }),
 };
