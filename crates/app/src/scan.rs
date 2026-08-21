@@ -1,4 +1,4 @@
-use agentark_adapter_sdk::{CaptureRequest, NormalizeOutcome, SourceAdapter};
+use agentark_adapter_sdk::{CaptureRequest, CapturedSource, NormalizeOutcome, SourceAdapter};
 use agentark_canonical::{
     AgentInstall, CanonicalSession, Sha256Digest, SourceRecord, canonical_hash, session_id,
 };
@@ -9,6 +9,7 @@ use agentark_index::{
 };
 use agentark_security::{SecretFinding, SecretScanner};
 use serde::Serialize;
+use std::collections::HashMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -149,6 +150,7 @@ where
             }
         }
 
+        let mut archived_records = Vec::with_capacity(batch.records.len());
         for record in batch.records {
             if let Some(source_session_id) = record.source_session_id.as_deref() {
                 let id = session_id(request.install.id, source_session_id);
@@ -177,17 +179,29 @@ where
                 sanitized_title: None,
                 sanitized_body: None,
             })?;
+            archived_records.push((record, stored));
+        }
 
-            if matches!(
-                record.source,
-                agentark_adapter_sdk::CapturedSource::FilesystemEvidence
-            ) {
+        let mut evidence_by_source: HashMap<String, Vec<SourceRecord>> = HashMap::new();
+        for (record, stored) in archived_records {
+            if matches!(record.source, CapturedSource::FilesystemEvidence) {
+                if let Some(source_session_id) = record.source_session_id.as_deref() {
+                    evidence_by_source
+                        .entry(source_session_id.to_owned())
+                        .or_default()
+                        .push(SourceRecord {
+                            source_locator: sanitize_locator(&record.source_locator),
+                            source_record_id: record.source_record_id.clone(),
+                            ordinal: record.ordinal,
+                            raw_sha256: stored.plaintext_hash.clone(),
+                            cas_object_id: stored.object_id.clone(),
+                            adapter_version: request.install.adapter_version.clone(),
+                            snapshot_id: batch.snapshot_id.clone(),
+                        });
+                }
                 continue;
             }
-            if matches!(
-                record.source,
-                agentark_adapter_sdk::CapturedSource::FilesystemRawOnly
-            ) {
+            if matches!(record.source, CapturedSource::FilesystemRawOnly) {
                 self.index.record_quarantine(QuarantineRecord {
                     id: Uuid::new_v5(
                         &scan_id,
@@ -224,6 +238,12 @@ where
                         adapter_version: request.install.adapter_version.clone(),
                         snapshot_id: batch.snapshot_id.clone(),
                     };
+                    let mut source_records = vec![source_record];
+                    if let Some(source_session_id) = record.source_session_id.as_deref() {
+                        if let Some(mut evidence) = evidence_by_source.remove(source_session_id) {
+                            source_records.append(&mut evidence);
+                        }
+                    }
                     self.journal.record_session(
                         scan_id,
                         &stored.object_id,
@@ -246,7 +266,7 @@ where
                     self.index.ingest_session(SessionIngest {
                         install: &request.install,
                         session: &session,
-                        source_records: std::slice::from_ref(&source_record),
+                        source_records: &source_records,
                         sanitized_title: &sanitized_title,
                         sanitized_body: &sanitized_body,
                         findings: &findings,

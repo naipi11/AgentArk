@@ -8,6 +8,7 @@ use agentark_adapter_sdk::{
 use agentark_app::{AppError, ScanRequest, ScanService, ScanStatus};
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalSchemaVersion, CanonicalSession, Completeness, Sha256Digest,
+    session_id,
 };
 use agentark_cas::{ArtifactStore, CasError, ObjectType, StoredObject};
 use agentark_index::{IndexError, QuarantineRecord, ScanManifest, SessionIndex, SessionIngest};
@@ -279,4 +280,154 @@ fn index_failure_does_not_publish_a_complete_manifest() {
     assert!(matches!(error, AppError::Index(_)));
     assert_eq!(service.index().last_scan_status(), Some("failed".into()));
     assert_eq!(service.index().stale_sources(), vec!["fixture-session"]);
+}
+
+#[derive(Clone)]
+struct DuplicateSourceAdapter {
+    install: AgentInstall,
+}
+
+impl SourceAdapter for DuplicateSourceAdapter {
+    fn id(&self) -> &'static str {
+        "duplicate-source"
+    }
+
+    fn detect(&self, _ctx: &DetectContext) -> Result<Vec<AgentInstall>, AdapterError> {
+        Ok(vec![self.install.clone()])
+    }
+
+    fn probe(&self, _install: &AgentInstall) -> Result<ProbeReport, AdapterError> {
+        Ok(ProbeReport {
+            adapter_id: self.id().into(),
+            executable_version: "fixture".into(),
+            schema_fingerprint: "fixture".into(),
+            capabilities: self.capabilities(&self.install),
+            quarantine_reason: None,
+        })
+    }
+
+    fn capture(&self, _request: &CaptureRequest) -> Result<CaptureBatch, AdapterError> {
+        let record = |source: CapturedSource, locator: &str| CapturedRecord {
+            source,
+            source_locator: locator.into(),
+            source_session_id: Some("thread".into()),
+            source_record_id: Some(locator.into()),
+            ordinal: 0,
+            snapshot_id: "snapshot".into(),
+            bytes: b"raw".to_vec(),
+        };
+        Ok(CaptureBatch {
+            snapshot_id: "snapshot".into(),
+            records: vec![
+                record(CapturedSource::FilesystemEvidence, "sessions/thread.jsonl"),
+                record(
+                    CapturedSource::AppServerSemantic,
+                    "app-server/active/thread.json",
+                ),
+            ],
+            issues: Vec::new(),
+        })
+    }
+
+    fn normalize(&self, record: &CapturedRecord) -> Result<NormalizeOutcome, AdapterError> {
+        if !matches!(record.source, CapturedSource::AppServerSemantic) {
+            return Ok(NormalizeOutcome::Quarantined {
+                reason_code: "filesystem-raw-only".into(),
+                fingerprint: "sha256:raw".into(),
+            });
+        }
+        Ok(NormalizeOutcome::Normalized(Box::new(CanonicalSession {
+            schema_version: CanonicalSchemaVersion::V0_1_0,
+            id: session_id(self.install.id, "thread"),
+            install_id: self.install.id,
+            source_session_id: "thread".into(),
+            source_kind: "app-server".into(),
+            workspace: None,
+            title: Some("thread".into()),
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: Default::default(),
+        })))
+    }
+
+    fn capabilities(&self, _install: &AgentInstall) -> BTreeSet<SourceCapability> {
+        BTreeSet::from([
+            SourceCapability::AppServerRead,
+            SourceCapability::FilesystemRawArchive,
+        ])
+    }
+}
+
+#[derive(Clone, Default)]
+struct ProvenanceIndex {
+    locators: Arc<Mutex<Vec<String>>>,
+}
+
+impl SessionIndex for ProvenanceIndex {
+    fn begin_scan(
+        &mut self,
+        _scan_id: Uuid,
+        _adapter_id: &str,
+        _snapshot_id: &str,
+    ) -> Result<(), IndexError> {
+        Ok(())
+    }
+
+    fn ingest_session(&mut self, input: SessionIngest<'_>) -> Result<(), IndexError> {
+        self.locators.lock().unwrap().extend(
+            input
+                .source_records
+                .iter()
+                .map(|record| record.source_locator.clone()),
+        );
+        Ok(())
+    }
+
+    fn record_quarantine(&mut self, _record: QuarantineRecord) -> Result<(), IndexError> {
+        Ok(())
+    }
+
+    fn finish_scan(&mut self, _manifest: &ScanManifest) -> Result<(), IndexError> {
+        Ok(())
+    }
+
+    fn fail_scan(&mut self, _scan_id: Uuid) -> Result<(), IndexError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn duplicate_app_server_and_filesystem_sources_keep_both_locators() {
+    let install = install();
+    let locators = Arc::new(Mutex::new(Vec::new()));
+    let mut service = ScanService::new(
+        DuplicateSourceAdapter {
+            install: install.clone(),
+        },
+        FixtureCas {
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        ProvenanceIndex {
+            locators: locators.clone(),
+        },
+        SecretScanner::v1().unwrap(),
+    );
+    let report = service
+        .run(ScanRequest {
+            install,
+            snapshot_hint: None,
+        })
+        .unwrap();
+    assert_eq!(report.status, ScanStatus::Complete);
+    assert_eq!(
+        locators.lock().unwrap().as_slice(),
+        ["thread.json", "thread.jsonl"]
+    );
 }
