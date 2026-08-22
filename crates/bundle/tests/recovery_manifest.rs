@@ -30,6 +30,26 @@ fn writes_recovery_metadata_without_provider_secrets() {
 }
 
 #[test]
+fn omits_secret_and_endpoint_shaped_model_labels() {
+    let provider_secret = "api_key=provider-label-secret-value";
+    let model_endpoint = "https://private-model-endpoint.example/v1";
+    let bundle = write_codex_bundle_with(
+        provider_secret,
+        model_endpoint,
+        "api_key=fixture-secret-value",
+        one_native_payload(),
+    );
+    let manifest = bundle.recovery_manifest().unwrap().unwrap();
+    assert_eq!(manifest.sessions[0].source_provider, None);
+    assert_eq!(manifest.sessions[0].source_model, None);
+    let entry = bundle.entries.get("recovery/manifest.json").unwrap();
+    let entry = String::from_utf8_lossy(entry);
+    assert!(!entry.contains(provider_secret));
+    assert!(!entry.contains(model_endpoint));
+    assert!(!entry.contains("[REDACTED:"));
+}
+
+#[test]
 fn old_bundle_has_no_recovery_manifest() {
     let bundle = read_fixture_with_format("1.1");
     assert_eq!(bundle.recovery_manifest().unwrap(), None);

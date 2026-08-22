@@ -366,8 +366,8 @@ pub fn write_selected_sessions_with_native(
             .iter()
             .map(|session| BundleRecoverySession {
                 canonical_session_id: session.id,
-                source_provider: session.model_provider.clone(),
-                source_model: session.model_name.clone(),
+                source_provider: safe_recovery_label(session.model_provider.as_deref(), scanner),
+                source_model: safe_recovery_label(session.model_name.as_deref(), scanner),
                 native_payload_count: native_entries
                     .iter()
                     .filter(|entry| entry.session_id == session.id)
@@ -589,6 +589,15 @@ fn redact_value(value: Value, scanner: &SecretScanner) -> (Value, u64) {
             (Value::Object(values), count)
         }
         other => (other, 0),
+    }
+}
+
+fn safe_recovery_label(value: Option<&str>, scanner: &SecretScanner) -> Option<String> {
+    let label = value?.trim();
+    if label.contains("://") || !scanner.sanitize(label).findings.is_empty() {
+        None
+    } else {
+        Some(label.to_owned())
     }
 }
 
