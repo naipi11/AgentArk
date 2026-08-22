@@ -115,6 +115,15 @@ fn main() -> ExitCode {
                 "migration.plan",
                 runtime::migration_plan(&bundle, &format!("{target:?}"), handoff),
             ),
+            MigrationCommand::Export {
+                bundle,
+                target,
+                output,
+            } => print_result(
+                cli.json,
+                "migration.export",
+                runtime::migration_export(&bundle, &format!("{target:?}"), &output),
+            ),
         },
         Command::Audit { command } => match command {
             AuditCommand::Verify => {

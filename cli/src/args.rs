@@ -73,6 +73,12 @@ pub enum MigrationCommand {
         #[arg(long)]
         handoff: bool,
     },
+    Export {
+        bundle: PathBuf,
+        #[arg(value_enum)]
+        target: AgentArg,
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]

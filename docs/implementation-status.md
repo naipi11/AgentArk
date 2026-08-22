@@ -25,6 +25,8 @@ Vendor databases/files are never opened writable.
   secret redaction.
 - CLI commands: `bundle export`, `bundle verify`, `bundle restore`, and
   `migration plan <bundle> <target> [--handoff]`.
+- `migration export <bundle> <target> <output>` writes an L1 structured JSON
+  handoff and human-readable Markdown handoff per session.
 - Restoring writes only AgentArk-owned SQLCipher index rows in one transaction;
   it does not inject records into a vendor client.
 - `agentark-watch` provides root fingerprints, change diffing, debounce, and a

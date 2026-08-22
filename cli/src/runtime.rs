@@ -14,7 +14,9 @@ use agentark_bundle::{BundleError, read_bundle, write_sessions};
 use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
-use agentark_migration::{ContextHandoff, MigrationPlan, build_plan, context_handoff};
+use agentark_migration::{
+    ContextHandoff, HandoffArtifact, MigrationPlan, build_plan, context_handoff, write_handoff,
+};
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
 use agentark_sync::{MergeResult, merge, read_operations};
 use directories::ProjectDirs;
@@ -83,6 +85,13 @@ pub struct MigrationData {
     pub plan_count: usize,
     pub plans: Vec<MigrationPlan>,
     pub handoffs: Vec<ContextHandoff>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationExportData {
+    pub target_agent: String,
+    pub artifacts: Vec<HandoffArtifact>,
 }
 
 pub fn data_dir(override_dir: Option<PathBuf>) -> PathBuf {
@@ -213,20 +222,12 @@ pub fn migration_plan(
     include_handoff: bool,
 ) -> Result<MigrationData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
-    let target = match target.to_ascii_lowercase().as_str() {
-        "codex" => AgentKind::Codex,
-        "claudecode" | "claude-code" => AgentKind::ClaudeCode,
-        "hermes" => AgentKind::Hermes,
-        "openclaw" => AgentKind::OpenClaw,
-        "opencode" => AgentKind::OpenCode,
-        "grokbuild" | "grok-build" => AgentKind::GrokBuild,
-        _ => return Err(RuntimeError::InvalidInput),
-    };
+    let target_kind = parse_target_agent(target)?;
     let sessions = bundle.session_records().map_err(bundle_error)?;
     let mut plans = Vec::with_capacity(sessions.len());
     let mut handoffs = Vec::new();
     for session in sessions {
-        let plan = build_plan(&session, target.clone()).map_err(|_| RuntimeError::Storage)?;
+        let plan = build_plan(&session, target_kind.clone()).map_err(|_| RuntimeError::Storage)?;
         if include_handoff {
             handoffs.push(context_handoff(&session, plan.loss_report.clone()));
         }
@@ -237,6 +238,41 @@ pub fn migration_plan(
         plans,
         handoffs,
     })
+}
+
+pub fn migration_export(
+    path: &Path,
+    target: &str,
+    output: &Path,
+) -> Result<MigrationExportData, RuntimeError> {
+    let bundle = read_bundle(path).map_err(bundle_error)?;
+    let target_kind = parse_target_agent(target)?;
+    let sessions = bundle.session_records().map_err(bundle_error)?;
+    let target_label = agentark_migration::agent_label(&target_kind).to_owned();
+    let mut artifacts = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let directory = output.join(session.id.to_string());
+        artifacts.push(
+            write_handoff(&directory, &session, target_kind.clone())
+                .map_err(|_| RuntimeError::Storage)?,
+        );
+    }
+    Ok(MigrationExportData {
+        target_agent: target_label,
+        artifacts,
+    })
+}
+
+fn parse_target_agent(target: &str) -> Result<AgentKind, RuntimeError> {
+    match target.to_ascii_lowercase().as_str() {
+        "codex" => Ok(AgentKind::Codex),
+        "claudecode" | "claude-code" => Ok(AgentKind::ClaudeCode),
+        "hermes" => Ok(AgentKind::Hermes),
+        "openclaw" => Ok(AgentKind::OpenClaw),
+        "opencode" => Ok(AgentKind::OpenCode),
+        "grokbuild" | "grok-build" => Ok(AgentKind::GrokBuild),
+        _ => Err(RuntimeError::InvalidInput),
+    }
 }
 
 fn bundle_error(error: BundleError) -> RuntimeError {
