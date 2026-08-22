@@ -76,7 +76,19 @@ fn indexed_session() -> (AgentInstall, CanonicalSession, Sha256Digest) {
 }
 
 fn insert_indexed_session(index: &mut IndexDb) -> CanonicalSession {
-    let (install, session, hash) = indexed_session();
+    insert_indexed_session_with(index, Uuid::from_u128(2), "source-native-session")
+}
+
+fn insert_indexed_session_with(
+    index: &mut IndexDb,
+    session_id: Uuid,
+    source_session_id: &str,
+) -> CanonicalSession {
+    let (install, mut session, _) = indexed_session();
+    session.id = session_id;
+    session.source_session_id = source_session_id.into();
+    session.messages[0].id = Uuid::new_v5(&session.id, b"fixture-message");
+    let hash = canonical_hash("session", &session).unwrap();
     index
         .ingest_session(SessionIngest {
             install: &install,
@@ -123,6 +135,45 @@ fn records_and_reopens_continuation_mapping() {
             .restore_mappings_for(mapping.source_session_id)
             .unwrap(),
         vec![mapping]
+    );
+}
+
+#[test]
+fn ignores_repeated_continuation_and_archive_only_mappings() {
+    let fixture = TempIndex::new();
+    let mut index = fixture.open();
+    let continuation_session = insert_indexed_session(&mut index);
+    let archive_session =
+        insert_indexed_session_with(&mut index, Uuid::from_u128(3), "archive-native-session");
+    let continuation = continuation_mapping(continuation_session.id);
+    let archive_only = RestoreMapping {
+        source_session_id: archive_session.id,
+        source_native_id: Some("archive-native-session".into()),
+        target_agent: AgentKind::OpenCode,
+        outcome: RestoreOutcome::ArchiveOnly,
+        target_native_id: None,
+        target_provider: None,
+        target_hash: None,
+        reason_code: "continuation-writer-unavailable".into(),
+        ..continuation.clone()
+    };
+
+    index.record_restore_mapping(&continuation).unwrap();
+    index.record_restore_mapping(&continuation).unwrap();
+    index.record_restore_mapping(&archive_only).unwrap();
+    index.record_restore_mapping(&archive_only).unwrap();
+
+    assert_eq!(
+        index
+            .restore_mappings_for(continuation.source_session_id)
+            .unwrap(),
+        vec![continuation]
+    );
+    assert_eq!(
+        index
+            .restore_mappings_for(archive_only.source_session_id)
+            .unwrap(),
+        vec![archive_only]
     );
 }
 

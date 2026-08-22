@@ -110,13 +110,7 @@ fn restores_bundle_sessions_into_searchable_archive() {
     assert!(db.show_session(session.id).is_ok());
     assert_eq!(db.search("CanonicalVisibleCanary", 10).unwrap().len(), 1);
     assert_eq!(
-        db.connection()
-            .query_row(
-                "SELECT status FROM scan_runs WHERE id = ?1",
-                [scan_id.to_string()],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
+        db.verification_snapshot(scan_id).unwrap().status,
         "complete"
     );
 }

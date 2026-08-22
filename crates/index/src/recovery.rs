@@ -24,13 +24,14 @@ impl IndexDb {
     pub fn record_restore_mapping(&mut self, mapping: &RestoreMapping) -> Result<(), IndexError> {
         let target_agent = enum_label(&mapping.target_agent)?;
         let outcome = enum_label(&mapping.outcome)?;
+        let id = mapping_id(mapping, &target_agent, &outcome)?;
         self.connection_mut().execute(
-            "INSERT INTO session_restore_mappings(
+            "INSERT OR IGNORE INTO session_restore_mappings(
                id, source_session_id, target_agent, outcome, source_native_id, target_native_id,
                source_provider, target_provider, source_hash, target_hash, reason_code, created_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                Uuid::new_v4().to_string(),
+                id,
                 mapping.source_session_id.to_string(),
                 target_agent,
                 outcome,
@@ -83,6 +84,46 @@ impl IndexDb {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+#[derive(serde::Serialize)]
+struct RestoreMappingIdentity<'a> {
+    source_session_id: Uuid,
+    target_agent: &'a str,
+    outcome: &'a str,
+    source_native_id: &'a str,
+    target_native_id: &'a str,
+    source_provider: &'a str,
+    target_provider: &'a str,
+    source_hash: &'a str,
+    target_hash: &'a str,
+    reason_code: &'a str,
+}
+
+fn mapping_id(
+    mapping: &RestoreMapping,
+    target_agent: &str,
+    outcome: &str,
+) -> Result<String, IndexError> {
+    let identity = RestoreMappingIdentity {
+        source_session_id: mapping.source_session_id,
+        target_agent,
+        outcome,
+        source_native_id: mapping.source_native_id.as_deref().unwrap_or(""),
+        target_native_id: mapping.target_native_id.as_deref().unwrap_or(""),
+        source_provider: mapping.source_provider.as_deref().unwrap_or(""),
+        target_provider: mapping.target_provider.as_deref().unwrap_or(""),
+        source_hash: mapping.source_hash.as_str(),
+        target_hash: mapping
+            .target_hash
+            .as_ref()
+            .map(Sha256Digest::as_str)
+            .unwrap_or(""),
+        reason_code: &mapping.reason_code,
+    };
+    Ok(Sha256Digest::from_bytes(&serde_json::to_vec(&identity)?)
+        .as_str()
+        .to_owned())
 }
 
 fn parse_uuid(value: String, index: usize, column: &str) -> Result<Uuid, rusqlite::Error> {

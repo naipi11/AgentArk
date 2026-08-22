@@ -71,7 +71,7 @@ impl IndexDb {
         })
     }
 
-    pub fn connection(&self) -> &Connection {
+    pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
 
