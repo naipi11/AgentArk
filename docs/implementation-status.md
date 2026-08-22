@@ -39,7 +39,7 @@ Vendor databases/files are never opened writable.
 
 ## Release gate result
 
-The 0.4.0 Windows gate is verified: workspace tests, clippy, front-end tests,
+The 0.4.1 Windows gate is verified: workspace tests, clippy, front-end tests,
 MSI/NSIS build, SHA-256 capture, administrator upgrade, and responsive desktop
 launch all passed. No vendor-native writer is enabled by default; cross-agent
 migration remains an explicit L1 handoff until an official target import
@@ -49,3 +49,8 @@ migration remain deliberately disabled for the local-first release.
 The transfer UI now exposes Agent-scoped project selection, an optional project
 file checkbox, bundle verification/preview, conflict blocking, and restore into
 `restored-workspaces` on the destination device.
+
+When the transfer path is empty, the export/import actions now show an explicit
+path-required hint and use a non-waiting disabled cursor. During an active
+operation the button label reports whether AgentArk is exporting, checking, or
+restoring the bundle.

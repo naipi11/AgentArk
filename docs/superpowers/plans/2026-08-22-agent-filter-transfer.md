@@ -33,12 +33,12 @@
 - Add `SessionQuery::list_workspaces_filtered(agent_kind: Option<AgentKind>, limit: u32, offset: u32)`.
 - Tauri `sessions_list` and `workspaces_list` accept optional serialized `agentKind`.
 
-- [ ] Write a failing Rust test inserting Codex and Claude installs with separate workspaces, then assert `list_sessions_filtered(Some(AgentKind::Codex), ...)` and workspace counts exclude Claude.
-- [ ] Run `cargo test -p agentark-index --test encrypted_index --offline`; expect the new test to fail because the filter methods do not exist.
-- [ ] Implement SQL joins through `agent_installs.kind`, preserving `None` as the existing unfiltered query.
-- [ ] Update `QueryUseCase`, `LockedIndexQueryService`, Tauri commands, and TypeScript API types.
-- [ ] Run the focused test and `cargo clippy -p agentark-index --all-targets --offline -- -D warnings`.
-- [ ] Commit `feat: filter projects and sessions by agent`.
+- [x] Write a failing Rust test inserting Codex and Claude installs with separate workspaces, then assert `list_sessions_filtered(Some(AgentKind::Codex), ...)` and workspace counts exclude Claude.
+- [x] Run `cargo test -p agentark-index --test encrypted_index --offline`; expect the new test to fail because the filter methods do not exist.
+- [x] Implement SQL joins through `agent_installs.kind`, preserving `None` as the existing unfiltered query.
+- [x] Update `QueryUseCase`, `LockedIndexQueryService`, Tauri commands, and TypeScript API types.
+- [x] Run the focused test and `cargo clippy -p agentark-index --all-targets --offline -- -D warnings`.
+- [x] Commit `feat: filter projects and sessions by agent`.
 
 ### Task 2: Agent selector in Projects, Sessions, and Timeline navigation
 
@@ -54,12 +54,12 @@
 - Add shared `AgentKind`/`AgentFilter` TypeScript union.
 - Project/session callbacks carry `{ agentKind, workspaceId }` so a project opened from a filtered view keeps the filter.
 
-- [ ] Add a failing Vitest test that selects Claude Code and asserts the API calls receive `agentKind: 'claude-code'`.
-- [ ] Run `pnpm --dir apps/desktop test -- App.test.tsx`; expect failure because no Agent selector exists.
-- [ ] Implement a shared selector and filter state at App level; pass it to ProjectsView and SessionsView.
-- [ ] Translate selector labels and empty states in both English and Chinese.
-- [ ] Run focused Vitest and `pnpm --dir apps/desktop exec tsc -b --pretty false`.
-- [ ] Commit `feat: add agent-scoped project and session browsing`.
+- [x] Add a failing Vitest test that selects Claude Code and asserts the API calls receive `agentKind: 'claude-code'`.
+- [x] Run `pnpm --dir apps/desktop test -- App.test.tsx`; expect failure because no Agent selector exists.
+- [x] Implement a shared selector and filter state at App level; pass it to ProjectsView and SessionsView.
+- [x] Translate selector labels and empty states in both English and Chinese.
+- [x] Run focused Vitest and `pnpm --dir apps/desktop exec tsc -b --pretty false`.
+- [x] Commit `feat: add agent-scoped project and session browsing`.
 
 ### Task 3: Agent-specific bundle manifest and project-file collection
 
@@ -74,12 +74,12 @@
 - Add `write_selected_sessions(path, sessions, workspaces, selection, scanner)`.
 - Add `Bundle::inspect()` returning manifest counts and conflict-safe entry metadata.
 
-- [ ] Write failing fixture test for a Codex session plus workspace files; assert the bundle includes only selected relative files, excludes `auth.json`, and records hashes.
-- [ ] Run `cargo test -p agentark-bundle --test agent_project_bundle --offline`; verify it fails before implementation.
-- [ ] Implement regular-file containment checks, reparse/symlink rejection, file-size limits, secret redaction, and manifest version `1.1`.
-- [ ] Preserve existing `.ahbundle` v1 reader compatibility and return a typed unsupported-version error for unknown versions.
-- [ ] Run focused bundle tests, path-policy tests, and secret-canary checks.
-- [ ] Commit `feat: export agent-scoped sessions and project files`.
+- [x] Write failing fixture test for a Codex session plus workspace files; assert the bundle includes only selected relative files, excludes `auth.json`, and records hashes.
+- [x] Run `cargo test -p agentark-bundle --test agent_project_bundle --offline`; verify it fails before implementation.
+- [x] Implement regular-file containment checks, reparse/symlink rejection, file-size limits, secret redaction, and manifest version `1.1`.
+- [x] Preserve existing `.ahbundle` v1 reader compatibility and return a typed unsupported-version error for unknown versions.
+- [x] Run focused bundle tests, path-policy tests, and secret-canary checks.
+- [x] Commit `feat: export agent-scoped sessions and project files`.
 
 ### Task 4: Transactional import preview and restore
 
@@ -95,12 +95,12 @@
 - Add `BundleImportMode::{NewWorkspace, Merge}`.
 - Add `IndexDb::restore_bundle(preview, mode) -> Result<RestoreReport, IndexError>`.
 
-- [ ] Write failing restore tests for new-workspace import, duplicate import idempotency, file hash mismatch, and interrupted transaction rollback.
-- [ ] Run the focused test; confirm failures are caused by missing preview/restore behavior.
-- [ ] Implement inspect-before-write, checkpoint creation, one SQLCipher transaction, CAS writes, file hash verification, and rollback on mismatch.
-- [ ] Record `bundle.import.started`, `bundle.import.completed`, and `bundle.import.rolled_back` audit events with only sanitized metadata.
-- [ ] Run focused tests plus `cargo test --workspace --all-features --offline`.
-- [ ] Commit `feat: restore agent bundles transactionally`.
+- [x] Write failing restore tests for new-workspace import, duplicate import idempotency, file hash mismatch, and interrupted transaction rollback.
+- [x] Run the focused test; confirm failures are caused by missing preview/restore behavior.
+- [x] Implement inspect-before-write, checkpoint creation, one SQLCipher transaction, CAS writes, file hash verification, and rollback on mismatch.
+- [x] Record `bundle.import.started`, `bundle.import.completed`, and `bundle.import.rolled_back` audit events with only sanitized metadata.
+- [x] Run focused tests plus `cargo test --workspace --all-features --offline`.
+- [x] Commit `feat: restore agent bundles transactionally`.
 
 ### Task 5: Desktop export/import workflow
 
@@ -117,12 +117,12 @@
 - Tauri commands: `bundle_export_preview`, `bundle_export`, `bundle_import_preview`, `bundle_import`.
 - UI state: `TransferStep = 'select' | 'preview' | 'complete' | 'error'`.
 
-- [ ] Add failing Vitest tests for both primary buttons, Agent selection, preview rendering, and confirmation gating.
-- [ ] Run focused tests and verify RED.
-- [ ] Implement TransferView with separate “导出会话历史” and “导入会话历史” buttons, Agent/project selectors, preview summary, conflict list, and progress/error states.
-- [ ] Keep Status backup controls backwards-compatible or link them into TransferView.
-- [ ] Run Vitest, TypeScript build, and Tauri command unit tests.
-- [ ] Commit `feat: add desktop session history transfer workflow`.
+- [x] Add failing Vitest tests for both primary buttons, Agent selection, preview rendering, and confirmation gating.
+- [x] Run focused tests and verify RED.
+- [x] Implement TransferView with separate “导出会话历史” and “导入会话历史” buttons, Agent/project selectors, preview summary, conflict list, and progress/error states.
+- [x] Keep Status backup controls backwards-compatible or link them into TransferView.
+- [x] Run Vitest, TypeScript build, and Tauri command unit tests.
+- [x] Commit `feat: add desktop session history transfer workflow`.
 
 ### Task 6: CLI parity and documentation
 
@@ -137,11 +137,11 @@
 - Add `bundle export --agent <agent> --project <workspace-id> --include-files <path>`.
 - Add `bundle inspect <path>` and `bundle restore <path> --mode new-workspace|merge`.
 
-- [ ] Add failing JSON envelope tests for Agent-specific export and inspect preview.
-- [ ] Implement commands with the same Rust bundle/index APIs as Tauri.
-- [ ] Verify error envelopes do not expose source contents or credentials.
-- [ ] Run CLI tests and docs checks.
-- [ ] Commit `feat: add CLI session history transfer commands`.
+- [x] Add failing JSON envelope tests for Agent-specific export and inspect preview.
+- [x] Implement commands with the same Rust bundle/index APIs as Tauri.
+- [x] Verify error envelopes do not expose source contents or credentials.
+- [x] Run CLI tests and docs checks.
+- [x] Commit `feat: add CLI session history transfer commands`.
 
 ### Task 7: Release verification
 
@@ -150,9 +150,9 @@
 - Modify: `compat/matrix.toml`
 - Modify: `docs/implementation-status.md`
 
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets --offline -- -D warnings`.
-- [ ] Run `cargo test --workspace --all-features --offline`.
-- [ ] Run `pnpm --dir apps/desktop test` and `pnpm --dir apps/desktop build`.
-- [ ] Build MSI/NSIS, calculate SHA-256, install with administrator elevation, verify registry version and responsive launch.
-- [ ] Commit release notes only after all commands exit 0.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo clippy --workspace --all-targets --offline -- -D warnings`.
+- [x] Run `cargo test --workspace --all-features --offline`.
+- [x] Run `pnpm --dir apps/desktop test` and `pnpm --dir apps/desktop build`.
+- [x] Build MSI/NSIS, calculate SHA-256, install with administrator elevation, verify registry version and responsive launch.
+- [x] Commit release notes only after all commands exit 0.

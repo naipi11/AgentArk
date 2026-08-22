@@ -38,4 +38,5 @@ test('transfer view exposes export and import session history actions', async ()
   fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
   expect(await screen.findByRole('button', { name: 'Export session history' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Import session history' })).toBeInTheDocument();
+  expect(screen.getByText('Enter a bundle path before exporting or importing.')).toBeInTheDocument();
 });
