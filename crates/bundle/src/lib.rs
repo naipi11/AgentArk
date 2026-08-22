@@ -611,6 +611,9 @@ fn safe_recovery_label(
     kind: RecoveryLabelKind,
 ) -> Option<String> {
     let label = value?.trim();
+    if label.is_empty() {
+        return None;
+    }
     if !scanner.sanitize(label).findings.is_empty() {
         return None;
     }

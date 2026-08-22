@@ -82,6 +82,19 @@ fn retains_ordinary_dotted_provider_and_model_labels() {
 }
 
 #[test]
+fn omits_whitespace_only_recovery_labels() {
+    let bundle = write_codex_bundle_with(
+        " \t ",
+        "\n  ",
+        "api_key=fixture-secret-value",
+        one_native_payload(),
+    );
+    let manifest = bundle.recovery_manifest().unwrap().unwrap();
+    assert_eq!(manifest.sessions[0].source_provider, None);
+    assert_eq!(manifest.sessions[0].source_model, None);
+}
+
+#[test]
 fn old_bundle_has_no_recovery_manifest() {
     let bundle = read_fixture_with_format("1.1");
     assert_eq!(bundle.recovery_manifest().unwrap(), None);
