@@ -14,7 +14,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAGIC: &[u8; 9] = b"AHBUNDLE1";
-const FORMAT_VERSION: &str = "1.1";
+const FORMAT_VERSION: &str = "1.2";
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: u32 = 100_000;
@@ -62,6 +62,22 @@ pub struct BundleManifest {
     pub entries: Vec<BundleEntryMeta>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleRecoverySession {
+    pub canonical_session_id: uuid::Uuid,
+    pub source_provider: Option<String>,
+    pub source_model: Option<String>,
+    pub native_payload_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleRecoveryManifest {
+    pub version: String,
+    pub sessions: Vec<BundleRecoverySession>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSelection {
     pub workspace_id: uuid::Uuid,
@@ -105,6 +121,13 @@ pub struct Bundle {
 }
 
 impl Bundle {
+    pub fn recovery_manifest(&self) -> Result<Option<BundleRecoveryManifest>, BundleError> {
+        self.entries
+            .get("recovery/manifest.json")
+            .map(|bytes| serde_json::from_slice(bytes).map_err(BundleError::from))
+            .transpose()
+    }
+
     pub fn session_records(&self) -> Result<Vec<CanonicalSession>, BundleError> {
         let mut sessions = Vec::new();
         for (path, bytes) in &self.entries {
@@ -337,6 +360,25 @@ pub fn write_selected_sessions_with_native(
             bytes: native.bytes.clone(),
         });
     }
+    let recovery_manifest = BundleRecoveryManifest {
+        version: "1".into(),
+        sessions: sessions
+            .iter()
+            .map(|session| BundleRecoverySession {
+                canonical_session_id: session.id,
+                source_provider: session.model_provider.clone(),
+                source_model: session.model_name.clone(),
+                native_payload_count: native_entries
+                    .iter()
+                    .filter(|entry| entry.session_id == session.id)
+                    .count() as u64,
+            })
+            .collect(),
+    };
+    entries.push(BundleEntry {
+        path: "recovery/manifest.json".into(),
+        bytes: serde_json::to_vec_pretty(&recovery_manifest)?,
+    });
     let source_root = selections
         .first()
         .map(|selection| selection.root.to_string_lossy().into_owned());
@@ -503,7 +545,7 @@ pub fn read_bundle(path: &Path) -> Result<Bundle, BundleError> {
         .get("manifest.json")
         .ok_or_else(|| BundleError::InvalidFormat("manifest.json is missing".into()))?;
     let manifest: BundleManifest = serde_json::from_slice(manifest_bytes)?;
-    if manifest.format != "1.0" && manifest.format != FORMAT_VERSION {
+    if !matches!(manifest.format.as_str(), "1.0" | "1.1" | FORMAT_VERSION) {
         return Err(BundleError::InvalidFormat(
             "unsupported bundle version".into(),
         ));
