@@ -101,10 +101,13 @@ include message bodies in audit events.
 ## Agent Rollout
 
 1. **Codex:** retain the existing validated raw-rollout identity path when the
-   provider is available. Add a continuation spike that proves a new Codex
-   thread can show migrated visible history and accept a turn under the target
-   default provider. Current `thread/inject_items` alone is explicitly not a
-   sufficient continuation writer because it does not create visible turns.
+   provider is available. The first continuation spike uses App Server
+   `thread/fork` with the rollout path and target `modelProvider`/`model`
+   override, because that protocol creates a new durable thread with copied
+   history. It must prove that the resulting thread lists, exposes visible
+   history, and accepts a subsequent target-provider turn. Current
+   `thread/inject_items` alone is explicitly not a sufficient continuation
+   writer because it does not create visible turns.
 2. **Claude Code:** add a target configuration probe and a continuation writer
    only after an isolated Claude fixture demonstrates visible history and a
    subsequent turn. Do not write a guessed transcript format.
