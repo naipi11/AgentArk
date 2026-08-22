@@ -52,11 +52,18 @@ impl IndexDb {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if schema_version.as_deref() != Some("1") {
-                return Err(IndexError::UnsupportedStorageBuild);
+            match schema_version
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                Some(1) => connection
+                    .execute_batch(include_str!("../migrations/0002_restore_mappings.sql"))?,
+                Some(2) => {}
+                _ => return Err(IndexError::UnsupportedStorageBuild),
             }
         } else {
             connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+            connection.execute_batch(include_str!("../migrations/0002_restore_mappings.sql"))?;
         }
         Ok(Self {
             connection,

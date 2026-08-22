@@ -314,6 +314,7 @@ name = "agentark-index"
 version = "0.1.0"
 dependencies = [
  "agentark-canonical",
+ "agentark-migration",
  "agentark-security",
  "hex",
  "rusqlite",
