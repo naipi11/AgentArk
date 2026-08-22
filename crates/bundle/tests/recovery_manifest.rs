@@ -50,6 +50,38 @@ fn omits_secret_and_endpoint_shaped_model_labels() {
 }
 
 #[test]
+fn omits_endpoint_shaped_labels_without_schemes() {
+    let bundle = write_codex_bundle_with(
+        "localhost:8080",
+        "private-model-endpoint.example/v1",
+        "api_key=fixture-secret-value",
+        one_native_payload(),
+    );
+    let manifest = bundle.recovery_manifest().unwrap().unwrap();
+    assert_eq!(manifest.sessions[0].source_provider, None);
+    assert_eq!(manifest.sessions[0].source_model, None);
+}
+
+#[test]
+fn retains_ordinary_dotted_provider_and_model_labels() {
+    let bundle = write_codex_bundle_with(
+        "gpt-5.1",
+        "claude-3.5",
+        "api_key=fixture-secret-value",
+        one_native_payload(),
+    );
+    let manifest = bundle.recovery_manifest().unwrap().unwrap();
+    assert_eq!(
+        manifest.sessions[0].source_provider.as_deref(),
+        Some("gpt-5.1")
+    );
+    assert_eq!(
+        manifest.sessions[0].source_model.as_deref(),
+        Some("claude-3.5")
+    );
+}
+
+#[test]
 fn old_bundle_has_no_recovery_manifest() {
     let bundle = read_fixture_with_format("1.1");
     assert_eq!(bundle.recovery_manifest().unwrap(), None);

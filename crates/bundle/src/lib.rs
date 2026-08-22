@@ -108,6 +108,11 @@ struct BundleWriteMeta {
     file_count: u64,
 }
 
+enum RecoveryLabelKind {
+    Provider,
+    Model,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BundleEntry {
     pub path: String,
@@ -366,8 +371,16 @@ pub fn write_selected_sessions_with_native(
             .iter()
             .map(|session| BundleRecoverySession {
                 canonical_session_id: session.id,
-                source_provider: safe_recovery_label(session.model_provider.as_deref(), scanner),
-                source_model: safe_recovery_label(session.model_name.as_deref(), scanner),
+                source_provider: safe_recovery_label(
+                    session.model_provider.as_deref(),
+                    scanner,
+                    RecoveryLabelKind::Provider,
+                ),
+                source_model: safe_recovery_label(
+                    session.model_name.as_deref(),
+                    scanner,
+                    RecoveryLabelKind::Model,
+                ),
                 native_payload_count: native_entries
                     .iter()
                     .filter(|entry| entry.session_id == session.id)
@@ -592,12 +605,27 @@ fn redact_value(value: Value, scanner: &SecretScanner) -> (Value, u64) {
     }
 }
 
-fn safe_recovery_label(value: Option<&str>, scanner: &SecretScanner) -> Option<String> {
+fn safe_recovery_label(
+    value: Option<&str>,
+    scanner: &SecretScanner,
+    kind: RecoveryLabelKind,
+) -> Option<String> {
     let label = value?.trim();
-    if label.contains("://") || !scanner.sanitize(label).findings.is_empty() {
-        None
-    } else {
-        Some(label.to_owned())
+    if !scanner.sanitize(label).findings.is_empty() {
+        return None;
+    }
+    match kind {
+        RecoveryLabelKind::Provider => label
+            .chars()
+            .all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+            .then(|| label.to_owned()),
+        RecoveryLabelKind::Model => (!label.contains('/')
+            && !label.contains('\\')
+            && !label.contains(':')
+            && !label.contains("://"))
+        .then(|| label.to_owned()),
     }
 }
 
