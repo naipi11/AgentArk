@@ -39,7 +39,7 @@ Vendor databases/files are never opened writable.
 
 ## Release gate result
 
-The 0.3.0 Windows gate is verified: workspace tests, clippy, front-end tests,
+The 0.4.0 Windows gate is verified: workspace tests, clippy, front-end tests,
 MSI/NSIS build, SHA-256 capture, administrator upgrade, and responsive desktop
 launch all passed. No vendor-native writer is enabled by default; cross-agent
 migration remains an explicit L1 handoff until an official target import
