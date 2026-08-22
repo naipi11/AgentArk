@@ -3,6 +3,9 @@
 mod commands;
 mod state;
 
+pub mod recovery;
+pub use state::{AppState, BundleReport};
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

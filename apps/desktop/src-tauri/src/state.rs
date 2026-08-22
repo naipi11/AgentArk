@@ -7,11 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentark_adapter_claude::ClaudeCodeAdapter;
-use agentark_adapter_codex::{
-    CodexAdapter, CodexProbe, NativePayloadError, NativeRolloutPayload, ensure_codex_not_running,
-    native_thread_expectation, restore_native_rollouts, rewrite_native_workspace_paths,
-    verify_rollouts_with_app_server,
-};
+use agentark_adapter_codex::{CodexAdapter, NativeRolloutPayload};
 use agentark_adapter_grok::GrokBuildAdapter;
 use agentark_adapter_hermes::HermesAdapter;
 use agentark_adapter_openclaw::OpenClawAdapter;
@@ -28,8 +24,8 @@ use agentark_bundle::{
 };
 use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
-use agentark_index::IndexDb;
-use agentark_migration::agent_label;
+use agentark_index::{IndexDb, RestoreMapping};
+use agentark_migration::{RestoreOutcome, agent_label};
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
 use agentark_watch::{
     ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
@@ -37,6 +33,11 @@ use agentark_watch::{
 use directories::ProjectDirs;
 use serde::Serialize;
 use uuid::Uuid;
+
+use crate::recovery::{
+    CodexRecoveryExecutor, ProductionCodexRecoveryExecutor, RecoveryInput,
+    recover_one_codex_session,
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +59,11 @@ pub struct BundleReport {
     pub native_backup_path: Option<String>,
     pub native_restart_required: bool,
     pub native_error: Option<String>,
+    pub native_identity_count: u64,
+    pub continuation_count: u64,
+    pub archive_only_count: u64,
+    pub restore_mapping_count: u64,
+    pub recovery_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -144,6 +150,21 @@ impl AppState {
                 scanner: Box::new(EmptyUseCase),
                 verifier: Box::new(EmptyUseCase),
                 queries: Box::new(LockedIndexQueryService::new(index)),
+            })),
+            data_root,
+            scan_lock: Arc::new(Mutex::new(())),
+            watch_roots: Arc::new(Mutex::new(Vec::new())),
+            watcher_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn for_data_root(data_root: PathBuf) -> Self {
+        Self {
+            services: Arc::new(Mutex::new(AppServices {
+                scanner: Box::new(EmptyUseCase),
+                verifier: Box::new(EmptyUseCase),
+                queries: Box::new(EmptyQuery),
             })),
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
@@ -598,6 +619,11 @@ impl AppState {
                 native_backup_path: None,
                 native_restart_required: false,
                 native_error: None,
+                native_identity_count: 0,
+                continuation_count: 0,
+                archive_only_count: 0,
+                restore_mapping_count: 0,
+                recovery_error: None,
             })
         })();
         let _ = self.refresh_query_index();
@@ -643,18 +669,38 @@ impl AppState {
             native_backup_path: None,
             native_restart_required: false,
             native_error: None,
+            native_identity_count: 0,
+            continuation_count: 0,
+            archive_only_count: 0,
+            restore_mapping_count: 0,
+            recovery_error: None,
         })
     }
 
-    pub fn bundle_restore(
+    pub fn bundle_restore(&self, path: PathBuf) -> Result<BundleReport, String> {
+        let codex_home = detected_codex_home().unwrap_or_default();
+        let executable = resolve_codex_executable();
+        let backup_root = codex_home.join("agentark-backups");
+        let executor = ProductionCodexRecoveryExecutor::new();
+        self.bundle_restore_with_executor(path, &executor, codex_home, executable, backup_root)
+    }
+
+    #[doc(hidden)]
+    pub fn bundle_restore_with_executor(
         &self,
         path: PathBuf,
-        native_target: bool,
+        executor: &dyn CodexRecoveryExecutor,
+        codex_home: PathBuf,
+        executable: PathBuf,
+        backup_root: PathBuf,
     ) -> Result<BundleReport, String> {
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
         let bundle = read_bundle(&path).map_err(|_| "无法读取 .ahbundle 备份".to_owned())?;
+        let recovery_manifest = bundle
+            .recovery_manifest()
+            .map_err(|_| "备份中的恢复清单无效".to_owned())?;
         let mut sessions = bundle
             .session_records()
             .map_err(|_| "备份中的会话数据无效".to_owned())?;
@@ -667,6 +713,30 @@ impl AppState {
         let native_entries = bundle
             .native_rollout_entries()
             .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?;
+        let native_payload_count = native_entries.len() as u64;
+        let mut payloads_by_session = HashMap::<Uuid, Vec<NativeRolloutPayload>>::new();
+        for entry in native_entries {
+            let payload = NativeRolloutPayload {
+                session_id: entry.session_id,
+                relative_path: entry.relative_path,
+                source_hash: agentark_canonical::Sha256Digest::from_bytes(&entry.bytes),
+                bytes: entry.bytes,
+                redaction_count: entry.redaction_count,
+            };
+            payloads_by_session
+                .entry(payload.session_id)
+                .or_default()
+                .push(payload);
+        }
+        let recovery_sources = recovery_manifest
+            .map(|manifest| {
+                manifest
+                    .sessions
+                    .into_iter()
+                    .map(|session| (session.canonical_session_id, session))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let restore_root = self.data_root.join("restored-workspaces");
         let workspace_mappings = sessions
             .iter()
@@ -700,118 +770,70 @@ impl AppState {
                 .restore_sessions(&sessions)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
             append_audit_event(&self.data_root, "bundle.restored", &path, Some(scan_id))?;
-            let mut native_imported_count = 0;
-            let mut native_skipped_count = 0;
-            let mut native_conflict_count = 0;
-            let mut native_backup_path = None;
-            let mut native_restart_required = false;
-            let mut native_error = None;
-            if native_target
-                && bundle.manifest.agent.as_deref() == Some("codex")
-                && !native_entries.is_empty()
+            let mut native_identity_count = 0u64;
+            let mut continuation_count = 0u64;
+            let mut archive_only_count = 0u64;
+            let mut restore_mapping_count = 0u64;
+            let mut recovery_error = None;
+            for session in sessions
+                .iter()
+                .filter(|session| session.source_kind == "codex")
             {
-                let payloads = native_entries
-                    .iter()
-                    .map(|entry| NativeRolloutPayload {
-                        session_id: entry.session_id,
-                        relative_path: entry.relative_path.clone(),
-                        source_hash: agentark_canonical::Sha256Digest::from_bytes(&entry.bytes),
-                        bytes: entry.bytes.clone(),
-                        redaction_count: 0,
-                    })
-                    .collect::<Vec<_>>();
-                let codex_home = detected_codex_home();
-                let executable = resolve_codex_executable();
-                let native_restore = ensure_codex_not_running()
-                    .map_err(NativePayloadError::NativeImport)
-                    .and_then(|_| {
-                        let probe = CodexProbe::run(&executable).map_err(|error| {
-                            NativePayloadError::NativeImport(
-                                agentark_adapter_codex::NativeImportError::Verification(format!(
-                                    "Codex capability probe failed: {error}"
-                                )),
-                            )
-                        })?;
-                        if probe.quarantine_reason.is_some() {
-                            return Err(NativePayloadError::NativeImport(
-                                agentark_adapter_codex::NativeImportError::UnsupportedVersion,
-                            ));
-                        }
-                        let codex_home = codex_home.as_ref().ok_or_else(|| {
-                            NativePayloadError::NativeImport(
-                                agentark_adapter_codex::NativeImportError::Invalid(
-                                    "Codex home not found".into(),
-                                ),
-                            )
-                        })?;
-                        restore_native_rollouts(
-                            codex_home,
-                            &payloads,
-                            &workspace_mappings,
-                            &codex_home.join("agentark-backups"),
-                        )
-                    });
-                match native_restore {
-                    Ok(report) => {
-                        native_imported_count = report.imported_count;
-                        native_skipped_count = report.skipped_count;
-                        native_conflict_count = report.conflict_count;
-                        native_backup_path = report
-                            .backup_path
-                            .as_ref()
-                            .map(|value| value.to_string_lossy().into_owned());
-                        native_restart_required = report.restart_required;
-                        if let Some(codex_home) = codex_home.as_ref() {
-                            let mut expectations = Vec::new();
-                            for payload in &payloads {
-                                let destination =
-                                    codex_home.join("sessions").join(&payload.relative_path);
-                                let rewritten = match rewrite_native_workspace_paths(
-                                    &payload.bytes,
-                                    &workspace_mappings,
-                                ) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        native_error = Some(error.to_string());
-                                        break;
-                                    }
-                                };
-                                let expected = match native_thread_expectation(&rewritten) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        native_error = Some(error.to_string());
-                                        break;
-                                    }
-                                };
-                                expectations.push((destination, expected));
-                            }
-                            if native_error.is_none()
-                                && let Err(error) = verify_rollouts_with_app_server(
-                                    &executable,
-                                    codex_home,
-                                    &expectations,
-                                )
-                            {
-                                native_error = Some(error.to_string());
-                            }
-                        } else {
-                            native_error = Some("Codex home not found during verification".into());
-                        }
-                        if native_error.is_some() {
-                            for path in &report.written_paths {
-                                let _ = fs::remove_file(path);
-                            }
-                            native_imported_count = 0;
-                            native_restart_required = false;
+                let mut recovery_session = session.clone();
+                if let Some(source) = recovery_sources.get(&session.id) {
+                    recovery_session.model_provider = source.source_provider.clone();
+                    recovery_session.model_name = source.source_model.clone();
+                }
+                let native_payload = payloads_by_session
+                    .remove(&session.id)
+                    .and_then(|payloads| payloads.into_iter().next());
+                let recovery = recover_one_codex_session(
+                    executor,
+                    &RecoveryInput {
+                        session: recovery_session,
+                        native_payload,
+                        workspace_mappings: workspace_mappings.clone(),
+                        codex_home: codex_home.clone(),
+                        executable: executable.clone(),
+                        backup_root: backup_root.clone(),
+                    },
+                );
+                match recovery.outcome {
+                    RestoreOutcome::NativeIdentity => native_identity_count += 1,
+                    RestoreOutcome::Continuation => continuation_count += 1,
+                    RestoreOutcome::ArchiveOnly => {
+                        archive_only_count += 1;
+                        if recovery_error.is_none() {
+                            recovery_error = Some(recovery.reason_code.clone());
                         }
                     }
-                    Err(NativePayloadError::Conflict) => {
-                        native_conflict_count = 1;
-                        native_error = Some(NativePayloadError::Conflict.to_string());
+                }
+                let mapping = RestoreMapping {
+                    source_session_id: session.id,
+                    target_agent: AgentKind::Codex,
+                    outcome: recovery.outcome,
+                    source_native_id: recovery.source_native_id,
+                    target_native_id: recovery.target_native_id,
+                    source_provider: recovery.source_provider.provider,
+                    target_provider: recovery
+                        .target_provider
+                        .and_then(|identity| identity.provider),
+                    source_hash: recovery.source_hash,
+                    target_hash: recovery.target_hash,
+                    reason_code: recovery.reason_code,
+                    created_at: restore_mapping_timestamp(),
+                };
+                match index.record_restore_mapping(&mapping) {
+                    Ok(()) => restore_mapping_count += 1,
+                    Err(_) => {
+                        if recovery_error.is_none() {
+                            recovery_error = Some("restore-mapping-persistence-failed".into());
+                        }
                     }
-                    Err(error) => native_error = Some(error.to_string()),
                 }
             }
+            let native_imported_count = native_identity_count + continuation_count;
+            let native_restart_required = native_imported_count > 0;
             Ok(BundleReport {
                 format: bundle.manifest.format.clone(),
                 agent: bundle.manifest.agent.clone(),
@@ -823,13 +845,18 @@ impl AppState {
                 redacted: bundle.manifest.redacted,
                 redaction_count: bundle.manifest.redaction_count,
                 restore_scan_id: Some(scan_id),
-                native_payload_count: native_entries.len() as u64,
+                native_payload_count,
                 native_imported_count,
-                native_skipped_count,
-                native_conflict_count,
-                native_backup_path,
+                native_skipped_count: 0,
+                native_conflict_count: 0,
+                native_backup_path: None,
                 native_restart_required,
-                native_error,
+                native_error: recovery_error.clone(),
+                native_identity_count,
+                continuation_count,
+                archive_only_count,
+                restore_mapping_count,
+                recovery_error,
             })
         })();
         let _ = self.refresh_query_index();
@@ -949,6 +976,13 @@ fn now_ns() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default()
+}
+
+fn restore_mapping_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| format!("unix:{}", duration.as_secs()))
+        .unwrap_or_else(|_| "unix:0".into())
 }
 
 fn append_audit_event(
