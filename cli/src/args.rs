@@ -59,9 +59,21 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum BundleCommand {
-    Export { path: PathBuf },
-    Verify { path: PathBuf },
-    Restore { path: PathBuf },
+    Export {
+        path: PathBuf,
+        #[arg(long, value_enum)]
+        agent: Option<AgentArg>,
+        #[arg(long = "project")]
+        workspace_ids: Vec<Uuid>,
+        #[arg(long)]
+        include_files: bool,
+    },
+    Verify {
+        path: PathBuf,
+    },
+    Restore {
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -18,9 +18,11 @@ use agentark_app::{
     ScanService, ScanUseCase, VerifyUseCase,
 };
 use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
-use agentark_bundle::{read_bundle, write_sessions};
+use agentark_bundle::{ProjectSelection, WorkspaceFileEntry, read_bundle, write_selected_sessions};
+use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::IndexDb;
+use agentark_migration::agent_label;
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
 use agentark_watch::{
     ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
@@ -33,8 +35,12 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct BundleReport {
     pub format: String,
+    pub agent: Option<String>,
     pub session_count: u64,
     pub entry_count: usize,
+    pub workspace_count: u64,
+    pub file_count: u64,
+    pub conflict_count: u64,
     pub redacted: bool,
     pub redaction_count: u64,
     pub restore_scan_id: Option<Uuid>,
@@ -493,7 +499,13 @@ impl AppState {
         }
     }
 
-    pub fn bundle_export(&self, path: PathBuf) -> Result<BundleReport, String> {
+    pub fn bundle_export(
+        &self,
+        path: PathBuf,
+        agent_kind: Option<AgentKind>,
+        workspace_ids: Vec<Uuid>,
+        include_files: bool,
+    ) -> Result<BundleReport, String> {
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
@@ -502,16 +514,35 @@ impl AppState {
             let index =
                 open_index(&self.data_root).ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
             let sessions = index
-                .all_sessions()
+                .all_sessions_filtered(agent_kind.clone())
                 .map_err(|_| "无法读取本地会话".to_owned())?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
-            let manifest = write_sessions(&path, &sessions, &scanner)
+            let selected = workspace_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            let selections = sessions
+                .iter()
+                .filter_map(|session| session.workspace.as_ref())
+                .filter(|workspace| selected.is_empty() || selected.contains(&workspace.id))
+                .map(|workspace| ProjectSelection {
+                    workspace_id: workspace.id,
+                    root: PathBuf::from(&workspace.path_native),
+                    include_files,
+                    max_file_bytes: 64 * 1024 * 1024,
+                })
+                .collect::<Vec<_>>();
+            let agent = agent_kind.as_ref().map(agent_label).unwrap_or("all");
+            let manifest = write_selected_sessions(&path, agent, &sessions, &selections, &scanner)
                 .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
             append_audit_event(&self.data_root, "bundle.exported", &path, None)?;
             Ok(BundleReport {
                 format: manifest.format,
+                agent: manifest.agent,
                 session_count: manifest.session_count,
                 entry_count: manifest.entries.len() + 1,
+                workspace_count: manifest.workspace_count,
+                file_count: manifest.file_count,
+                conflict_count: 0,
                 redacted: manifest.redacted,
                 redaction_count: manifest.redaction_count,
                 restore_scan_id: None,
@@ -523,10 +554,30 @@ impl AppState {
 
     pub fn bundle_verify(&self, path: PathBuf) -> Result<BundleReport, String> {
         let bundle = read_bundle(&path).map_err(|_| "无法验证 .ahbundle 文件".to_owned())?;
+        let mut conflict_count = 0;
+        let restore_root = self.data_root.join("restored-workspaces");
+        for entry in bundle
+            .workspace_file_entries()
+            .map_err(|_| "备份中的项目文件清单无效".to_owned())?
+        {
+            let destination = restore_root
+                .join(entry.workspace_id.to_string())
+                .join(&entry.relative_path);
+            if let Ok(existing) = fs::read(destination)
+                && agentark_canonical::Sha256Digest::from_bytes(&existing)
+                    != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
+            {
+                conflict_count += 1;
+            }
+        }
         Ok(BundleReport {
             format: bundle.manifest.format.clone(),
+            agent: bundle.manifest.agent.clone(),
             session_count: bundle.manifest.session_count,
             entry_count: bundle.entries.len(),
+            workspace_count: bundle.manifest.workspace_count,
+            file_count: bundle.manifest.file_count,
+            conflict_count,
             redacted: bundle.manifest.redacted,
             redaction_count: bundle.manifest.redaction_count,
             restore_scan_id: None,
@@ -538,9 +589,27 @@ impl AppState {
             return Err("备份路径不能为空".into());
         }
         let bundle = read_bundle(&path).map_err(|_| "无法读取 .ahbundle 备份".to_owned())?;
-        let sessions = bundle
+        let mut sessions = bundle
             .session_records()
             .map_err(|_| "备份中的会话数据无效".to_owned())?;
+        let workspace_ids = bundle
+            .workspace_ids()
+            .map_err(|_| "备份中的项目清单无效".to_owned())?;
+        let file_entries = bundle
+            .workspace_file_entries()
+            .map_err(|_| "备份中的项目文件清单无效".to_owned())?;
+        let restore_root = self.data_root.join("restored-workspaces");
+        restore_project_files(&restore_root, &file_entries)?;
+        for session in &mut sessions {
+            if let Some(workspace) = session.workspace.as_mut()
+                && workspace_ids.contains(&workspace.id)
+            {
+                let path = restore_root.join(workspace.id.to_string());
+                workspace.path_native = path.to_string_lossy().into_owned();
+                workspace.canonical_uri =
+                    format!("file://{}", workspace.path_native.replace('\\', "/"));
+            }
+        }
         self.release_query_index()?;
         let result = (|| {
             let (_cas, mut index) = open_storage(&self.data_root)?;
@@ -550,8 +619,12 @@ impl AppState {
             append_audit_event(&self.data_root, "bundle.restored", &path, Some(scan_id))?;
             Ok(BundleReport {
                 format: bundle.manifest.format.clone(),
+                agent: bundle.manifest.agent.clone(),
                 session_count: bundle.manifest.session_count,
                 entry_count: bundle.entries.len(),
+                workspace_count: bundle.manifest.workspace_count,
+                file_count: bundle.manifest.file_count,
+                conflict_count: 0,
                 redacted: bundle.manifest.redacted,
                 redaction_count: bundle.manifest.redaction_count,
                 restore_scan_id: Some(scan_id),
@@ -702,6 +775,29 @@ fn append_audit_event(
     append_event(&root.join("audit.jsonl"), event)
         .map(|_| ())
         .map_err(|_| "无法写入审计账本".to_owned())
+}
+
+fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
+    for entry in entries {
+        let destination = root
+            .join(entry.workspace_id.to_string())
+            .join(&entry.relative_path);
+        if let Ok(existing) = fs::read(&destination) {
+            if agentark_canonical::Sha256Digest::from_bytes(&existing)
+                != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
+            {
+                return Err(format!("项目文件冲突：{}", entry.relative_path));
+            }
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|_| "无法创建恢复项目目录".to_owned())?;
+        }
+        let temporary = destination.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        fs::write(&temporary, &entry.bytes).map_err(|_| "无法写入恢复项目文件".to_owned())?;
+        fs::rename(&temporary, &destination).map_err(|_| "无法提交恢复项目文件".to_owned())?;
+    }
+    Ok(())
 }
 
 pub fn detected_codex_home() -> Option<PathBuf> {

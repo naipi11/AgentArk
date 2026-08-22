@@ -91,10 +91,21 @@ fn main() -> ExitCode {
             print_result(cli.json, "verify", runtime::verify(&data_root, scan_id))
         }
         Command::Bundle { command } => match command {
-            BundleCommand::Export { path } => print_result(
+            BundleCommand::Export {
+                path,
+                agent,
+                workspace_ids,
+                include_files,
+            } => print_result(
                 cli.json,
                 "bundle.export",
-                runtime::export_bundle(&data_root, &path),
+                runtime::export_bundle(
+                    &data_root,
+                    &path,
+                    agent.map(|value| format!("{value:?}")),
+                    workspace_ids,
+                    include_files,
+                ),
             ),
             BundleCommand::Verify { path } => {
                 print_result(cli.json, "bundle.verify", runtime::verify_bundle(&path))

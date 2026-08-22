@@ -6,15 +6,15 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 
 use agentark_canonical::CanonicalSession;
-use agentark_security::SecretScanner;
+use agentark_security::{AuthorizedRoot, SecretScanner};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAGIC: &[u8; 9] = b"AHBUNDLE1";
-const FORMAT_VERSION: &str = "1.0";
+const FORMAT_VERSION: &str = "1.1";
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: u32 = 100_000;
@@ -23,6 +23,8 @@ const MAX_ENTRIES: u32 = 100_000;
 pub enum BundleError {
     #[error("bundle I/O failed")]
     Io(#[from] io::Error),
+    #[error("bundle source security policy rejected the operation")]
+    Security(#[from] agentark_security::SecurityError),
     #[error("bundle format is invalid: {0}")]
     InvalidFormat(String),
     #[error("bundle path is unsafe: {0}")]
@@ -45,11 +47,41 @@ pub struct BundleEntryMeta {
 #[serde(rename_all = "camelCase")]
 pub struct BundleManifest {
     pub format: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub source_root: Option<String>,
     pub created_at: String,
     pub session_count: u64,
+    #[serde(default)]
+    pub workspace_count: u64,
+    #[serde(default)]
+    pub file_count: u64,
     pub redacted: bool,
     pub redaction_count: u64,
     pub entries: Vec<BundleEntryMeta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSelection {
+    pub workspace_id: uuid::Uuid,
+    pub root: std::path::PathBuf,
+    pub include_files: bool,
+    pub max_file_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceFileEntry {
+    pub workspace_id: uuid::Uuid,
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+}
+
+struct BundleWriteMeta {
+    agent: Option<String>,
+    source_root: Option<String>,
+    workspace_count: u64,
+    file_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +128,43 @@ impl Bundle {
         }
         Ok(())
     }
+
+    pub fn workspace_file_entries(&self) -> Result<Vec<WorkspaceFileEntry>, BundleError> {
+        let mut files = Vec::new();
+        for (path, bytes) in &self.entries {
+            let Some(rest) = path.strip_prefix("workspaces/") else {
+                continue;
+            };
+            let Some((workspace, relative)) = rest.split_once("/files/") else {
+                continue;
+            };
+            let workspace_id = uuid::Uuid::parse_str(workspace)
+                .map_err(|_| BundleError::UnsafePath(path.clone()))?;
+            validate_relative_path(relative)?;
+            files.push(WorkspaceFileEntry {
+                workspace_id,
+                relative_path: relative.to_owned(),
+                bytes: bytes.clone(),
+            });
+        }
+        Ok(files)
+    }
+
+    pub fn workspace_ids(&self) -> Result<Vec<uuid::Uuid>, BundleError> {
+        let mut ids = Vec::new();
+        for path in self.entries.keys() {
+            let Some(rest) = path.strip_prefix("workspaces/") else {
+                continue;
+            };
+            let Some(id) = rest.strip_suffix("/manifest.json") else {
+                continue;
+            };
+            ids.push(uuid::Uuid::parse_str(id).map_err(|_| BundleError::UnsafePath(path.clone()))?);
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
 }
 
 pub fn write_sessions(
@@ -116,14 +185,143 @@ pub fn write_sessions(
             bytes,
         });
     }
-    write_entries(path, entries, sessions.len() as u64, redaction_count)
+    write_entries_with_meta(
+        path,
+        entries,
+        sessions.len() as u64,
+        redaction_count,
+        BundleWriteMeta {
+            agent: None,
+            source_root: None,
+            workspace_count: 0,
+            file_count: 0,
+        },
+    )
+}
+
+pub fn write_selected_sessions(
+    path: &Path,
+    agent: &str,
+    sessions: &[CanonicalSession],
+    selections: &[ProjectSelection],
+    scanner: &SecretScanner,
+) -> Result<BundleManifest, BundleError> {
+    let mut entries = Vec::with_capacity(sessions.len() + selections.len());
+    let mut redaction_count = 0;
+    for session in sessions {
+        let value = serde_json::to_value(session)?;
+        let (value, count) = redact_value(value, scanner);
+        redaction_count += count;
+        let mut bytes = serde_json::to_vec(&value)?;
+        bytes.push(b'\n');
+        entries.push(BundleEntry {
+            path: format!("sessions/{}.ndjson", session.id),
+            bytes,
+        });
+    }
+    let mut file_count = 0u64;
+    let mut workspace_count = 0u64;
+    for selection in selections {
+        let workspace = sessions.iter().find_map(|session| {
+            session
+                .workspace
+                .as_ref()
+                .filter(|workspace| workspace.id == selection.workspace_id)
+        });
+        let Some(workspace) = workspace else {
+            continue;
+        };
+        let mut workspace_files = Vec::new();
+        if selection.include_files {
+            let authorized = AuthorizedRoot::new(selection.root.clone())?;
+            for entry in walkdir::WalkDir::new(&selection.root)
+                .follow_links(false)
+                .max_depth(32)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+            {
+                let relative = entry.path().strip_prefix(&selection.root).map_err(|_| {
+                    BundleError::UnsafePath(entry.path().to_string_lossy().into_owned())
+                })?;
+                let relative_text = relative.to_string_lossy().replace('\\', "/");
+                validate_relative_path(&relative_text)?;
+                if is_credential_filename(&relative_text) {
+                    continue;
+                }
+                let mut source = authorized.open_regular_file(relative)?;
+                let metadata = source.metadata()?;
+                if metadata.len() > selection.max_file_bytes {
+                    return Err(BundleError::InvalidFormat(format!(
+                        "project file {} exceeds the selected size limit",
+                        relative_text
+                    )));
+                }
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                source.read_to_end(&mut bytes)?;
+                let (bytes, count) = redact_bytes(bytes, scanner);
+                redaction_count += count;
+                file_count += 1;
+                entries.push(BundleEntry {
+                    path: format!(
+                        "workspaces/{}/files/{}",
+                        selection.workspace_id, relative_text
+                    ),
+                    bytes: bytes.clone(),
+                });
+                workspace_files.push(json!({"path": relative_text, "size": bytes.len(), "sha256": hex::encode(Sha256::digest(&bytes))}));
+            }
+        }
+        let manifest = json!({"workspaceId": workspace.id, "pathNative": workspace.path_native, "canonicalUri": workspace.canonical_uri, "gitCommit": workspace.git_commit, "files": workspace_files});
+        entries.push(BundleEntry {
+            path: format!("workspaces/{}/manifest.json", selection.workspace_id),
+            bytes: serde_json::to_vec_pretty(&manifest)?,
+        });
+        workspace_count += 1;
+    }
+    let source_root = selections
+        .first()
+        .map(|selection| selection.root.to_string_lossy().into_owned());
+    write_entries_with_meta(
+        path,
+        entries,
+        sessions.len() as u64,
+        redaction_count,
+        BundleWriteMeta {
+            agent: Some(agent.to_owned()),
+            source_root,
+            workspace_count,
+            file_count,
+        },
+    )
 }
 
 pub fn write_entries(
     path: &Path,
+    entries: Vec<BundleEntry>,
+    session_count: u64,
+    redaction_count: u64,
+) -> Result<BundleManifest, BundleError> {
+    write_entries_with_meta(
+        path,
+        entries,
+        session_count,
+        redaction_count,
+        BundleWriteMeta {
+            agent: None,
+            source_root: None,
+            workspace_count: 0,
+            file_count: 0,
+        },
+    )
+}
+
+fn write_entries_with_meta(
+    path: &Path,
     mut entries: Vec<BundleEntry>,
     session_count: u64,
     redaction_count: u64,
+    meta: BundleWriteMeta,
 ) -> Result<BundleManifest, BundleError> {
     for entry in &entries {
         validate_relative_path(&entry.path)?;
@@ -148,10 +346,14 @@ pub fn write_entries(
         .collect::<Vec<_>>();
     let manifest = BundleManifest {
         format: FORMAT_VERSION.into(),
+        agent: meta.agent,
+        source_root: meta.source_root,
         created_at: OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default(),
         session_count,
+        workspace_count: meta.workspace_count,
+        file_count: meta.file_count,
         redacted: redaction_count > 0,
         redaction_count,
         entries: metadata.clone(),
@@ -243,7 +445,7 @@ pub fn read_bundle(path: &Path) -> Result<Bundle, BundleError> {
         .get("manifest.json")
         .ok_or_else(|| BundleError::InvalidFormat("manifest.json is missing".into()))?;
     let manifest: BundleManifest = serde_json::from_slice(manifest_bytes)?;
-    if manifest.format != FORMAT_VERSION {
+    if manifest.format != "1.0" && manifest.format != FORMAT_VERSION {
         return Err(BundleError::InvalidFormat(
             "unsupported bundle version".into(),
         ));
@@ -288,6 +490,32 @@ fn redact_value(value: Value, scanner: &SecretScanner) -> (Value, u64) {
         }
         other => (other, 0),
     }
+}
+
+fn redact_bytes(bytes: Vec<u8>, scanner: &SecretScanner) -> (Vec<u8>, u64) {
+    match String::from_utf8(bytes) {
+        Ok(text) => {
+            let sanitized = scanner.sanitize(&text);
+            (sanitized.text.into_bytes(), sanitized.findings.len() as u64)
+        }
+        Err(error) => (error.into_bytes(), 0),
+    }
+}
+
+fn is_credential_filename(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        ".env"
+            | ".env.local"
+            | "auth.json"
+            | "auth.toml"
+            | "credentials.json"
+            | "mcp-auth.json"
+            | "token.json"
+    ) || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
 }
 
 fn validate_relative_path(value: &str) -> Result<(), BundleError> {

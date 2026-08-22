@@ -21,6 +21,7 @@ agentark-app = { path = "../../../crates/app" }
 agentark-bundle = { path = "../../../crates/bundle" }
 agentark-audit = { path = "../../../crates/audit" }
 agentark-canonical = { path = "../../../crates/canonical" }
+agentark-migration = { path = "../../../crates/migration" }
 agentark-watch = { path = "../../../crates/watch" }
 agentark-adapter-codex = { path = "../../../crates/adapters/codex" }
 agentark-adapter-claude = { path = "../../../crates/adapters/claude" }

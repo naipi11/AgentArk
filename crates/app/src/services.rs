@@ -1,4 +1,4 @@
-use agentark_canonical::{CanonicalRole, Completeness};
+use agentark_canonical::{AgentKind, CanonicalRole, Completeness};
 use agentark_index::{SearchHit, SessionQuery, SessionSummary, WorkspaceSummary};
 use agentark_security::SecretScanner;
 use serde::Serialize;
@@ -19,6 +19,17 @@ pub trait VerifyUseCase: Send + Sync {}
 pub trait QueryUseCase: Send + Sync {
     fn status(&self) -> Result<StatusDto, AppError>;
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, AppError>;
+    fn list_sessions_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        if agent_kind.is_some() {
+            return Err(AppError::Invariant("agent filter is unavailable".into()));
+        }
+        self.list_sessions(limit, offset)
+    }
     fn list_sessions_for_workspace(
         &self,
         workspace_id: Uuid,
@@ -28,7 +39,30 @@ pub trait QueryUseCase: Send + Sync {
         let _ = workspace_id;
         self.list_sessions(limit, offset)
     }
+    fn list_sessions_for_workspace_filtered(
+        &self,
+        workspace_id: Uuid,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        if agent_kind.is_some() {
+            return Err(AppError::Invariant("agent filter is unavailable".into()));
+        }
+        self.list_sessions_for_workspace(workspace_id, limit, offset)
+    }
     fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError>;
+    fn list_workspaces_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WorkspaceDto>, AppError> {
+        if agent_kind.is_some() {
+            return Err(AppError::Invariant("agent filter is unavailable".into()));
+        }
+        self.list_workspaces(limit, offset)
+    }
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, AppError>;
     fn list_quarantines(&self) -> Result<Vec<QuarantineDto>, AppError>;
@@ -136,10 +170,35 @@ impl<I: SessionQuery + Send + Sync> QueryUseCase for IndexQueryService<I> {
         Ok(self.index.list_sessions(limit, offset)?)
     }
 
+    fn list_sessions_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        Ok(self
+            .index
+            .list_sessions_filtered(agent_kind, limit, offset)?)
+    }
+
     fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError> {
         Ok(self
             .index
             .list_workspaces(limit, offset)?
+            .into_iter()
+            .map(workspace_dto)
+            .collect())
+    }
+
+    fn list_workspaces_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WorkspaceDto>, AppError> {
+        Ok(self
+            .index
+            .list_workspaces_filtered(agent_kind, limit, offset)?
             .into_iter()
             .map(workspace_dto)
             .collect())
@@ -154,6 +213,21 @@ impl<I: SessionQuery + Send + Sync> QueryUseCase for IndexQueryService<I> {
         Ok(self
             .index
             .list_sessions_for_workspace(workspace_id, limit, offset)?)
+    }
+
+    fn list_sessions_for_workspace_filtered(
+        &self,
+        workspace_id: Uuid,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        Ok(self.index.list_sessions_for_workspace_filtered(
+            workspace_id,
+            agent_kind,
+            limit,
+            offset,
+        )?)
     }
 
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError> {
@@ -198,11 +272,38 @@ impl<I: SessionQuery + Send> QueryUseCase for LockedIndexQueryService<I> {
             .map_err(AppError::from)
     }
 
+    fn list_sessions_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        self.index
+            .lock()
+            .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
+            .list_sessions_filtered(agent_kind, limit, offset)
+            .map_err(AppError::from)
+    }
+
     fn list_workspaces(&self, limit: u32, offset: u32) -> Result<Vec<WorkspaceDto>, AppError> {
         self.index
             .lock()
             .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
             .list_workspaces(limit, offset)
+            .map(|rows| rows.into_iter().map(workspace_dto).collect())
+            .map_err(AppError::from)
+    }
+
+    fn list_workspaces_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WorkspaceDto>, AppError> {
+        self.index
+            .lock()
+            .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
+            .list_workspaces_filtered(agent_kind, limit, offset)
             .map(|rows| rows.into_iter().map(workspace_dto).collect())
             .map_err(AppError::from)
     }
@@ -217,6 +318,20 @@ impl<I: SessionQuery + Send> QueryUseCase for LockedIndexQueryService<I> {
             .lock()
             .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
             .list_sessions_for_workspace(workspace_id, limit, offset)
+            .map_err(AppError::from)
+    }
+
+    fn list_sessions_for_workspace_filtered(
+        &self,
+        workspace_id: Uuid,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, AppError> {
+        self.index
+            .lock()
+            .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
+            .list_sessions_for_workspace_filtered(workspace_id, agent_kind, limit, offset)
             .map_err(AppError::from)
     }
 

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs};
 
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession,
-    Completeness, canonical_hash,
+    Completeness, Workspace, canonical_hash, workspace_id,
 };
 use agentark_index::{IndexDb, SessionIndex, SessionIngest, SessionQuery};
 use agentark_security::{DatasetBootstrap, MemoryMasterKeyStore, SanitizedText};
@@ -118,6 +118,74 @@ fn restores_bundle_sessions_into_searchable_archive() {
             )
             .unwrap(),
         "complete"
+    );
+}
+
+#[test]
+fn filters_sessions_and_projects_by_agent_kind() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let mut db = IndexDb::open(&dir.path().join("agentark.db"), keys.sqlcipher_key()).unwrap();
+    let (codex_install, mut codex_session, _) = fixture();
+    codex_session.workspace = Some(Workspace {
+        id: workspace_id("file:///C:/codex"),
+        path_native: "C:\\codex".into(),
+        canonical_uri: "file:///C:/codex".into(),
+        git_commit: None,
+    });
+    let codex_hash = canonical_hash("session", &codex_session).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &codex_install,
+        session: &codex_session,
+        source_records: &[],
+        sanitized_title: "codex",
+        sanitized_body: "codex",
+        findings: &[],
+        canonical_hash: &codex_hash,
+    })
+    .unwrap();
+    let (mut claude_install, mut claude_session, _) = fixture();
+    claude_install.kind = AgentKind::ClaudeCode;
+    claude_session.install_id = claude_install.id;
+    claude_session.source_kind = "claude-code".into();
+    claude_session.source_session_id = "claude-session".into();
+    claude_session.messages[0].id = Uuid::new_v4();
+    claude_session.workspace = Some(Workspace {
+        id: workspace_id("file:///C:/claude"),
+        path_native: "C:\\claude".into(),
+        canonical_uri: "file:///C:/claude".into(),
+        git_commit: None,
+    });
+    let claude_hash = canonical_hash("session", &claude_session).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &claude_install,
+        session: &claude_session,
+        source_records: &[],
+        sanitized_title: "claude",
+        sanitized_body: "claude",
+        findings: &[],
+        canonical_hash: &claude_hash,
+    })
+    .unwrap();
+    assert_eq!(
+        db.list_sessions_filtered(Some(AgentKind::Codex), 10, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_sessions_filtered(Some(AgentKind::ClaudeCode), 10, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_workspaces_filtered(Some(AgentKind::Codex), 10, 0)
+            .unwrap()[0]
+            .path_native,
+        "C:\\codex"
     );
 }
 

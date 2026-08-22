@@ -1,4 +1,4 @@
-use agentark_canonical::{CanonicalSession, Completeness};
+use agentark_canonical::{AgentKind, CanonicalSession, Completeness};
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
@@ -6,6 +6,17 @@ use crate::{IndexDb, IndexError};
 
 pub trait SessionQuery {
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, IndexError>;
+    fn list_sessions_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, IndexError> {
+        if agent_kind.is_some() {
+            return Err(IndexError::InvalidQuery);
+        }
+        self.list_sessions(limit, offset)
+    }
     fn list_sessions_for_workspace(
         &self,
         workspace_id: Uuid,
@@ -15,8 +26,31 @@ pub trait SessionQuery {
         let _ = workspace_id;
         self.list_sessions(limit, offset)
     }
+    fn list_sessions_for_workspace_filtered(
+        &self,
+        workspace_id: Uuid,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, IndexError> {
+        if agent_kind.is_some() {
+            return Err(IndexError::InvalidQuery);
+        }
+        self.list_sessions_for_workspace(workspace_id, limit, offset)
+    }
     fn list_workspaces(&self, limit: u32, offset: u32)
     -> Result<Vec<WorkspaceSummary>, IndexError>;
+    fn list_workspaces_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WorkspaceSummary>, IndexError> {
+        if agent_kind.is_some() {
+            return Err(IndexError::InvalidQuery);
+        }
+        self.list_workspaces(limit, offset)
+    }
     fn show_session(&self, id: Uuid) -> Result<SessionDetail, IndexError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, IndexError>;
     fn list_quarantines(&self) -> Result<Vec<QuarantineSummary>, IndexError>;
@@ -69,11 +103,23 @@ pub struct QuarantineSummary {
 
 impl SessionQuery for IndexDb {
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, IndexError> {
+        self.list_sessions_filtered(None, limit, offset)
+    }
+
+    fn list_sessions_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, IndexError> {
+        let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let mut statement = self.connection().prepare(
-            "SELECT id, search_title, source_kind, archived, completeness, stale
-             FROM sessions ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
+            "SELECT s.id, s.search_title, s.source_kind, s.archived, s.completeness, s.stale
+             FROM sessions s JOIN agent_installs ai ON ai.id = s.install_id
+             WHERE (?1 IS NULL OR ai.kind = ?1)
+             ORDER BY s.rowid DESC LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = statement.query_map(params![limit.min(100), offset], |row| {
+        let rows = statement.query_map(params![agent_kind, limit.min(100), offset], |row| {
             Ok(SessionSummary {
                 id: parse_uuid(row.get::<_, String>(0)?)?,
                 title: row.get(1)?,
@@ -92,13 +138,25 @@ impl SessionQuery for IndexDb {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionSummary>, IndexError> {
+        self.list_sessions_for_workspace_filtered(workspace_id, None, limit, offset)
+    }
+
+    fn list_sessions_for_workspace_filtered(
+        &self,
+        workspace_id: Uuid,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionSummary>, IndexError> {
+        let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let mut statement = self.connection().prepare(
-            "SELECT id, search_title, source_kind, archived, completeness, stale
-             FROM sessions WHERE workspace_id = ?1
-             ORDER BY rowid DESC LIMIT ?2 OFFSET ?3",
+            "SELECT s.id, s.search_title, s.source_kind, s.archived, s.completeness, s.stale
+             FROM sessions s JOIN agent_installs ai ON ai.id = s.install_id
+             WHERE s.workspace_id = ?1 AND (?2 IS NULL OR ai.kind = ?2)
+             ORDER BY s.rowid DESC LIMIT ?3 OFFSET ?4",
         )?;
         let rows = statement.query_map(
-            params![workspace_id.to_string(), limit.min(100), offset],
+            params![workspace_id.to_string(), agent_kind, limit.min(100), offset],
             |row| {
                 Ok(SessionSummary {
                     id: parse_uuid(row.get::<_, String>(0)?)?,
@@ -118,16 +176,28 @@ impl SessionQuery for IndexDb {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<WorkspaceSummary>, IndexError> {
+        self.list_workspaces_filtered(None, limit, offset)
+    }
+
+    fn list_workspaces_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WorkspaceSummary>, IndexError> {
+        let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let mut statement = self.connection().prepare(
             "SELECT w.id, w.path_native, w.canonical_uri, w.git_commit, COUNT(s.id)
              FROM workspaces w
-             LEFT JOIN sessions s ON s.workspace_id = w.id
+             JOIN sessions s ON s.workspace_id = w.id
+             JOIN agent_installs ai ON ai.id = s.install_id
+             WHERE (?1 IS NULL OR ai.kind = ?1)
              GROUP BY w.id, w.path_native, w.canonical_uri, w.git_commit
              HAVING COUNT(s.id) > 0
              ORDER BY MAX(s.rowid) DESC, w.rowid DESC
-             LIMIT ?1 OFFSET ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = statement.query_map(params![limit.min(100), offset], |row| {
+        let rows = statement.query_map(params![agent_kind, limit.min(100), offset], |row| {
             Ok(WorkspaceSummary {
                 id: parse_uuid(row.get::<_, String>(0)?)?,
                 path_native: row.get(1)?,
@@ -213,16 +283,31 @@ impl SessionQuery for IndexDb {
 impl IndexDb {
     /// Returns every canonical session for portable backup/export.
     pub fn all_sessions(&self) -> Result<Vec<CanonicalSession>, IndexError> {
+        self.all_sessions_filtered(None)
+    }
+
+    pub fn all_sessions_filtered(
+        &self,
+        agent_kind: Option<AgentKind>,
+    ) -> Result<Vec<CanonicalSession>, IndexError> {
+        let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let mut statement = self
             .connection()
-            .prepare("SELECT canonical_json FROM sessions ORDER BY rowid ASC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            .prepare("SELECT s.canonical_json FROM sessions s JOIN agent_installs ai ON ai.id = s.install_id WHERE (?1 IS NULL OR ai.kind = ?1) ORDER BY s.rowid ASC")?;
+        let rows = statement.query_map(params![agent_kind], |row| row.get::<_, String>(0))?;
         rows.map(|row| {
             let json = row?;
             Ok(serde_json::from_str(&json)?)
         })
         .collect()
     }
+}
+
+fn agent_kind_storage_label(agent_kind: Option<&AgentKind>) -> Result<Option<String>, IndexError> {
+    agent_kind
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(IndexError::from)
 }
 
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use agentark_app::{
     AppError, PublicSessionDetail, QuarantineDto, QueryUseCase, ScanReport, StatusDto, WorkspaceDto,
 };
+use agentark_canonical::AgentKind;
 use agentark_index::{SearchHit, SessionSummary};
 use tauri::State;
 use uuid::Uuid;
@@ -50,8 +51,9 @@ pub fn sessions_list(
     limit: u32,
     offset: u32,
     workspace_id: Option<Uuid>,
+    agent_kind: Option<AgentKind>,
 ) -> Result<Vec<SessionSummary>, String> {
-    sessions_list_inner(&state.services, limit, offset, workspace_id)
+    sessions_list_inner(&state.services, limit, offset, workspace_id, agent_kind)
 }
 
 pub fn sessions_list_inner(
@@ -59,10 +61,13 @@ pub fn sessions_list_inner(
     limit: u32,
     offset: u32,
     workspace_id: Option<Uuid>,
+    agent_kind: Option<AgentKind>,
 ) -> Result<Vec<SessionSummary>, String> {
     with_query(services, |query| match workspace_id {
-        Some(workspace_id) => query.list_sessions_for_workspace(workspace_id, limit, offset),
-        None => query.list_sessions(limit, offset),
+        Some(workspace_id) => {
+            query.list_sessions_for_workspace_filtered(workspace_id, agent_kind, limit, offset)
+        }
+        None => query.list_sessions_filtered(agent_kind, limit, offset),
     })
 }
 
@@ -93,9 +98,10 @@ pub fn workspaces_list(
     state: State<'_, AppState>,
     limit: u32,
     offset: u32,
+    agent_kind: Option<AgentKind>,
 ) -> Result<Vec<WorkspaceDto>, String> {
     with_query(&state.services, |query| {
-        query.list_workspaces(limit, offset)
+        query.list_workspaces_filtered(agent_kind, limit, offset)
     })
 }
 
@@ -172,13 +178,24 @@ pub fn grok_build_default_root() -> Option<String> {
 pub fn bundle_export(
     state: State<'_, AppState>,
     path: String,
+    agent_kind: Option<AgentKind>,
+    workspace_ids: Vec<Uuid>,
+    include_files: bool,
 ) -> Result<crate::state::BundleReport, String> {
-    state.bundle_export(std::path::PathBuf::from(path.trim()))
+    state.bundle_export(
+        std::path::PathBuf::from(path.trim()),
+        agent_kind,
+        workspace_ids,
+        include_files,
+    )
 }
 
 #[tauri::command]
-pub fn bundle_verify(path: String) -> Result<crate::state::BundleReport, String> {
-    AppState::empty().bundle_verify(std::path::PathBuf::from(path.trim()))
+pub fn bundle_verify(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::state::BundleReport, String> {
+    state.bundle_verify(std::path::PathBuf::from(path.trim()))
 }
 
 #[tauri::command]

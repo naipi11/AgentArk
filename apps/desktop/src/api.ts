@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 
+export type AgentKind = 'codex' | 'claudeCode' | 'hermes' | 'openClaw' | 'openCode' | 'grokBuild';
+export type AgentFilter = AgentKind | 'all';
+
 export type StatusDto = {
   datasetState: string;
   adapterId?: string;
@@ -57,8 +60,12 @@ export type ScanReport = {
 };
 export type BundleReport = {
   format: string;
+  agent?: string;
   sessionCount: number;
   entryCount: number;
+  workspaceCount: number;
+  fileCount: number;
+  conflictCount: number;
   redacted: boolean;
   redactionCount: number;
   restoreScanId?: string;
@@ -67,7 +74,7 @@ export type AuditVerification = { valid: boolean; eventCount: number; lastHash?:
 
 export const api = {
   status: () => invoke<StatusDto>('status'),
-  sessionsList: (limit = 50, offset = 0, workspaceId?: string) => invoke<SessionSummary[]>('sessions_list', { limit, offset, workspaceId }),
+  sessionsList: (limit = 50, offset = 0, workspaceId?: string, agentKind?: AgentKind) => invoke<SessionSummary[]>('sessions_list', { limit, offset, workspaceId, agentKind }),
   sessionsShow: (sessionId: string) => invoke<PublicSessionDetail>('sessions_show', { sessionId }),
   search: (query: string, limit = 50) => invoke<SearchHit[]>('search', { query, limit }),
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),
@@ -83,9 +90,9 @@ export const api = {
   scanOpenClaw: (sourceRoot: string) => invoke<ScanReport>('scan_openclaw', { sourceRoot }),
   scanOpenCode: (sourceRoot: string) => invoke<ScanReport>('scan_opencode', { sourceRoot }),
   scanGrokBuild: (sourceRoot: string) => invoke<ScanReport>('scan_grok_build', { sourceRoot }),
-  bundleExport: (path: string) => invoke<BundleReport>('bundle_export', { path }),
+  bundleExport: (path: string, agentKind?: AgentKind, workspaceIds: string[] = [], includeFiles = false) => invoke<BundleReport>('bundle_export', { path, agentKind: agentKind ?? null, workspaceIds, includeFiles }),
   bundleVerify: (path: string) => invoke<BundleReport>('bundle_verify', { path }),
   bundleRestore: (path: string) => invoke<BundleReport>('bundle_restore', { path }),
   auditVerify: () => invoke<AuditVerification>('audit_verify'),
-  workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
+  workspacesList: (limit = 100, offset = 0, agentKind?: AgentKind) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset, agentKind }),
 };

@@ -5,6 +5,7 @@ button, input { font: inherit; }
 button { cursor: pointer; }
 .app-shell { width: min(1120px, calc(100% - 48px)); margin: 0 auto; padding: 42px 0; }
 .app-header, .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.section-actions { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; }
 .header-actions { display: flex; align-items: center; gap: 10px; }
 .language-control select { border: 1px solid #304655; color: #dce8ef; background: #0c151d; border-radius: 999px; padding: 7px 10px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
@@ -33,6 +34,8 @@ dl { display: grid; grid-template-columns: 180px 1fr; gap: 10px 20px; margin: 24
 .scan-form { display: flex; gap: 10px; align-items: center; }
 .scan-form input { flex: 1; min-width: 0; }
 .agent-select { width: min(260px, 100%); border: 1px solid #304655; color: #e6edf3; background: #0c151d; border-radius: 9px; padding: 9px 12px; }
+.agent-filter .field-label { margin: 0 0 6px; }
+.agent-filter select { min-width: 160px; border: 1px solid #304655; color: #e6edf3; background: #0c151d; border-radius: 9px; padding: 9px 12px; }
 .primary-button { border: 1px solid #4da9e4; color: #06111a; background: #75caff; border-radius: 9px; padding: 9px 16px; font-weight: 700; }
 .primary-button:hover { background: #9bdcff; }
 .primary-button:disabled { cursor: wait; opacity: .65; }
@@ -40,6 +43,13 @@ dl { display: grid; grid-template-columns: 180px 1fr; gap: 10px 20px; margin: 24
 .button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .button-row button { border: 1px solid #304655; color: #dce8ef; background: #101d27; border-radius: 9px; padding: 9px 13px; }
 .button-row button:hover { border-color: #55b8ff; }
+.transfer-view > input { width: 100%; }
+.transfer-projects { display: grid; gap: 7px; max-height: 220px; overflow: auto; border: 1px solid #243745; border-radius: 10px; padding: 10px; background: #0d171f; }
+.transfer-project { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; color: #dce8ef; font-size: 13px; }
+.transfer-project span { overflow-wrap: anywhere; }
+.transfer-project small { color: #8394a2; }
+.transfer-files { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: #b8c7d2; font-size: 13px; }
+.transfer-preview { display: grid; gap: 9px; margin-top: 18px; border: 1px solid #2e7f9d; border-radius: 10px; padding: 14px; background: #102731; }
 .scan-hint { margin-top: 12px; font-size: 12px; }
 .error-message { margin-top: 18px; color: #ffab9d; }
 .scan-result { display: grid; gap: 7px; margin-top: 24px; border: 1px solid #2e7f9d; border-radius: 12px; padding: 14px; background: #102731; }

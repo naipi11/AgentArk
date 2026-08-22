@@ -235,6 +235,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -286,6 +287,7 @@ dependencies = [
  "agentark-canonical",
  "agentark-cas",
  "agentark-index",
+ "agentark-migration",
  "agentark-security",
  "agentark-watch",
  "directories",

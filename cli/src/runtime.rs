@@ -10,7 +10,7 @@ use agentark_adapter_opencode::OpenCodeAdapter;
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{AppError, ScanReport, ScanRequest, ScanService, VerificationService};
 use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
-use agentark_bundle::{BundleError, read_bundle, write_sessions};
+use agentark_bundle::{BundleError, ProjectSelection, read_bundle, write_selected_sessions};
 use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
@@ -72,8 +72,12 @@ pub struct ProbeData {
 #[serde(rename_all = "camelCase")]
 pub struct BundleData {
     pub format: String,
+    pub agent: Option<String>,
     pub session_count: u64,
     pub entry_count: usize,
+    pub workspace_count: u64,
+    pub file_count: u64,
+    pub conflict_count: u64,
     pub redacted: bool,
     pub redaction_count: u64,
     pub restore_scan_id: Option<Uuid>,
@@ -170,16 +174,50 @@ pub fn doctor(root: &Path) -> DoctorData {
     }
 }
 
-pub fn export_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeError> {
+pub fn export_bundle(
+    root: &Path,
+    path: &Path,
+    agent: Option<String>,
+    workspace_ids: Vec<Uuid>,
+    include_files: bool,
+) -> Result<BundleData, RuntimeError> {
     let (_cas, index, _store) = open_storage_existing(root)?;
-    let sessions = index.all_sessions().map_err(|_| RuntimeError::Storage)?;
+    let agent_kind = agent.as_deref().map(parse_target_agent).transpose()?;
+    let sessions = index
+        .all_sessions_filtered(agent_kind.clone())
+        .map_err(|_| RuntimeError::Storage)?;
     let scanner = SecretScanner::v1().map_err(|_| RuntimeError::Storage)?;
-    let manifest = write_sessions(path, &sessions, &scanner).map_err(bundle_error)?;
+    let selected = workspace_ids
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let selections = sessions
+        .iter()
+        .filter_map(|session| session.workspace.as_ref())
+        .filter(|workspace| selected.is_empty() || selected.contains(&workspace.id))
+        .map(|workspace| ProjectSelection {
+            workspace_id: workspace.id,
+            root: PathBuf::from(&workspace.path_native),
+            include_files,
+            max_file_bytes: 64 * 1024 * 1024,
+        })
+        .collect::<Vec<_>>();
+    let manifest = write_selected_sessions(
+        path,
+        agent.as_deref().unwrap_or("all"),
+        &sessions,
+        &selections,
+        &scanner,
+    )
+    .map_err(bundle_error)?;
     append_audit(root, "bundle.exported", path, None)?;
     Ok(BundleData {
         format: manifest.format,
+        agent: manifest.agent,
         session_count: manifest.session_count,
         entry_count: manifest.entries.len() + 1,
+        workspace_count: manifest.workspace_count,
+        file_count: manifest.file_count,
+        conflict_count: 0,
         redacted: manifest.redacted,
         redaction_count: manifest.redaction_count,
         restore_scan_id: None,
@@ -190,8 +228,12 @@ pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
     Ok(BundleData {
         format: bundle.manifest.format.clone(),
+        agent: bundle.manifest.agent.clone(),
         session_count: bundle.manifest.session_count,
         entry_count: bundle.entries.len(),
+        workspace_count: bundle.manifest.workspace_count,
+        file_count: bundle.manifest.file_count,
+        conflict_count: 0,
         redacted: bundle.manifest.redacted,
         redaction_count: bundle.manifest.redaction_count,
         restore_scan_id: None,
@@ -208,8 +250,12 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
     append_audit(root, "bundle.restored", path, Some(scan_id))?;
     Ok(BundleData {
         format: bundle.manifest.format.clone(),
+        agent: bundle.manifest.agent.clone(),
         session_count: bundle.manifest.session_count,
         entry_count: bundle.entries.len(),
+        workspace_count: bundle.manifest.workspace_count,
+        file_count: bundle.manifest.file_count,
+        conflict_count: 0,
         redacted: bundle.manifest.redacted,
         redaction_count: bundle.manifest.redaction_count,
         restore_scan_id: Some(scan_id),
