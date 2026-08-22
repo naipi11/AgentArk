@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use agentark_adapter_codex::CodexProbe;
+use agentark_adapter_codex::{CodexProbe, NativeCapability, native_import_capability_from_outputs};
 use agentark_adapter_sdk::SourceCapability;
 
 #[test]
@@ -65,4 +65,14 @@ fn probe_capabilities_are_stable_and_deterministic() {
             SourceCapability::KnownSemanticSchema,
         ])
     );
+}
+
+#[test]
+fn unknown_codex_version_disables_native_writer() {
+    let capability = native_import_capability_from_outputs(
+        "codex-cli 0.999.0\n",
+        "Usage: codex app-server --listen stdio://\n",
+    )
+    .unwrap();
+    assert_eq!(capability, NativeCapability::Unsupported);
 }

@@ -7,7 +7,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentark_adapter_claude::ClaudeCodeAdapter;
-use agentark_adapter_codex::CodexAdapter;
+use agentark_adapter_codex::{
+    CodexAdapter, CodexProbe, NativePayloadError, NativeRolloutPayload, ensure_codex_not_running,
+    native_thread_expectation, restore_native_rollouts, rewrite_native_workspace_paths,
+    verify_rollouts_with_app_server,
+};
 use agentark_adapter_grok::GrokBuildAdapter;
 use agentark_adapter_hermes::HermesAdapter;
 use agentark_adapter_openclaw::OpenClawAdapter;
@@ -18,7 +22,10 @@ use agentark_app::{
     ScanService, ScanUseCase, VerifyUseCase,
 };
 use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
-use agentark_bundle::{ProjectSelection, WorkspaceFileEntry, read_bundle, write_selected_sessions};
+use agentark_bundle::{
+    NativeBundleEntry, ProjectSelection, WorkspaceFileEntry, read_bundle,
+    write_selected_sessions_with_native,
+};
 use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::IndexDb;
@@ -44,6 +51,13 @@ pub struct BundleReport {
     pub redacted: bool,
     pub redaction_count: u64,
     pub restore_scan_id: Option<Uuid>,
+    pub native_payload_count: u64,
+    pub native_imported_count: u64,
+    pub native_skipped_count: u64,
+    pub native_conflict_count: u64,
+    pub native_backup_path: Option<String>,
+    pub native_restart_required: bool,
+    pub native_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -532,8 +546,39 @@ impl AppState {
                 })
                 .collect::<Vec<_>>();
             let agent = agent_kind.as_ref().map(agent_label).unwrap_or("all");
-            let manifest = write_selected_sessions(&path, agent, &sessions, &selections, &scanner)
-                .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
+            let native_entries = if agent_kind == Some(AgentKind::Codex) {
+                detected_codex_home()
+                    .filter(|root| root.is_dir())
+                    .map(|root| {
+                        agentark_adapter_codex::collect_native_rollouts(&root, &sessions, &scanner)
+                            .map(|payloads| {
+                                payloads
+                                    .into_iter()
+                                    .map(|payload| NativeBundleEntry {
+                                        session_id: payload.session_id,
+                                        relative_path: payload.relative_path,
+                                        bytes: payload.bytes,
+                                        redaction_count: payload.redaction_count,
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .transpose()
+                    .map_err(|_| "无法读取 Codex 原生会话文件".to_owned())?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let native_payload_count = native_entries.len() as u64;
+            let manifest = write_selected_sessions_with_native(
+                &path,
+                agent,
+                &sessions,
+                &selections,
+                &native_entries,
+                &scanner,
+            )
+            .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
             append_audit_event(&self.data_root, "bundle.exported", &path, None)?;
             Ok(BundleReport {
                 format: manifest.format,
@@ -546,6 +591,13 @@ impl AppState {
                 redacted: manifest.redacted,
                 redaction_count: manifest.redaction_count,
                 restore_scan_id: None,
+                native_payload_count,
+                native_imported_count: 0,
+                native_skipped_count: 0,
+                native_conflict_count: 0,
+                native_backup_path: None,
+                native_restart_required: false,
+                native_error: None,
             })
         })();
         let _ = self.refresh_query_index();
@@ -581,10 +633,24 @@ impl AppState {
             redacted: bundle.manifest.redacted,
             redaction_count: bundle.manifest.redaction_count,
             restore_scan_id: None,
+            native_payload_count: bundle
+                .native_rollout_entries()
+                .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?
+                .len() as u64,
+            native_imported_count: 0,
+            native_skipped_count: 0,
+            native_conflict_count: 0,
+            native_backup_path: None,
+            native_restart_required: false,
+            native_error: None,
         })
     }
 
-    pub fn bundle_restore(&self, path: PathBuf) -> Result<BundleReport, String> {
+    pub fn bundle_restore(
+        &self,
+        path: PathBuf,
+        native_target: bool,
+    ) -> Result<BundleReport, String> {
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
@@ -598,7 +664,24 @@ impl AppState {
         let file_entries = bundle
             .workspace_file_entries()
             .map_err(|_| "备份中的项目文件清单无效".to_owned())?;
+        let native_entries = bundle
+            .native_rollout_entries()
+            .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?;
         let restore_root = self.data_root.join("restored-workspaces");
+        let workspace_mappings = sessions
+            .iter()
+            .filter_map(|session| {
+                session.workspace.as_ref().map(|workspace| {
+                    (
+                        workspace.path_native.clone(),
+                        restore_root
+                            .join(workspace.id.to_string())
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         restore_project_files(&restore_root, &file_entries)?;
         for session in &mut sessions {
             if let Some(workspace) = session.workspace.as_mut()
@@ -617,6 +700,118 @@ impl AppState {
                 .restore_sessions(&sessions)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
             append_audit_event(&self.data_root, "bundle.restored", &path, Some(scan_id))?;
+            let mut native_imported_count = 0;
+            let mut native_skipped_count = 0;
+            let mut native_conflict_count = 0;
+            let mut native_backup_path = None;
+            let mut native_restart_required = false;
+            let mut native_error = None;
+            if native_target
+                && bundle.manifest.agent.as_deref() == Some("codex")
+                && !native_entries.is_empty()
+            {
+                let payloads = native_entries
+                    .iter()
+                    .map(|entry| NativeRolloutPayload {
+                        session_id: entry.session_id,
+                        relative_path: entry.relative_path.clone(),
+                        source_hash: agentark_canonical::Sha256Digest::from_bytes(&entry.bytes),
+                        bytes: entry.bytes.clone(),
+                        redaction_count: 0,
+                    })
+                    .collect::<Vec<_>>();
+                let codex_home = detected_codex_home();
+                let executable = resolve_codex_executable();
+                let native_restore = ensure_codex_not_running()
+                    .map_err(NativePayloadError::NativeImport)
+                    .and_then(|_| {
+                        let probe = CodexProbe::run(&executable).map_err(|error| {
+                            NativePayloadError::NativeImport(
+                                agentark_adapter_codex::NativeImportError::Verification(format!(
+                                    "Codex capability probe failed: {error}"
+                                )),
+                            )
+                        })?;
+                        if probe.quarantine_reason.is_some() {
+                            return Err(NativePayloadError::NativeImport(
+                                agentark_adapter_codex::NativeImportError::UnsupportedVersion,
+                            ));
+                        }
+                        let codex_home = codex_home.as_ref().ok_or_else(|| {
+                            NativePayloadError::NativeImport(
+                                agentark_adapter_codex::NativeImportError::Invalid(
+                                    "Codex home not found".into(),
+                                ),
+                            )
+                        })?;
+                        restore_native_rollouts(
+                            codex_home,
+                            &payloads,
+                            &workspace_mappings,
+                            &codex_home.join("agentark-backups"),
+                        )
+                    });
+                match native_restore {
+                    Ok(report) => {
+                        native_imported_count = report.imported_count;
+                        native_skipped_count = report.skipped_count;
+                        native_conflict_count = report.conflict_count;
+                        native_backup_path = report
+                            .backup_path
+                            .as_ref()
+                            .map(|value| value.to_string_lossy().into_owned());
+                        native_restart_required = report.restart_required;
+                        if let Some(codex_home) = codex_home.as_ref() {
+                            let mut expectations = Vec::new();
+                            for payload in &payloads {
+                                let destination =
+                                    codex_home.join("sessions").join(&payload.relative_path);
+                                let rewritten = match rewrite_native_workspace_paths(
+                                    &payload.bytes,
+                                    &workspace_mappings,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        native_error = Some(error.to_string());
+                                        break;
+                                    }
+                                };
+                                let expected = match native_thread_expectation(&rewritten) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        native_error = Some(error.to_string());
+                                        break;
+                                    }
+                                };
+                                expectations.push((destination, expected));
+                            }
+                            if native_error.is_none()
+                                && let Err(error) = verify_rollouts_with_app_server(
+                                    &executable,
+                                    codex_home,
+                                    &expectations,
+                                )
+                            {
+                                native_error = Some(error.to_string());
+                            }
+                        } else {
+                            native_error = Some("Codex home not found during verification".into());
+                        }
+                        if native_error.is_some() {
+                            for path in &report.written_paths {
+                                let _ = fs::remove_file(path);
+                            }
+                            native_imported_count = 0;
+                            native_restart_required = false;
+                        }
+                    }
+                    Err(NativePayloadError::Conflict) => {
+                        native_conflict_count = 1;
+                        native_error = Some(NativePayloadError::Conflict.to_string());
+                    }
+                    Err(error) => native_error = Some(error.to_string()),
+                }
+            }
             Ok(BundleReport {
                 format: bundle.manifest.format.clone(),
                 agent: bundle.manifest.agent.clone(),
@@ -628,6 +823,13 @@ impl AppState {
                 redacted: bundle.manifest.redacted,
                 redaction_count: bundle.manifest.redaction_count,
                 restore_scan_id: Some(scan_id),
+                native_payload_count: native_entries.len() as u64,
+                native_imported_count,
+                native_skipped_count,
+                native_conflict_count,
+                native_backup_path,
+                native_restart_required,
+                native_error,
             })
         })();
         let _ = self.refresh_query_index();

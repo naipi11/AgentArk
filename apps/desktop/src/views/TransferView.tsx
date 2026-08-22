@@ -14,6 +14,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const [includeFiles, setIncludeFiles] = useState(true);
   const [path, setPath] = useState('');
   const [preview, setPreview] = useState<BundleReport | null>(null);
+  const [restoreNativeCodex, setRestoreNativeCodex] = useState(true);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyAction, setBusyAction] = useState<'export' | 'import' | 'restore' | null>(null);
@@ -68,7 +69,11 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     if (!chosenPath) return;
     setPath(chosenPath);
     setBusy(true); setBusyAction('import'); setMessage(null);
-    try { setPreview(await api.bundleVerify(chosenPath)); }
+    try {
+      const report = await api.bundleVerify(chosenPath);
+      setPreview(report);
+      setRestoreNativeCodex(report.agent === 'codex');
+    }
     catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
   }
@@ -76,8 +81,15 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   async function restoreHistory() {
     setBusy(true); setBusyAction('restore'); setMessage(null);
     try {
-      const report = await api.bundleRestore(path);
-      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
+      const report = await api.bundleRestore(path, restoreNativeCodex);
+      const nativeSummary = report.nativePayloadCount > 0
+        ? ` · ${report.nativeImportedCount} ${t('transfer.nativeSummary')} · ${report.nativeSkippedCount} ${t('transfer.nativeSkipped')} · ${report.nativeConflictCount} ${t('transfer.nativeConflict')}`
+        : '';
+      const nativeBackup = report.nativeBackupPath
+        ? ` · ${t('transfer.nativeBackup')}: ${report.nativeBackupPath}`
+        : '';
+      const nativeError = report.nativeError ? ` · ${t('transfer.nativeError')}: ${report.nativeError}` : '';
+      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files${nativeSummary}${nativeBackup}${nativeError}`);
       setPreview(null);
     } catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
@@ -94,11 +106,12 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         {projects.map((project) => <label key={project.id} className="transfer-project"><input type="checkbox" checked={selectedSet.has(project.id)} onChange={() => toggleProject(project.id)} /><span>{project.pathNative}</span><small>{project.sessionCount} {t('projects.sessions')}</small></label>)}
       </div>
       <label className="transfer-files"><input type="checkbox" checked={includeFiles} onChange={(event) => setIncludeFiles(event.target.checked)} />{t('transfer.files')}</label>
+      {preview?.agent === 'codex' && <label className="transfer-files"><input type="checkbox" checked={restoreNativeCodex} onChange={(event) => setRestoreNativeCodex(event.target.checked)} />{t('transfer.nativeRestore')}</label>}
       <div className="button-row">
         <button className="primary-button" type="button" disabled={busy} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
         <button type="button" disabled={busy} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
       </div>
-      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
+      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span>{preview.agent === 'codex' && restoreNativeCodex && <span className="muted">{t('transfer.nativeRestart')}</span>}<button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
       {message && <p className="muted" role="status">{message}</p>}
     </section>
   );

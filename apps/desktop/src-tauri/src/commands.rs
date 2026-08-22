@@ -202,8 +202,9 @@ pub fn bundle_verify(
 pub fn bundle_restore(
     state: State<'_, AppState>,
     path: String,
+    native_target: bool,
 ) -> Result<crate::state::BundleReport, String> {
-    state.bundle_restore(std::path::PathBuf::from(path.trim()))
+    state.bundle_restore(std::path::PathBuf::from(path.trim()), native_target)
 }
 
 #[tauri::command]

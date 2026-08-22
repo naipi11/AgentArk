@@ -27,8 +27,10 @@ Vendor databases/files are never opened writable.
   `migration plan <bundle> <target> [--handoff]`.
 - `migration export <bundle> <target> <output>` writes an L1 structured JSON
   handoff and human-readable Markdown handoff per session.
-- Restoring writes only AgentArk-owned SQLCipher index rows in one transaction;
-  it does not inject records into a vendor client.
+- Restoring always writes AgentArk-owned SQLCipher index rows in one transaction.
+  Codex bundles additionally carry sanitized, source-generated native rollout
+  payloads and can restore them into the target Codex client when the native
+  option is enabled.
 - `agentark-watch` provides root fingerprints, change diffing, debounce, and a
   desktop background rescan loop serialized behind the scan lock.
 - `agentark-audit` provides append-only hash-chain events and checkpoint file
@@ -39,12 +41,14 @@ Vendor databases/files are never opened writable.
 
 ## Release gate result
 
-The 0.4.2 Windows gate is verified: workspace tests, clippy, front-end tests,
+The 0.5.0 Windows gate is in progress: workspace tests, clippy, front-end tests,
 MSI/NSIS build, SHA-256 capture, administrator upgrade, and responsive desktop
-launch all passed. No vendor-native writer is enabled by default; cross-agent
-migration remains an explicit L1 handoff until an official target import
-contract is available. Cloud relay, multi-user server mode, and L3 credential
-migration remain deliberately disabled for the local-first release.
+launch are retained as release gates. Codex native restore is version-gated to
+the tested Codex App Server contract, requires Codex to be closed while writing,
+and verifies the imported rollout after a fresh App Server start. Unknown
+versions or verification failures fall back to the verified AgentArk archive.
+Cloud relay, multi-user server mode, and L3 credential migration remain
+deliberately disabled for the local-first release.
 
 The transfer UI now exposes Agent-scoped project selection, an optional project
 file checkbox, bundle verification/preview, conflict blocking, and restore into
@@ -58,3 +62,9 @@ unchanged.
 The transfer actions now open native Windows dialogs: export opens a save dialog
 with the `.ahbundle` filter, import opens a file picker for an existing bundle,
 and cancelling either dialog performs no operation.
+
+For Codex, the transfer bundle now includes redacted native rollout payloads.
+Restore writes them atomically under the target `CODEX_HOME`, rewrites only
+workspace path fields, creates an `agentark-backups` manifest, and reports the
+number of Codex threads imported or skipped. Restart Codex after a successful
+native restore to refresh its session list.

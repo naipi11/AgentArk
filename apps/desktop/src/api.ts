@@ -69,6 +69,13 @@ export type BundleReport = {
   redacted: boolean;
   redactionCount: number;
   restoreScanId?: string;
+  nativePayloadCount: number;
+  nativeImportedCount: number;
+  nativeSkippedCount: number;
+  nativeConflictCount: number;
+  nativeBackupPath?: string;
+  nativeRestartRequired: boolean;
+  nativeError?: string;
 };
 export type AuditVerification = { valid: boolean; eventCount: number; lastHash?: string; error?: string };
 
@@ -92,7 +99,7 @@ export const api = {
   scanGrokBuild: (sourceRoot: string) => invoke<ScanReport>('scan_grok_build', { sourceRoot }),
   bundleExport: (path: string, agentKind?: AgentKind, workspaceIds: string[] = [], includeFiles = false) => invoke<BundleReport>('bundle_export', { path, agentKind: agentKind ?? null, workspaceIds, includeFiles }),
   bundleVerify: (path: string) => invoke<BundleReport>('bundle_verify', { path }),
-  bundleRestore: (path: string) => invoke<BundleReport>('bundle_restore', { path }),
+  bundleRestore: (path: string, nativeTarget = false) => invoke<BundleReport>('bundle_restore', { path, nativeTarget }),
   auditVerify: () => invoke<AuditVerification>('audit_verify'),
   workspacesList: (limit = 100, offset = 0, agentKind?: AgentKind) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset, agentKind }),
 };

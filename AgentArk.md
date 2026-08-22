@@ -2,6 +2,16 @@
 
 ## 执行摘要
 
+## 当前实现增量（AgentArk 0.5.0）
+
+在保留本规划书 L0/L1/L2 分层合同的前提下，当前桌面迁移页已加入 Codex
+原生 payload 恢复路径：导出 Codex 时把源 `CODEX_HOME/sessions` 中与已索引
+会话匹配的 rollout JSONL 脱敏后放入 `.ahbundle`；目标恢复时检查 Codex
+版本和运行状态，原子写入目标 `CODEX_HOME`，用 App Server 重新列出/读取
+thread，失败则回滚本次新增文件。Codex 以外的 Agent 仍保持 AgentArk 索引
+和语义迁移边界，不伪造供应商原生会话。Codex 原生恢复完成后需要重启 Codex
+客户端刷新会话列表。
+
 本项目建议暂定名为 **Agent History Hub（AHH）**：一个面向 Claude Code、Codex、Hermes、Grok Build、OpenClaw 的 **local-first、跨平台、可审计的 Agent 会话与项目历史管理层**。其核心价值不是再做一个聊天客户端，而是建立一个位于各 Agent 之上的“**Agent 数据控制平面**”：自动发现本机 Agent 与工作区，持续索引会话、消息、工具调用、附件、文件快照、instructions/memory/skills/MCP 等资源，在统一 UI/CLI 中查询，并通过统一中间模型实现 Agent 间、设备间和 Windows/Linux/macOS 间迁移。
 
 这一路线具有现实可行性，但必须重新严格定义“**无缝迁移**”。各产品没有共同的原生 session persistence 标准；例如 Claude Code 官方确认本地 transcript 位于 `~/.claude/projects/`，默认只保留 30 天，并且 CLI 与 Desktop 各自维护 session history；CLI 会话可通过官方 `/desktop` 转到 Desktop，但 Anthropic 没有为第三方提供“任意写入 Claude 原生历史”的公共契约。citeturn13search0turn13search9 Codex 则提供了明显更适合作为集成边界的 App Server：其 JSON-RPC thread API 能列出、归档、恢复、删除、修改 metadata，并明确操作磁盘上的持久化 JSONL thread log。citeturn14search1 Hermes 的持久化契约最透明之一，官方直接记录 `~/.hermes/state.db`、SQLite WAL、sessions/messages/FTS5 等结构，并已经提供 session REST API。citeturn15search0turn15search4turn15search23 Grok Build 会把 prompts、responses、tool calls 和 file snapshots 自动保存在 `~/.grok/sessions/`，同时提供 resume/fork/export/import 与 ACP JSON-RPC。citeturn17search6turn17search2turn16search0 OpenClaw 当前则明确采用全局 SQLite + 每 Agent SQLite，并要求客户端通过 Gateway 查询和控制 session。citeturn18search0turn18search18

@@ -14,7 +14,15 @@ pub struct ProcessTransport {
 
 impl ProcessTransport {
     pub fn spawn(executable: &Path) -> Result<Self, CodexError> {
-        let mut child = Command::new(executable)
+        Self::spawn_with_codex_home(executable, None)
+    }
+
+    pub fn spawn_with_codex_home(
+        executable: &Path,
+        codex_home: Option<&Path>,
+    ) -> Result<Self, CodexError> {
+        let mut command = Command::new(executable);
+        command
             .args([
                 "app-server",
                 "-c",
@@ -24,8 +32,11 @@ impl ProcessTransport {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        if let Some(codex_home) = codex_home {
+            command.env("CODEX_HOME", codex_home);
+        }
+        let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or(CodexError::InvalidOutput)?;
         let stdout = child.stdout.take().ok_or(CodexError::InvalidOutput)?;
         Ok(Self {

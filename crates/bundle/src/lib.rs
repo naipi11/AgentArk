@@ -77,6 +77,14 @@ pub struct WorkspaceFileEntry {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeBundleEntry {
+    pub session_id: uuid::Uuid,
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+    pub redaction_count: u64,
+}
+
 struct BundleWriteMeta {
     agent: Option<String>,
     source_root: Option<String>,
@@ -165,6 +173,34 @@ impl Bundle {
         ids.dedup();
         Ok(ids)
     }
+
+    pub fn native_rollout_entries(&self) -> Result<Vec<NativeBundleEntry>, BundleError> {
+        let mut entries = Vec::new();
+        for path in self.entries.keys() {
+            let Some(rest) = path.strip_prefix("native/codex/") else {
+                continue;
+            };
+            let Some((session, relative)) = rest.split_once('/') else {
+                return Err(BundleError::UnsafePath(path.clone()));
+            };
+            let session_id = uuid::Uuid::parse_str(session)
+                .map_err(|_| BundleError::UnsafePath(path.clone()))?;
+            validate_relative_path(relative)?;
+            entries.push(NativeBundleEntry {
+                session_id,
+                relative_path: relative.to_owned(),
+                bytes: self
+                    .entries
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| BundleError::InvalidFormat(path.clone()))?,
+                // Redaction totals are intentionally represented by the
+                // bundle manifest rather than duplicated in each payload.
+                redaction_count: 0,
+            });
+        }
+        Ok(entries)
+    }
 }
 
 pub fn write_sessions(
@@ -204,6 +240,17 @@ pub fn write_selected_sessions(
     agent: &str,
     sessions: &[CanonicalSession],
     selections: &[ProjectSelection],
+    scanner: &SecretScanner,
+) -> Result<BundleManifest, BundleError> {
+    write_selected_sessions_with_native(path, agent, sessions, selections, &[], scanner)
+}
+
+pub fn write_selected_sessions_with_native(
+    path: &Path,
+    agent: &str,
+    sessions: &[CanonicalSession],
+    selections: &[ProjectSelection],
+    native_entries: &[NativeBundleEntry],
     scanner: &SecretScanner,
 ) -> Result<BundleManifest, BundleError> {
     let mut entries = Vec::with_capacity(sessions.len() + selections.len());
@@ -278,6 +325,17 @@ pub fn write_selected_sessions(
             bytes: serde_json::to_vec_pretty(&manifest)?,
         });
         workspace_count += 1;
+    }
+    for native in native_entries {
+        validate_relative_path(&native.relative_path)?;
+        redaction_count += native.redaction_count;
+        entries.push(BundleEntry {
+            path: format!(
+                "native/codex/{}/{}",
+                native.session_id, native.relative_path
+            ),
+            bytes: native.bytes.clone(),
+        });
     }
     let source_root = selections
         .first()

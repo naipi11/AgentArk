@@ -21,6 +21,7 @@ const { invoke, dialog, dialogState } = vi.hoisted(() => ({
     if (command === 'quarantines_list') return Promise.resolve([]);
     if (command === 'bundle_verify') return Promise.resolve({ format: '1.1', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, conflictCount: 0, redacted: 0, redactionCount: 0, restoreScanId: null, agent: 'codex' });
     if (command === 'bundle_export') return Promise.resolve({ format: '1.1', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, conflictCount: 0, redacted: 0, redactionCount: 0, restoreScanId: null, agent: 'codex' });
+    if (command === 'bundle_restore') return Promise.resolve({ format: '1.1', sessionCount: 1, entryCount: 1, workspaceCount: 1, fileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: 'scan-1', agent: 'codex', nativePayloadCount: 1, nativeImportedCount: 1, nativeSkippedCount: 0, nativeConflictCount: 0, nativeRestartRequired: true });
     return Promise.resolve([]);
   }),
 }));
@@ -88,4 +89,14 @@ test('cancelled export does not call the bundle writer', async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'Export session history' }));
   await waitFor(() => expect(dialog.save).toHaveBeenCalled());
   expect(invoke).not.toHaveBeenCalledWith('bundle_export', expect.anything());
+});
+
+test('codex restore enables native client import by default', async () => {
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Restore into Codex client' })).toBeChecked());
+  fireEvent.click(screen.getByRole('button', { name: 'Restore imported history' }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith('bundle_restore', { path: dialogState.importPath, nativeTarget: true }));
 });
