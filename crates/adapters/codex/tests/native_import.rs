@@ -270,6 +270,7 @@ fn fork_rollout_sends_selected_provider_without_secrets_and_verifies_visibility(
     );
     assert_eq!(report.target_thread_id, target_thread_id);
     assert_eq!(report.visible_turns, 1);
+    assert!(sent.iter().all(|value| value["method"] != "thread/delete"));
 }
 
 #[test]
@@ -303,4 +304,144 @@ fn fork_rollout_omits_optional_target_provider_and_model_keys() {
         .unwrap()["params"];
     assert!(params.get("modelProvider").is_none());
     assert!(params.get("model").is_none());
+}
+
+#[test]
+fn fork_rollout_deletes_new_target_when_post_fork_validation_fails() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let target_thread_id = "019target-thread";
+    let (mut responses, _) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
+    responses[3]["result"]["modelProvider"] = Value::String("unexpected".into());
+    responses.truncate(4);
+    responses.push(json!({"jsonrpc": "2.0", "id": 5, "result": {}}));
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("thread/fork returned a different model provider")
+    );
+    let sent = sent.lock().unwrap();
+    let deletes = sent
+        .iter()
+        .filter(|value| value["method"] == "thread/delete")
+        .collect::<Vec<_>>();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0]["params"], json!({"threadId": target_thread_id}));
+}
+
+#[test]
+fn fork_rollout_does_not_retry_archived_when_active_list_is_malformed() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let target_thread_id = "019target-thread";
+    let (mut responses, _) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
+    responses[4] = json!({"jsonrpc": "2.0", "id": 5, "result": {}});
+    responses.truncate(5);
+    responses.push(json!({"jsonrpc": "2.0", "id": 6, "result": {}}));
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(error.to_string().contains("thread/list data is missing"));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|value| value["method"] == "thread/list")
+            .count(),
+        1
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|value| value["method"] == "thread/delete")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fork_rollout_does_not_retry_archived_when_active_target_has_wrong_cwd() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let target_thread_id = "019target-thread";
+    let (mut responses, _) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
+    let mut wrong_cwd_listing = responses[5].clone();
+    wrong_cwd_listing["id"] = Value::from(5);
+    wrong_cwd_listing["result"]["data"][0]["cwd"] = Value::String("C:/wrong".into());
+    responses[4] = wrong_cwd_listing;
+    responses.truncate(5);
+    responses.push(json!({"jsonrpc": "2.0", "id": 6, "result": {}}));
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("forked thread cwd does not match")
+    );
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|value| value["method"] == "thread/list")
+            .count(),
+        1
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|value| value["method"] == "thread/delete")
+            .count(),
+        1
+    );
 }

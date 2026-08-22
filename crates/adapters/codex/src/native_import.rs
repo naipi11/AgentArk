@@ -243,57 +243,76 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
             "thread/fork reused the source thread id".into(),
         ));
     }
-    let rollout_path = required_nonempty_label(
-        &response.value,
-        "/result/thread/path",
-        "thread/fork returned no rollout path",
-    )?;
-    let rollout_path = verified_session_rollout_path(codex_home, Path::new(&rollout_path))?;
-    let model_provider = required_nonempty_label(
-        &response.value,
-        "/result/modelProvider",
-        "thread/fork returned no model provider",
-    )?;
-    let model = required_nonempty_label(
-        &response.value,
-        "/result/model",
-        "thread/fork returned no model",
-    )?;
-    if let Some(expected) = request.target_provider.as_deref()
-        && model_provider != expected
-    {
-        return Err(NativeImportError::Verification(
-            "thread/fork returned a different model provider".into(),
-        ));
-    }
-    if let Some(expected) = request.target_model.as_deref()
-        && model != expected
-    {
-        return Err(NativeImportError::Verification(
-            "thread/fork returned a different model".into(),
-        ));
-    }
+    let outcome = (|| {
+        let rollout_path = required_nonempty_label(
+            &response.value,
+            "/result/thread/path",
+            "thread/fork returned no rollout path",
+        )?;
+        let rollout_path = verified_session_rollout_path(codex_home, Path::new(&rollout_path))?;
+        let model_provider = required_nonempty_label(
+            &response.value,
+            "/result/modelProvider",
+            "thread/fork returned no model provider",
+        )?;
+        let model = required_nonempty_label(
+            &response.value,
+            "/result/model",
+            "thread/fork returned no model",
+        )?;
+        if let Some(expected) = request.target_provider.as_deref()
+            && model_provider != expected
+        {
+            return Err(NativeImportError::Verification(
+                "thread/fork returned a different model provider".into(),
+            ));
+        }
+        if let Some(expected) = request.target_model.as_deref()
+            && model != expected
+        {
+            return Err(NativeImportError::Verification(
+                "thread/fork returned a different model".into(),
+            ));
+        }
 
-    let target_cwd = request.target_cwd.to_string_lossy();
-    let listed = client.request("thread/list", continuation_list_params(false))?;
-    if verify_continuation_listing(&listed.value, &target_thread_id, &target_cwd).is_err() {
-        let archived = client.request("thread/list", continuation_list_params(true))?;
-        verify_continuation_listing(&archived.value, &target_thread_id, &target_cwd)?;
-    }
-    let read = client.request(
-        "thread/read",
-        json!({"threadId": target_thread_id, "includeTurns": true}),
-    )?;
-    let visible_turns = verify_continuation_read(&read.value, &target_thread_id, &target_cwd)?;
+        let target_cwd = request.target_cwd.to_string_lossy();
+        let active = client.request("thread/list", continuation_list_params(false))?;
+        match verify_continuation_listing(&active.value, &target_thread_id, &target_cwd)? {
+            ContinuationListing::Found => {}
+            ContinuationListing::Missing => {
+                let archived = client.request("thread/list", continuation_list_params(true))?;
+                if verify_continuation_listing(&archived.value, &target_thread_id, &target_cwd)?
+                    == ContinuationListing::Missing
+                {
+                    return Err(NativeImportError::Verification(
+                        "forked thread is not listed".into(),
+                    ));
+                }
+            }
+        }
+        let read = client.request(
+            "thread/read",
+            json!({"threadId": target_thread_id, "includeTurns": true}),
+        )?;
+        let visible_turns = verify_continuation_read(&read.value, &target_thread_id, &target_cwd)?;
 
-    Ok(CodexContinuationReport {
-        source_thread_id: request.source_thread_id.clone(),
-        target_thread_id,
-        rollout_path,
-        model_provider,
-        model,
-        visible_turns,
-    })
+        Ok(CodexContinuationReport {
+            source_thread_id: request.source_thread_id.clone(),
+            target_thread_id: target_thread_id.clone(),
+            rollout_path,
+            model_provider,
+            model,
+            visible_turns,
+        })
+    })();
+
+    match outcome {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let _ = client.request("thread/delete", json!({"threadId": target_thread_id}));
+            Err(error)
+        }
+    }
 }
 
 fn required_nonempty_label(
@@ -340,25 +359,33 @@ fn continuation_list_params(archived: bool) -> Value {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuationListing {
+    Found,
+    Missing,
+}
+
 fn verify_continuation_listing(
     response: &Value,
     target_thread_id: &str,
     target_cwd: &str,
-) -> Result<(), NativeImportError> {
+) -> Result<ContinuationListing, NativeImportError> {
     let threads = response
         .pointer("/result/data")
         .and_then(Value::as_array)
         .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
-    let thread = threads
+    let Some(thread) = threads
         .iter()
         .find(|thread| thread.get("id").and_then(Value::as_str) == Some(target_thread_id))
-        .ok_or_else(|| NativeImportError::Verification("forked thread is not listed".into()))?;
+    else {
+        return Ok(ContinuationListing::Missing);
+    };
     if thread.get("cwd").and_then(Value::as_str) != Some(target_cwd) {
         return Err(NativeImportError::Verification(
             "forked thread cwd does not match".into(),
         ));
     }
-    Ok(())
+    Ok(ContinuationListing::Found)
 }
 
 fn verify_continuation_read(

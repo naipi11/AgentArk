@@ -51,6 +51,14 @@ fn forked_thread_accepts_a_target_provider_turn() {
     cleanup_fixture(&report.target_thread_id);
 }
 
+#[test]
+fn continuation_target_cwd_is_scoped_to_fixture_tempdir() {
+    let root = tempdir().unwrap();
+    let target_cwd = create_fixture_target_cwd(&root).unwrap();
+    assert!(target_cwd.starts_with(root.path()));
+    assert!(target_cwd.is_dir());
+}
+
 fn fork_fixture_with_target_provider(
     provider: &str,
     model: Option<&str>,
@@ -77,7 +85,7 @@ fn fork_fixture_with_target_provider(
     fs::copy(&fixture, &source_rollout)?;
     let source = fs::read(&source_rollout)?;
     let expected = native_thread_expectation(&source)?;
-    let target_cwd = env::current_dir()?;
+    let target_cwd = create_fixture_target_cwd(&root)?;
     let request = CodexContinuationRequest {
         source_rollout,
         source_thread_id: expected.thread_id,
@@ -201,4 +209,10 @@ fn receive_response<T: JsonRpcTransport>(
 
 fn cleanup_fixture(thread_id: &str) {
     fixture_contexts().lock().unwrap().remove(thread_id);
+}
+
+fn create_fixture_target_cwd(root: &TempDir) -> io::Result<PathBuf> {
+    let target_cwd = root.path().join("project");
+    fs::create_dir(&target_cwd)?;
+    Ok(target_cwd)
 }
