@@ -41,6 +41,25 @@ pub struct NativeThreadExpectation {
     pub visible_turns: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexContinuationRequest {
+    pub source_rollout: PathBuf,
+    pub source_thread_id: String,
+    pub target_cwd: PathBuf,
+    pub target_provider: Option<String>,
+    pub target_model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexContinuationReport {
+    pub source_thread_id: String,
+    pub target_thread_id: String,
+    pub rollout_path: PathBuf,
+    pub model_provider: String,
+    pub model: String,
+    pub visible_turns: usize,
+}
+
 pub fn ensure_codex_not_running_from_tasklist(output: &str) -> Result<(), NativeImportError> {
     let names = ["codex.exe", "codex-desktop.exe", "codexdesktop.exe"];
     if output.lines().any(|line| {
@@ -173,6 +192,202 @@ pub fn verify_rollouts_with_app_server(
         verify_thread_read(&read.value, expected)?;
     }
     Ok(())
+}
+
+pub fn fork_rollout_with_target_provider(
+    executable: &Path,
+    codex_home: &Path,
+    request: &CodexContinuationRequest,
+) -> Result<CodexContinuationReport, NativeImportError> {
+    let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
+        .map_err(map_codex_error)?;
+    fork_rollout_with_target_provider_transport(&mut transport, codex_home, request)
+}
+
+/// Transport-injected form of [`fork_rollout_with_target_provider`].
+///
+/// This is public so protocol tests can exercise the exact JSON-RPC boundary
+/// without launching or contacting a provider.
+#[doc(hidden)]
+pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
+    transport: &mut T,
+    codex_home: &Path,
+    request: &CodexContinuationRequest,
+) -> Result<CodexContinuationReport, NativeImportError> {
+    let mut client = NativeAppServerClient::new(transport);
+    client.initialize()?;
+    client.request("modelProvider/capabilities/read", json!({}))?;
+    client.request("model/list", json!({}))?;
+
+    let mut params = json!({
+        "threadId": request.source_thread_id,
+        "path": request.source_rollout.to_string_lossy(),
+        "cwd": request.target_cwd.to_string_lossy(),
+        "threadSource": "user",
+        "ephemeral": false,
+    });
+    if let Some(provider) = &request.target_provider {
+        params["modelProvider"] = Value::String(provider.clone());
+    }
+    if let Some(model) = &request.target_model {
+        params["model"] = Value::String(model.clone());
+    }
+    let response = client.request("thread/fork", params)?;
+    let target_thread_id = required_nonempty_label(
+        &response.value,
+        "/result/thread/id",
+        "thread/fork returned no target thread id",
+    )?;
+    if target_thread_id == request.source_thread_id {
+        return Err(NativeImportError::Verification(
+            "thread/fork reused the source thread id".into(),
+        ));
+    }
+    let rollout_path = required_nonempty_label(
+        &response.value,
+        "/result/thread/path",
+        "thread/fork returned no rollout path",
+    )?;
+    let rollout_path = verified_session_rollout_path(codex_home, Path::new(&rollout_path))?;
+    let model_provider = required_nonempty_label(
+        &response.value,
+        "/result/modelProvider",
+        "thread/fork returned no model provider",
+    )?;
+    let model = required_nonempty_label(
+        &response.value,
+        "/result/model",
+        "thread/fork returned no model",
+    )?;
+    if let Some(expected) = request.target_provider.as_deref()
+        && model_provider != expected
+    {
+        return Err(NativeImportError::Verification(
+            "thread/fork returned a different model provider".into(),
+        ));
+    }
+    if let Some(expected) = request.target_model.as_deref()
+        && model != expected
+    {
+        return Err(NativeImportError::Verification(
+            "thread/fork returned a different model".into(),
+        ));
+    }
+
+    let target_cwd = request.target_cwd.to_string_lossy();
+    let listed = client.request("thread/list", continuation_list_params(false))?;
+    if verify_continuation_listing(&listed.value, &target_thread_id, &target_cwd).is_err() {
+        let archived = client.request("thread/list", continuation_list_params(true))?;
+        verify_continuation_listing(&archived.value, &target_thread_id, &target_cwd)?;
+    }
+    let read = client.request(
+        "thread/read",
+        json!({"threadId": target_thread_id, "includeTurns": true}),
+    )?;
+    let visible_turns = verify_continuation_read(&read.value, &target_thread_id, &target_cwd)?;
+
+    Ok(CodexContinuationReport {
+        source_thread_id: request.source_thread_id.clone(),
+        target_thread_id,
+        rollout_path,
+        model_provider,
+        model,
+        visible_turns,
+    })
+}
+
+fn required_nonempty_label(
+    response: &Value,
+    pointer: &str,
+    error: &str,
+) -> Result<String, NativeImportError> {
+    response
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| NativeImportError::Verification(error.into()))
+}
+
+fn verified_session_rollout_path(
+    codex_home: &Path,
+    rollout: &Path,
+) -> Result<PathBuf, NativeImportError> {
+    if !rollout.is_absolute() {
+        return Err(NativeImportError::Verification(
+            "thread/fork rollout path is not absolute".into(),
+        ));
+    }
+    let sessions = dunce::canonicalize(codex_home.join("sessions")).map_err(|_| {
+        NativeImportError::Verification("CODEX_HOME sessions path cannot be resolved".into())
+    })?;
+    let rollout = dunce::canonicalize(rollout).map_err(|_| {
+        NativeImportError::Verification("thread/fork rollout path cannot be resolved".into())
+    })?;
+    rollout.strip_prefix(&sessions).map_err(|_| {
+        NativeImportError::Verification(
+            "thread/fork rollout path escapes CODEX_HOME sessions".into(),
+        )
+    })?;
+    Ok(rollout)
+}
+
+fn continuation_list_params(archived: bool) -> Value {
+    json!({
+        "archived": archived,
+        "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
+        "limit": 1000
+    })
+}
+
+fn verify_continuation_listing(
+    response: &Value,
+    target_thread_id: &str,
+    target_cwd: &str,
+) -> Result<(), NativeImportError> {
+    let threads = response
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
+    let thread = threads
+        .iter()
+        .find(|thread| thread.get("id").and_then(Value::as_str) == Some(target_thread_id))
+        .ok_or_else(|| NativeImportError::Verification("forked thread is not listed".into()))?;
+    if thread.get("cwd").and_then(Value::as_str) != Some(target_cwd) {
+        return Err(NativeImportError::Verification(
+            "forked thread cwd does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_continuation_read(
+    response: &Value,
+    target_thread_id: &str,
+    target_cwd: &str,
+) -> Result<usize, NativeImportError> {
+    let thread = response
+        .pointer("/result/thread")
+        .ok_or_else(|| NativeImportError::Verification("thread/read returned no thread".into()))?;
+    if thread.get("id").and_then(Value::as_str) != Some(target_thread_id) {
+        return Err(NativeImportError::Verification(
+            "thread/read returned a different thread id".into(),
+        ));
+    }
+    if thread.get("cwd").and_then(Value::as_str) != Some(target_cwd) {
+        return Err(NativeImportError::Verification(
+            "thread/read cwd does not match".into(),
+        ));
+    }
+    let visible_turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .filter(|turns| *turns > 0)
+        .ok_or_else(|| {
+            NativeImportError::Verification("thread/read returned no visible turns".into())
+        })?;
+    Ok(visible_turns)
 }
 
 fn verify_thread_read(
