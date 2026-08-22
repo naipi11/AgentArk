@@ -24,6 +24,8 @@ pub enum NativeImportError {
     Verification(String),
     #[error("Codex is running; native import requires it to be closed")]
     CodexRunning,
+    #[error("Codex rollback failed; manual intervention is required")]
+    Rollback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +206,28 @@ pub fn fork_rollout_with_target_provider(
     fork_rollout_with_target_provider_transport(&mut transport, codex_home, request)
 }
 
+pub fn delete_thread_with_app_server(
+    executable: &Path,
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<(), NativeImportError> {
+    let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
+        .map_err(map_codex_error)?;
+    delete_thread_with_app_server_transport(&mut transport, thread_id)
+}
+
+/// Transport-injected form of [`delete_thread_with_app_server`].
+#[doc(hidden)]
+pub fn delete_thread_with_app_server_transport<T: JsonRpcTransport>(
+    transport: &mut T,
+    thread_id: &str,
+) -> Result<(), NativeImportError> {
+    let mut client = NativeAppServerClient::new(transport);
+    client.initialize()?;
+    client.request("thread/delete", json!({"threadId": thread_id}))?;
+    Ok(())
+}
+
 /// Transport-injected form of [`fork_rollout_with_target_provider`].
 ///
 /// This is public so protocol tests can exercise the exact JSON-RPC boundary
@@ -309,8 +333,10 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
     match outcome {
         Ok(report) => Ok(report),
         Err(error) => {
-            let _ = client.request("thread/delete", json!({"threadId": target_thread_id}));
-            Err(error)
+            match client.request("thread/delete", json!({"threadId": target_thread_id})) {
+                Ok(_) => Err(error),
+                Err(_) => Err(NativeImportError::Rollback),
+            }
         }
     }
 }

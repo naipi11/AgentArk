@@ -7,10 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use agentark_adapter_codex::{CodexContinuationReport, NativeRestoreReport};
 use agentark_bundle::{NativeBundleEntry, write_selected_sessions_with_native};
 use agentark_canonical::{
-    CanonicalMessage, CanonicalSchemaVersion, CanonicalSession, Completeness,
+    AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession, Completeness,
 };
-use agentark_desktop_lib::AppState;
-use agentark_desktop_lib::recovery::{CodexRecoveryExecutor, RecoveryError, RecoveryInput};
+use agentark_desktop_lib::recovery::{
+    CodexRecoveryExecutor, NativeAttemptSummary, RecoveryError, RecoveryInput,
+};
+use agentark_desktop_lib::{AppState, RestoreMappingWriter};
+use agentark_index::{IndexDb, RestoreMapping};
 use agentark_security::SecretScanner;
 use uuid::Uuid;
 
@@ -38,18 +41,25 @@ impl Drop for TempRoot {
 enum NativeScript {
     Success,
     MissingProvider,
+    ManualIntervention,
+    VerificationWithBackup,
 }
 
 #[derive(Clone, Copy)]
 enum ContinuationScript {
     Success,
     Unavailable,
+    ManualIntervention,
 }
 
 struct FakeExecutor {
     native: Mutex<VecDeque<NativeScript>>,
     continuation: Mutex<VecDeque<ContinuationScript>>,
     vendor_writes: AtomicUsize,
+    continuation_calls: AtomicUsize,
+    rollback_calls: AtomicUsize,
+    rollback_fails: bool,
+    native_summary: Mutex<NativeAttemptSummary>,
 }
 
 impl FakeExecutor {
@@ -63,6 +73,22 @@ impl FakeExecutor {
             .lock()
             .unwrap()
             .push_back(NativeScript::MissingProvider);
+        self
+    }
+
+    fn native_manual_intervention(self) -> Self {
+        self.native
+            .lock()
+            .unwrap()
+            .push_back(NativeScript::ManualIntervention);
+        self
+    }
+
+    fn native_verification_with_backup(self) -> Self {
+        self.native
+            .lock()
+            .unwrap()
+            .push_back(NativeScript::VerificationWithBackup);
         self
     }
 
@@ -82,8 +108,29 @@ impl FakeExecutor {
         self
     }
 
+    fn continuation_manual_intervention(self) -> Self {
+        self.continuation
+            .lock()
+            .unwrap()
+            .push_back(ContinuationScript::ManualIntervention);
+        self
+    }
+
     fn vendor_write_count(&self) -> usize {
         self.vendor_writes.load(Ordering::SeqCst)
+    }
+
+    fn continuation_call_count(&self) -> usize {
+        self.continuation_calls.load(Ordering::SeqCst)
+    }
+
+    fn rollback_failure(mut self) -> Self {
+        self.rollback_fails = true;
+        self
+    }
+
+    fn rollback_call_count(&self) -> usize {
+        self.rollback_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -97,7 +144,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
                 Ok(NativeRestoreReport {
                     imported_count: 1,
-                    skipped_count: 0,
+                    skipped_count: 2,
                     conflict_count: 0,
                     backup_path: Some(input.backup_root.join("fake-native")),
                     mappings: vec![(
@@ -109,6 +156,15 @@ impl CodexRecoveryExecutor for FakeExecutor {
                 })
             }
             NativeScript::MissingProvider => Err(RecoveryError::MissingProvider),
+            NativeScript::ManualIntervention => Err(RecoveryError::ManualIntervention),
+            NativeScript::VerificationWithBackup => {
+                *self.native_summary.lock().unwrap() = NativeAttemptSummary {
+                    skipped_count: 0,
+                    conflict_count: 1,
+                    backup_path: Some(input.backup_root.join("failed-native-backup")),
+                };
+                Err(RecoveryError::Verification)
+            }
         }
     }
 
@@ -116,6 +172,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
         &self,
         input: &RecoveryInput,
     ) -> Result<CodexContinuationReport, RecoveryError> {
+        self.continuation_calls.fetch_add(1, Ordering::SeqCst);
         match self.continuation.lock().unwrap().pop_front().unwrap() {
             ContinuationScript::Success => {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
@@ -130,7 +187,25 @@ impl CodexRecoveryExecutor for FakeExecutor {
                 })
             }
             ContinuationScript::Unavailable => Err(RecoveryError::Unavailable),
+            ContinuationScript::ManualIntervention => Err(RecoveryError::ManualIntervention),
         }
+    }
+
+    fn rollback(
+        &self,
+        _input: &RecoveryInput,
+        _report: &agentark_desktop_lib::recovery::AutomaticRecoveryReport,
+    ) -> Result<(), RecoveryError> {
+        self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        if self.rollback_fails {
+            Err(RecoveryError::ManualIntervention)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn native_attempt_summary(&self) -> NativeAttemptSummary {
+        self.native_summary.lock().unwrap().clone()
     }
 }
 
@@ -139,6 +214,10 @@ fn fake_executor() -> FakeExecutor {
         native: Mutex::new(VecDeque::new()),
         continuation: Mutex::new(VecDeque::new()),
         vendor_writes: AtomicUsize::new(0),
+        continuation_calls: AtomicUsize::new(0),
+        rollback_calls: AtomicUsize::new(0),
+        rollback_fails: false,
+        native_summary: Mutex::new(NativeAttemptSummary::default()),
     }
 }
 
@@ -152,7 +231,7 @@ fn session(id: u128, native_id: &str) -> CanonicalSession {
         id: session_id,
         install_id: Uuid::from_u128(100),
         source_session_id: native_id.into(),
-        source_kind: "codex".into(),
+        source_kind: "app-server".into(),
         workspace: None,
         title: Some(format!("fixture {id}")),
         archived: false,
@@ -190,22 +269,69 @@ fn restore_sessions_with(
     executor: &FakeExecutor,
     sessions: Vec<CanonicalSession>,
 ) -> Result<agentark_desktop_lib::BundleReport, String> {
+    restore_fixture(executor, sessions, "codex", true).map(|fixture| fixture.report)
+}
+
+struct RestoredFixture {
+    _root: TempRoot,
+    state: AppState,
+    report: agentark_desktop_lib::BundleReport,
+    session_ids: Vec<Uuid>,
+}
+
+fn restore_fixture(
+    executor: &FakeExecutor,
+    sessions: Vec<CanonicalSession>,
+    agent: &str,
+    include_payloads: bool,
+) -> Result<RestoredFixture, String> {
+    restore_fixture_with_writer(executor, sessions, agent, include_payloads, None)
+}
+
+fn restore_fixture_with_writer(
+    executor: &FakeExecutor,
+    sessions: Vec<CanonicalSession>,
+    agent: &str,
+    include_payloads: bool,
+    mapping_writer: Option<&dyn RestoreMappingWriter>,
+) -> Result<RestoredFixture, String> {
     let root = TempRoot::new("provider-independent-restore");
     let data_root = root.path().join("data");
     let codex_home = root.path().join("codex-home");
     fs::create_dir_all(codex_home.join("sessions")).unwrap();
     let bundle_path = root.path().join("fixture.ahbundle");
-    let payloads = sessions.iter().map(payload).collect::<Vec<_>>();
+    let payloads = if include_payloads {
+        sessions.iter().map(payload).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let scanner = SecretScanner::v1().unwrap();
-    write_selected_sessions_with_native(&bundle_path, "codex", &sessions, &[], &payloads, &scanner)
+    write_selected_sessions_with_native(&bundle_path, agent, &sessions, &[], &payloads, &scanner)
         .unwrap();
-    AppState::for_data_root(data_root).bundle_restore_with_executor(
-        bundle_path,
-        executor,
-        codex_home.clone(),
-        PathBuf::from("fake-codex"),
-        codex_home.join("agentark-backups"),
-    )
+    let state = AppState::for_data_root(data_root);
+    let report = match mapping_writer {
+        Some(mapping_writer) => state.bundle_restore_with_executor_and_mapping_writer(
+            bundle_path,
+            executor,
+            mapping_writer,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )?,
+        None => state.bundle_restore_with_executor(
+            bundle_path,
+            executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )?,
+    };
+    Ok(RestoredFixture {
+        _root: root,
+        state,
+        report,
+        session_ids: sessions.iter().map(|session| session.id).collect(),
+    })
 }
 
 #[test]
@@ -215,6 +341,14 @@ fn compatible_payload_retains_original_id() {
     assert_eq!(report.native_identity_count, 1);
     assert_eq!(report.continuation_count, 0);
     assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.native_skipped_count, 2);
+    assert!(
+        report
+            .native_backup_path
+            .as_deref()
+            .unwrap()
+            .ends_with("fake-native")
+    );
 }
 
 #[test]
@@ -245,12 +379,169 @@ fn archive_only_session_does_not_skip_later_continuation_or_mapping() {
         .native_missing_provider()
         .continuation_unavailable()
         .continuation_success();
-    let report = restore_sessions_with(
+    let fixture = restore_fixture(
         &executor,
         vec![session(1, "native-one"), session(2, "native-two")],
+        "codex",
+        true,
     )
     .unwrap();
+    let report = &fixture.report;
     assert_eq!(report.archive_only_count, 1);
     assert_eq!(report.continuation_count, 1);
     assert_eq!(report.restore_mapping_count, 2);
+    for session_id in fixture.session_ids {
+        assert_eq!(
+            fixture
+                .state
+                .restore_mappings_for(session_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn non_codex_bundle_records_archive_only_mapping_for_every_session() {
+    let fixture = restore_fixture(
+        &fake_executor(),
+        vec![session(1, "claude-one"), session(2, "claude-two")],
+        "claude-code",
+        false,
+    )
+    .unwrap();
+    assert_eq!(fixture.report.archive_only_count, 2);
+    assert_eq!(fixture.report.restore_mapping_count, 2);
+    for session_id in fixture.session_ids {
+        let mappings = fixture.state.restore_mappings_for(session_id).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].target_agent, AgentKind::ClaudeCode);
+        assert_eq!(mappings[0].reason_code, "target-recovery-unavailable");
+    }
+}
+
+#[test]
+fn all_agent_bundle_uses_safe_source_agent_mapping_and_unavailable_reason() {
+    let fixture = restore_fixture(
+        &fake_executor(),
+        vec![session(1, "native-one")],
+        "all",
+        false,
+    )
+    .unwrap();
+    let mappings = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+
+    assert_eq!(fixture.report.archive_only_count, 1);
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].target_agent, AgentKind::Codex);
+    assert_eq!(mappings[0].reason_code, "target-agent-unavailable");
+}
+
+#[test]
+fn native_rollback_failure_requires_manual_intervention_without_continuation() {
+    let executor = fake_executor().native_manual_intervention();
+    let report = restore_with(&executor).unwrap();
+    assert_eq!(report.native_identity_count, 0);
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(executor.continuation_call_count(), 0);
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("manual-intervention-required")
+    );
+}
+
+struct FailingMappingWriter;
+
+impl RestoreMappingWriter for FailingMappingWriter {
+    fn record(&self, _index: &mut IndexDb, _mapping: &RestoreMapping) -> Result<(), String> {
+        Err("fixture-mapping-failure".into())
+    }
+}
+
+#[test]
+fn mapping_persistence_failure_rolls_back_and_is_not_counted_as_success() {
+    let executor = fake_executor().native_success();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![session(1, "native-one")],
+        "codex",
+        true,
+        Some(&FailingMappingWriter),
+    )
+    .unwrap();
+
+    assert_eq!(executor.rollback_call_count(), 1);
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.continuation_count, 0);
+    assert_eq!(fixture.report.archive_only_count, 1);
+    assert_eq!(fixture.report.restore_mapping_count, 0);
+    assert_eq!(
+        fixture.report.recovery_error.as_deref(),
+        Some("restore-mapping-persistence-failed")
+    );
+    assert!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn mapping_persistence_and_rollback_failure_requires_manual_intervention() {
+    let executor = fake_executor().native_success().rollback_failure();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![session(1, "native-one")],
+        "codex",
+        true,
+        Some(&FailingMappingWriter),
+    )
+    .unwrap();
+
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.archive_only_count, 0);
+    assert_eq!(
+        fixture.report.recovery_error.as_deref(),
+        Some("manual-intervention-required")
+    );
+}
+
+#[test]
+fn failed_native_attempt_preserves_conflict_and_backup_metrics_after_continuation() {
+    let executor = fake_executor()
+        .native_verification_with_backup()
+        .continuation_success();
+    let report = restore_with(&executor).unwrap();
+
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.native_conflict_count, 1);
+    assert!(
+        report
+            .native_backup_path
+            .as_deref()
+            .unwrap()
+            .ends_with("failed-native-backup")
+    );
+}
+
+#[test]
+fn failed_continuation_rollback_reports_manual_intervention() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_manual_intervention();
+    let report = restore_with(&executor).unwrap();
+
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("manual-intervention-required")
+    );
 }

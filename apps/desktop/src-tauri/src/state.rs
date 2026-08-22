@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::recovery::{
     CodexRecoveryExecutor, ProductionCodexRecoveryExecutor, RecoveryInput,
-    recover_one_codex_session,
+    archive_only_recovery_report, recover_one_codex_session,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,6 +73,21 @@ pub struct AppState {
     scan_lock: Arc<Mutex<()>>,
     watch_roots: Arc<Mutex<Vec<WatchRoot>>>,
     watcher_started: Arc<AtomicBool>,
+}
+
+#[doc(hidden)]
+pub trait RestoreMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String>;
+}
+
+struct IndexRestoreMappingWriter;
+
+impl RestoreMappingWriter for IndexRestoreMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        index
+            .record_restore_mapping(mapping)
+            .map_err(|_| "restore-mapping-persistence-failed".into())
+    }
 }
 
 struct EmptyUseCase;
@@ -158,6 +173,8 @@ impl AppState {
         }
     }
 
+    /// Test-only constructor for external integration tests that must isolate
+    /// AgentArk storage from the user's configured data root.
     #[doc(hidden)]
     pub fn for_data_root(data_root: PathBuf) -> Self {
         Self {
@@ -694,6 +711,26 @@ impl AppState {
         executable: PathBuf,
         backup_root: PathBuf,
     ) -> Result<BundleReport, String> {
+        self.bundle_restore_with_executor_and_mapping_writer(
+            path,
+            executor,
+            &IndexRestoreMappingWriter,
+            codex_home,
+            executable,
+            backup_root,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn bundle_restore_with_executor_and_mapping_writer(
+        &self,
+        path: PathBuf,
+        executor: &dyn CodexRecoveryExecutor,
+        mapping_writer: &dyn RestoreMappingWriter,
+        codex_home: PathBuf,
+        executable: PathBuf,
+        backup_root: PathBuf,
+    ) -> Result<BundleReport, String> {
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
@@ -775,10 +812,11 @@ impl AppState {
             let mut archive_only_count = 0u64;
             let mut restore_mapping_count = 0u64;
             let mut recovery_error = None;
-            for session in sessions
-                .iter()
-                .filter(|session| session.source_kind == "codex")
-            {
+            let mut native_skipped_count = 0u64;
+            let mut native_conflict_count = 0u64;
+            let mut native_backup_path = None;
+            let bundle_target_agent = target_agent_kind(bundle.manifest.agent.as_deref());
+            for session in &sessions {
                 let mut recovery_session = session.clone();
                 if let Some(source) = recovery_sources.get(&session.id) {
                     recovery_session.model_provider = source.source_provider.clone();
@@ -787,49 +825,85 @@ impl AppState {
                 let native_payload = payloads_by_session
                     .remove(&session.id)
                     .and_then(|payloads| payloads.into_iter().next());
-                let recovery = recover_one_codex_session(
-                    executor,
-                    &RecoveryInput {
-                        session: recovery_session,
-                        native_payload,
-                        workspace_mappings: workspace_mappings.clone(),
-                        codex_home: codex_home.clone(),
-                        executable: executable.clone(),
-                        backup_root: backup_root.clone(),
-                    },
-                );
-                match recovery.outcome {
-                    RestoreOutcome::NativeIdentity => native_identity_count += 1,
-                    RestoreOutcome::Continuation => continuation_count += 1,
-                    RestoreOutcome::ArchiveOnly => {
-                        archive_only_count += 1;
-                        if recovery_error.is_none() {
-                            recovery_error = Some(recovery.reason_code.clone());
-                        }
-                    }
+                let input = RecoveryInput {
+                    session: recovery_session,
+                    native_payload,
+                    workspace_mappings: workspace_mappings.clone(),
+                    codex_home: codex_home.clone(),
+                    executable: executable.clone(),
+                    backup_root: backup_root.clone(),
+                };
+                let target_agent = bundle_target_agent
+                    .clone()
+                    .or_else(|| source_agent_kind(&session.source_kind));
+                let recovery = if bundle.manifest.agent.as_deref() == Some("codex") {
+                    recover_one_codex_session(executor, &input)
+                } else {
+                    archive_only_recovery_report(
+                        &input,
+                        if bundle_target_agent.is_some() {
+                            "target-recovery-unavailable"
+                        } else {
+                            "target-agent-unavailable"
+                        },
+                    )
+                };
+                native_skipped_count += recovery.native_skipped_count;
+                native_conflict_count += recovery.native_conflict_count;
+                if native_backup_path.is_none() {
+                    native_backup_path = recovery
+                        .native_backup_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
                 }
+                let Some(target_agent) = target_agent else {
+                    archive_only_count += 1;
+                    if recovery_error.is_none() {
+                        recovery_error = Some("target-agent-unavailable".into());
+                    }
+                    continue;
+                };
                 let mapping = RestoreMapping {
                     source_session_id: session.id,
-                    target_agent: AgentKind::Codex,
+                    target_agent,
                     outcome: recovery.outcome,
-                    source_native_id: recovery.source_native_id,
-                    target_native_id: recovery.target_native_id,
-                    source_provider: recovery.source_provider.provider,
+                    source_native_id: recovery.source_native_id.clone(),
+                    target_native_id: recovery.target_native_id.clone(),
+                    source_provider: recovery.source_provider.provider.clone(),
                     target_provider: recovery
                         .target_provider
+                        .clone()
                         .and_then(|identity| identity.provider),
-                    source_hash: recovery.source_hash,
-                    target_hash: recovery.target_hash,
-                    reason_code: recovery.reason_code,
+                    source_hash: recovery.source_hash.clone(),
+                    target_hash: recovery.target_hash.clone(),
+                    reason_code: recovery.reason_code.clone(),
                     created_at: restore_mapping_timestamp(),
                 };
-                match index.record_restore_mapping(&mapping) {
-                    Ok(()) => restore_mapping_count += 1,
-                    Err(_) => {
-                        if recovery_error.is_none() {
-                            recovery_error = Some("restore-mapping-persistence-failed".into());
+                match mapping_writer.record(&mut index, &mapping) {
+                    Ok(()) => {
+                        restore_mapping_count += 1;
+                        match recovery.outcome {
+                            RestoreOutcome::NativeIdentity => native_identity_count += 1,
+                            RestoreOutcome::Continuation => continuation_count += 1,
+                            RestoreOutcome::ArchiveOnly => {
+                                archive_only_count += 1;
+                                if recovery_error.is_none() {
+                                    recovery_error = Some(recovery.reason_code.clone());
+                                }
+                            }
                         }
                     }
+                    Err(_) => match executor.rollback(&input, &recovery) {
+                        Ok(()) => {
+                            archive_only_count += 1;
+                            if recovery_error.is_none() {
+                                recovery_error = Some("restore-mapping-persistence-failed".into());
+                            }
+                        }
+                        Err(_) => {
+                            recovery_error = Some("manual-intervention-required".into());
+                        }
+                    },
                 }
             }
             let native_imported_count = native_identity_count + continuation_count;
@@ -847,9 +921,9 @@ impl AppState {
                 restore_scan_id: Some(scan_id),
                 native_payload_count,
                 native_imported_count,
-                native_skipped_count: 0,
-                native_conflict_count: 0,
-                native_backup_path: None,
+                native_skipped_count,
+                native_conflict_count,
+                native_backup_path,
                 native_restart_required,
                 native_error: recovery_error.clone(),
                 native_identity_count,
@@ -859,6 +933,17 @@ impl AppState {
                 recovery_error,
             })
         })();
+        let _ = self.refresh_query_index();
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn restore_mappings_for(&self, session_id: Uuid) -> Result<Vec<RestoreMapping>, String> {
+        self.release_query_index()?;
+        let result = open_index(&self.data_root)
+            .ok_or_else(|| "无法打开本地加密索引".to_owned())?
+            .restore_mappings_for(session_id)
+            .map_err(|_| "无法读取恢复映射".to_owned());
         let _ = self.refresh_query_index();
         result
     }
@@ -983,6 +1068,30 @@ fn restore_mapping_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| format!("unix:{}", duration.as_secs()))
         .unwrap_or_else(|_| "unix:0".into())
+}
+
+fn target_agent_kind(label: Option<&str>) -> Option<AgentKind> {
+    match label {
+        Some("codex") => Some(AgentKind::Codex),
+        Some("claude-code") => Some(AgentKind::ClaudeCode),
+        Some("hermes") => Some(AgentKind::Hermes),
+        Some("openclaw") => Some(AgentKind::OpenClaw),
+        Some("opencode") => Some(AgentKind::OpenCode),
+        Some("grok-build") => Some(AgentKind::GrokBuild),
+        _ => None,
+    }
+}
+
+fn source_agent_kind(source_kind: &str) -> Option<AgentKind> {
+    match source_kind {
+        "app-server" | "codex" => Some(AgentKind::Codex),
+        "claude" | "claude-code" => Some(AgentKind::ClaudeCode),
+        "hermes" => Some(AgentKind::Hermes),
+        "openclaw" => Some(AgentKind::OpenClaw),
+        "opencode" => Some(AgentKind::OpenCode),
+        "grok" | "grok-build" => Some(AgentKind::GrokBuild),
+        _ => None,
+    }
 }
 
 fn append_audit_event(

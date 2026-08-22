@@ -4,8 +4,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
-    CodexContinuationRequest, CodexError, JsonRpcTransport, NativeThreadExpectation, RawJsonRpc,
-    backup_codex_targets, ensure_codex_not_running_from_tasklist,
+    CodexContinuationRequest, CodexError, JsonRpcTransport, NativeImportError,
+    NativeThreadExpectation, RawJsonRpc, backup_codex_targets,
+    delete_thread_with_app_server_transport, ensure_codex_not_running_from_tasklist,
     fork_rollout_with_target_provider_transport, verify_thread_listing,
 };
 use agentark_canonical::Sha256Digest;
@@ -15,6 +16,23 @@ use tempfile::tempdir;
 struct ScriptedTransport {
     sent: Arc<Mutex<Vec<Value>>>,
     responses: VecDeque<Value>,
+}
+
+#[test]
+fn delete_thread_helper_initializes_and_deletes_exact_target() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    delete_thread_with_app_server_transport(&mut transport, "target-thread").unwrap();
+
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent[0]["method"], "initialize");
+    assert_eq!(sent[1]["method"], "initialized");
+    assert_eq!(sent[2]["method"], "thread/delete");
+    assert_eq!(sent[2]["params"], json!({"threadId": "target-thread"}));
 }
 
 impl ScriptedTransport {
@@ -347,6 +365,42 @@ fn fork_rollout_deletes_new_target_when_post_fork_validation_fails() {
         .collect::<Vec<_>>();
     assert_eq!(deletes.len(), 1);
     assert_eq!(deletes[0]["params"], json!({"threadId": target_thread_id}));
+}
+
+#[test]
+fn fork_rollout_reports_manual_intervention_when_validation_rollback_fails() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let (mut responses, _) =
+        continuation_responses("019target-thread", &target_rollout, &target_cwd);
+    responses[3]["result"]["modelProvider"] = Value::String("unexpected".into());
+    responses.truncate(4);
+    responses.push(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "error": {"code": -32603, "message": "fixture delete failure"}
+    }));
+    let (mut transport, _) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Rollback));
 }
 
 #[test]

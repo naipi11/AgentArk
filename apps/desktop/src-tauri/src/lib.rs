@@ -4,7 +4,7 @@ mod commands;
 mod state;
 
 pub mod recovery;
-pub use state::{AppState, BundleReport};
+pub use state::{AppState, BundleReport, RestoreMappingWriter};
 
 pub fn run() {
     tauri::Builder::default()

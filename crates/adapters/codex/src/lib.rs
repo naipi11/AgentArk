@@ -17,7 +17,8 @@ pub use filesystem::{
 };
 pub use native_import::{
     CodexContinuationReport, CodexContinuationRequest, NativeCapability, NativeImportError,
-    NativeThreadExpectation, backup_codex_targets, ensure_codex_not_running,
+    NativeThreadExpectation, backup_codex_targets, delete_thread_with_app_server,
+    delete_thread_with_app_server_transport, ensure_codex_not_running,
     ensure_codex_not_running_from_tasklist, fork_rollout_with_target_provider,
     fork_rollout_with_target_provider_transport, native_import_capability_from_outputs,
     verify_rollout_with_app_server, verify_rollouts_with_app_server, verify_thread_listing,
