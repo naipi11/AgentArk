@@ -3,6 +3,39 @@ use agentark_migration::{
 };
 
 #[test]
+fn provider_identity_constructor_normalizes_blank_labels() {
+    assert_eq!(
+        ProviderIdentity::new(Some("  openai  ".into()), Some("\t".into())),
+        ProviderIdentity {
+            provider: Some("openai".into()),
+            model: None,
+        }
+    );
+}
+
+#[test]
+fn recovery_decision_normalizes_blank_source_and_target_labels() {
+    let decision = decide_recovery(
+        ProviderIdentity {
+            provider: Some("  ".into()),
+            model: Some("\t".into()),
+        },
+        TargetRecoveryCapabilities {
+            native_identity_verified: true,
+            continuation_writer_verified: true,
+            target_default: Some(ProviderIdentity {
+                provider: Some("  ".into()),
+                model: Some("\n".into()),
+            }),
+        },
+    );
+
+    assert_eq!(decision.source_provider.provider, None);
+    assert_eq!(decision.source_provider.model, None);
+    assert_eq!(decision.target_provider.unwrap().provider, None);
+}
+
+#[test]
 fn same_provider_with_verified_identity_keeps_native_id() {
     let decision = decide_recovery(
         ProviderIdentity {
