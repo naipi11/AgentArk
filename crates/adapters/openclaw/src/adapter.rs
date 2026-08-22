@@ -253,14 +253,14 @@ fn table_names(connection: &Connection) -> Result<Vec<String>, AdapterError> {
         connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
     )?;
     let rows = sql(statement.query_map([], |row| row.get::<_, String>(0)))?;
-    Ok(sql(rows.collect::<Result<Vec<_>, _>>())?)
+    sql(rows.collect::<Result<Vec<_>, _>>())
 }
 
 fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, AdapterError> {
     let sql_text = format!("PRAGMA table_info({})", quoted_identifier(table));
     let mut statement = sql(connection.prepare(&sql_text))?;
     let rows = sql(statement.query_map([], |row| row.get::<_, String>(1)))?;
-    Ok(sql(rows.collect::<Result<Vec<_>, _>>())?)
+    sql(rows.collect::<Result<Vec<_>, _>>())
 }
 
 fn read_rows(

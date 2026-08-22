@@ -1,6 +1,10 @@
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentark_adapter_claude::ClaudeCodeAdapter;
 use agentark_adapter_codex::CodexAdapter;
@@ -13,10 +17,14 @@ use agentark_app::{
     AppError, AppServices, LockedIndexQueryService, QueryUseCase, ScanReport, ScanRequest,
     ScanService, ScanUseCase, VerifyUseCase,
 };
+use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
 use agentark_bundle::{read_bundle, write_sessions};
 use agentark_cas::EncryptedCas;
 use agentark_index::IndexDb;
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
+use agentark_watch::{
+    ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
+};
 use directories::ProjectDirs;
 use serde::Serialize;
 use uuid::Uuid;
@@ -32,10 +40,13 @@ pub struct BundleReport {
     pub restore_scan_id: Option<Uuid>,
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub services: Arc<Mutex<AppServices>>,
     data_root: PathBuf,
     scan_lock: Arc<Mutex<()>>,
+    watch_roots: Arc<Mutex<Vec<WatchRoot>>>,
+    watcher_started: Arc<AtomicBool>,
 }
 
 struct EmptyUseCase;
@@ -98,6 +109,8 @@ impl AppState {
             })),
             data_root: default_data_dir(),
             scan_lock: Arc::new(Mutex::new(())),
+            watch_roots: Arc::new(Mutex::new(Vec::new())),
+            watcher_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -114,6 +127,8 @@ impl AppState {
             })),
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
+            watch_roots: Arc::new(Mutex::new(Vec::new())),
+            watcher_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -130,6 +145,7 @@ impl AppState {
         if !source_root.is_dir() {
             return Err("Codex 数据目录不存在或不是目录".into());
         }
+        self.register_watch("codex", &source_root);
 
         let executable = resolve_codex_executable();
         let adapter = CodexAdapter::with_executable(&source_root, executable.clone())
@@ -196,6 +212,7 @@ impl AppState {
         if !source_root.is_dir() {
             return Err("Claude Code 数据目录不存在或不是目录".into());
         }
+        self.register_watch("claude-code", &source_root);
         let adapter = ClaudeCodeAdapter::new(&source_root)
             .map_err(|_| "无法打开 Claude Code 数据目录".to_owned())?;
         let mut install = adapter
@@ -254,6 +271,7 @@ impl AppState {
         if !source_root.is_dir() {
             return Err("Hermes 数据目录不存在或不是目录".into());
         }
+        self.register_watch("hermes", &source_root);
         let adapter =
             HermesAdapter::new(&source_root).map_err(|_| "无法打开 Hermes 数据目录".to_owned())?;
         let mut install = adapter
@@ -311,6 +329,7 @@ impl AppState {
         if !source_root.is_dir() {
             return Err("OpenClaw 数据目录不存在或不是目录".into());
         }
+        self.register_watch("openclaw", &source_root);
         let adapter = OpenClawAdapter::new(&source_root)
             .map_err(|_| "无法打开 OpenClaw 数据目录".to_owned())?;
         let mut install = adapter
@@ -368,6 +387,7 @@ impl AppState {
         if !source_root.exists() {
             return Err("OpenCode 数据目录或数据库不存在".into());
         }
+        self.register_watch("opencode", &source_root);
         let adapter = OpenCodeAdapter::new(&source_root)
             .map_err(|_| "无法打开 OpenCode 数据目录".to_owned())?;
         let mut install = adapter
@@ -428,6 +448,7 @@ impl AppState {
         if !source_root.exists() {
             return Err("Grok Build 数据目录不存在".into());
         }
+        self.register_watch("grok-build", &source_root);
         let adapter = GrokBuildAdapter::new(&source_root)
             .map_err(|_| "无法打开 Grok Build 数据目录".to_owned())?;
         let mut install = adapter
@@ -486,6 +507,7 @@ impl AppState {
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let manifest = write_sessions(&path, &sessions, &scanner)
                 .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
+            append_audit_event(&self.data_root, "bundle.exported", &path, None)?;
             Ok(BundleReport {
                 format: manifest.format,
                 session_count: manifest.session_count,
@@ -525,6 +547,7 @@ impl AppState {
             let scan_id = index
                 .restore_sessions(&sessions)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
+            append_audit_event(&self.data_root, "bundle.restored", &path, Some(scan_id))?;
             Ok(BundleReport {
                 format: bundle.manifest.format.clone(),
                 session_count: bundle.manifest.session_count,
@@ -536,6 +559,93 @@ impl AppState {
         })();
         let _ = self.refresh_query_index();
         result
+    }
+
+    pub fn audit_verify(&self) -> Result<AuditVerification, String> {
+        verify_chain(&self.data_root.join("audit.jsonl")).map_err(|_| "无法验证审计账本".to_owned())
+    }
+
+    fn register_watch(&self, agent_id: &str, path: &Path) {
+        let root = WatchRoot {
+            agent_id: agent_id.to_owned(),
+            path: path.to_path_buf(),
+        };
+        if let Ok(mut roots) = self.watch_roots.lock()
+            && !roots.iter().any(|candidate| candidate == &root)
+        {
+            roots.push(root);
+        }
+        if !self.watcher_started.swap(true, Ordering::AcqRel) {
+            self.start_watcher_thread();
+        }
+    }
+
+    fn start_watcher_thread(&self) {
+        let state = self.clone();
+        thread::spawn(move || {
+            let mut previous =
+                HashMap::<(String, PathBuf), Vec<agentark_watch::FileFingerprint>>::new();
+            let mut queue = ReconciliationQueue::new(Duration::from_millis(500));
+            loop {
+                thread::sleep(Duration::from_secs(2));
+                let roots = state
+                    .watch_roots
+                    .lock()
+                    .map(|roots| roots.clone())
+                    .unwrap_or_default();
+                for root in &roots {
+                    let key = (root.agent_id.clone(), root.path.clone());
+                    let Ok(current) = fingerprint_root(root) else {
+                        continue;
+                    };
+                    let prior = previous.insert(key, current.clone()).unwrap_or_default();
+                    for changed in diff_fingerprints(&prior, &current) {
+                        queue.push(ReconcileEvent {
+                            agent_id: root.agent_id.clone(),
+                            path: changed,
+                            changed_at_ns: now_ns(),
+                        });
+                    }
+                }
+                queue.flush(now_ns());
+                let mut rescanned = BTreeSet::new();
+                while let Some(event) = queue.pop_ready() {
+                    if !rescanned.insert(event.agent_id.clone()) {
+                        continue;
+                    }
+                    let Some(root) = roots
+                        .iter()
+                        .find(|root| {
+                            root.agent_id == event.agent_id && event.path.starts_with(&root.path)
+                        })
+                        .map(|root| root.path.clone())
+                    else {
+                        continue;
+                    };
+                    match event.agent_id.as_str() {
+                        "codex" => {
+                            let _ = state.scan_codex(root);
+                        }
+                        "claude-code" => {
+                            let _ = state.scan_claude(root);
+                        }
+                        "hermes" => {
+                            let _ = state.scan_hermes(root);
+                        }
+                        "openclaw" => {
+                            let _ = state.scan_openclaw(root);
+                        }
+                        "opencode" => {
+                            let _ = state.scan_opencode(root);
+                        }
+                        "grok-build" => {
+                            let _ = state.scan_grok_build(root);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
     }
 
     fn release_query_index(&self) -> Result<(), String> {
@@ -557,6 +667,41 @@ impl AppState {
         services.queries = Box::new(LockedIndexQueryService::new(index));
         Ok(())
     }
+}
+
+fn now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+fn append_audit_event(
+    root: &Path,
+    event_type: &str,
+    path: &Path,
+    target: Option<Uuid>,
+) -> Result<(), String> {
+    let event = AuditEvent {
+        event_id: Uuid::new_v4(),
+        event_type: event_type.into(),
+        timestamp: "now".into(),
+        actor: "agentark-desktop".into(),
+        source: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned),
+        target: target.map(|value| value.to_string()),
+        before_hash: None,
+        after_hash: None,
+        plan_hash: None,
+        result: "success".into(),
+        previous_hash: None,
+        event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
+    };
+    append_event(&root.join("audit.jsonl"), event)
+        .map(|_| ())
+        .map_err(|_| "无法写入审计账本".to_owned())
 }
 
 pub fn detected_codex_home() -> Option<PathBuf> {

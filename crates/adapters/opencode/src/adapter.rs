@@ -39,10 +39,10 @@ impl OpenCodeAdapter {
         if let Some(path) = std::env::var_os("OPENCODE_HOME") {
             return Some(PathBuf::from(path));
         }
-        if cfg!(windows) {
-            if let Some(path) = std::env::var_os("LOCALAPPDATA") {
-                return Some(PathBuf::from(path).join("opencode"));
-            }
+        if cfg!(windows)
+            && let Some(path) = std::env::var_os("LOCALAPPDATA")
+        {
+            return Some(PathBuf::from(path).join("opencode"));
         }
         std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -175,7 +175,7 @@ fn table_names(connection: &Connection) -> Result<Vec<String>, AdapterError> {
         connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
     )?;
     let rows = sql(statement.query_map([], |row| row.get::<_, String>(0)))?;
-    Ok(sql(rows.collect::<Result<Vec<_>, _>>())?)
+    sql(rows.collect::<Result<Vec<_>, _>>())
 }
 
 fn quoted_identifier(value: &str) -> String {
@@ -424,9 +424,9 @@ fn normalize_session(bytes: &[u8], install_id: Uuid) -> Result<CanonicalSession,
                     raw_extra: part_row.clone().into_iter().collect(),
                 });
             }
-        }
-        if content.is_empty() {
-            if let Some(text) = row_value(&data, &["text", "content", "prompt", "response"]) {
+            if content.is_empty()
+                && let Some(text) = row_value(&data, &["text", "content", "prompt", "response"])
+            {
                 content.push(ContentPart {
                     kind: ContentPartKind::Text,
                     text: Some(text),

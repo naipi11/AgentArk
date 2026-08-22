@@ -387,7 +387,9 @@ fn message_text(message: &Value) -> String {
     }
 }
 
-fn assistant_content(message: &Value) -> (String, Vec<(String, Option<String>, Option<String>)>) {
+type ToolContent = (String, Option<String>, Option<String>);
+
+fn assistant_content(message: &Value) -> (String, Vec<ToolContent>) {
     let Some(Value::Array(parts)) = message.get("content") else {
         return (message_text(message), Vec::new());
     };

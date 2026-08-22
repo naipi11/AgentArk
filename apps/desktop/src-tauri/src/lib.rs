@@ -28,6 +28,7 @@ pub fn run() {
             commands::bundle_export,
             commands::bundle_verify,
             commands::bundle_restore,
+            commands::audit_verify,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentArk desktop");
@@ -62,7 +63,8 @@ mod tests {
                 "grok_build_default_root",
                 "bundle_export",
                 "bundle_verify",
-                "bundle_restore"
+                "bundle_restore",
+                "audit_verify"
             ]
         );
     }

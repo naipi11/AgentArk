@@ -63,6 +63,7 @@ export type BundleReport = {
   redactionCount: number;
   restoreScanId?: string;
 };
+export type AuditVerification = { valid: boolean; eventCount: number; lastHash?: string; error?: string };
 
 export const api = {
   status: () => invoke<StatusDto>('status'),
@@ -85,5 +86,6 @@ export const api = {
   bundleExport: (path: string) => invoke<BundleReport>('bundle_export', { path }),
   bundleVerify: (path: string) => invoke<BundleReport>('bundle_verify', { path }),
   bundleRestore: (path: string) => invoke<BundleReport>('bundle_restore', { path }),
+  auditVerify: () => invoke<AuditVerification>('audit_verify'),
   workspacesList: (limit = 100, offset = 0) => invoke<WorkspaceDto[]>('workspaces_list', { limit, offset }),
 };

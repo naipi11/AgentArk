@@ -43,6 +43,14 @@ pub enum Command {
         #[command(subcommand)]
         command: BundleCommand,
     },
+    Migration {
+        #[command(subcommand)]
+        command: MigrationCommand,
+    },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,6 +58,22 @@ pub enum BundleCommand {
     Export { path: PathBuf },
     Verify { path: PathBuf },
     Restore { path: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MigrationCommand {
+    Plan {
+        bundle: PathBuf,
+        #[arg(value_enum)]
+        target: AgentArg,
+        #[arg(long)]
+        handoff: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditCommand {
+    Verify,
 }
 
 #[derive(Subcommand, Debug)]

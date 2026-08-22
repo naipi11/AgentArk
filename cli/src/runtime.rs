@@ -9,9 +9,12 @@ use agentark_adapter_openclaw::OpenClawAdapter;
 use agentark_adapter_opencode::OpenCodeAdapter;
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{AppError, ScanReport, ScanRequest, ScanService, VerificationService};
+use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
 use agentark_bundle::{BundleError, read_bundle, write_sessions};
+use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
+use agentark_migration::{ContextHandoff, MigrationPlan, build_plan, context_handoff};
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
 use directories::ProjectDirs;
 use serde::Serialize;
@@ -37,6 +40,19 @@ pub enum RuntimeError {
 #[serde(rename_all = "camelCase")]
 pub struct DoctorData {
     pub dataset_state: &'static str,
+    pub bootstrap_present: bool,
+    pub index_present: bool,
+    pub cas_present: bool,
+    pub sqlcipher_ready: bool,
+    pub adapters: Vec<DoctorAdapter>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorAdapter {
+    pub id: &'static str,
+    pub detected: bool,
+    pub default_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,6 +74,14 @@ pub struct BundleData {
     pub redacted: bool,
     pub redaction_count: u64,
     pub restore_scan_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationData {
+    pub plan_count: usize,
+    pub plans: Vec<MigrationPlan>,
+    pub handoffs: Vec<ContextHandoff>,
 }
 
 pub fn data_dir(override_dir: Option<PathBuf>) -> PathBuf {
@@ -99,12 +123,40 @@ pub fn detected_grok_build_home() -> Option<PathBuf> {
 }
 
 pub fn doctor(root: &Path) -> DoctorData {
+    let bootstrap_present = root.join("bootstrap.json").is_file();
+    let index_present = root.join("index.db").is_file();
+    let cas_present = root.join("cas").is_dir();
+    let sqlcipher_ready = if bootstrap_present {
+        open_storage_existing(root).is_ok()
+    } else {
+        false
+    };
+    let adapters = [
+        ("codex", detected_codex_home()),
+        ("claude-code", detected_claude_home()),
+        ("hermes", detected_hermes_home()),
+        ("openclaw", detected_openclaw_home()),
+        ("opencode", detected_opencode_home()),
+        ("grok-build", detected_grok_build_home()),
+    ]
+    .into_iter()
+    .map(|(id, root)| DoctorAdapter {
+        id,
+        detected: root.as_ref().is_some_and(|path| path.exists()),
+        default_root: root.map(|path| path.to_string_lossy().into_owned()),
+    })
+    .collect();
     DoctorData {
-        dataset_state: if root.join("bootstrap.json").is_file() {
+        dataset_state: if bootstrap_present {
             "ready"
         } else {
             "notInitialized"
         },
+        bootstrap_present,
+        index_present,
+        cas_present,
+        sqlcipher_ready,
+        adapters,
     }
 }
 
@@ -113,6 +165,7 @@ pub fn export_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErro
     let sessions = index.all_sessions().map_err(|_| RuntimeError::Storage)?;
     let scanner = SecretScanner::v1().map_err(|_| RuntimeError::Storage)?;
     let manifest = write_sessions(path, &sessions, &scanner).map_err(bundle_error)?;
+    append_audit(root, "bundle.exported", path, None)?;
     Ok(BundleData {
         format: manifest.format,
         session_count: manifest.session_count,
@@ -142,6 +195,7 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
     let scan_id = index
         .restore_sessions(&sessions)
         .map_err(|_| RuntimeError::Storage)?;
+    append_audit(root, "bundle.restored", path, Some(scan_id))?;
     Ok(BundleData {
         format: bundle.manifest.format.clone(),
         session_count: bundle.manifest.session_count,
@@ -152,9 +206,73 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
     })
 }
 
+pub fn migration_plan(
+    path: &Path,
+    target: &str,
+    include_handoff: bool,
+) -> Result<MigrationData, RuntimeError> {
+    let bundle = read_bundle(path).map_err(bundle_error)?;
+    let target = match target.to_ascii_lowercase().as_str() {
+        "codex" => AgentKind::Codex,
+        "claudecode" | "claude-code" => AgentKind::ClaudeCode,
+        "hermes" => AgentKind::Hermes,
+        "openclaw" => AgentKind::OpenClaw,
+        "opencode" => AgentKind::OpenCode,
+        "grokbuild" | "grok-build" => AgentKind::GrokBuild,
+        _ => return Err(RuntimeError::InvalidInput),
+    };
+    let sessions = bundle.session_records().map_err(bundle_error)?;
+    let mut plans = Vec::with_capacity(sessions.len());
+    let mut handoffs = Vec::new();
+    for session in sessions {
+        let plan = build_plan(&session, target.clone()).map_err(|_| RuntimeError::Storage)?;
+        if include_handoff {
+            handoffs.push(context_handoff(&session, plan.loss_report.clone()));
+        }
+        plans.push(plan);
+    }
+    Ok(MigrationData {
+        plan_count: plans.len(),
+        plans,
+        handoffs,
+    })
+}
+
 fn bundle_error(error: BundleError) -> RuntimeError {
     let _ = error;
     RuntimeError::Storage
+}
+
+pub fn verify_audit(root: &Path) -> Result<AuditVerification, RuntimeError> {
+    verify_chain(&root.join("audit.jsonl")).map_err(|_| RuntimeError::Storage)
+}
+
+fn append_audit(
+    root: &Path,
+    event_type: &str,
+    path: &Path,
+    target: Option<Uuid>,
+) -> Result<(), RuntimeError> {
+    let event = AuditEvent {
+        event_id: Uuid::new_v4(),
+        event_type: event_type.into(),
+        timestamp: "now".into(),
+        actor: "agentark".into(),
+        source: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned),
+        target: target.map(|value| value.to_string()),
+        before_hash: None,
+        after_hash: None,
+        plan_hash: None,
+        result: "success".into(),
+        previous_hash: None,
+        event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
+    };
+    append_event(&root.join("audit.jsonl"), event)
+        .map(|_| ())
+        .map_err(|_| RuntimeError::Storage)
 }
 
 pub fn probe_codex() -> Result<ProbeData, RuntimeError> {

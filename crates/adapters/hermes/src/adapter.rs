@@ -87,7 +87,7 @@ impl HermesAdapter {
     ) -> Result<HashSet<String>, AdapterError> {
         let mut statement = sql(connection.prepare(&format!("PRAGMA table_info({table})")))?;
         let rows = sql(statement.query_map([], |row| row.get::<_, String>(1)))?;
-        Ok(sql(rows.collect::<Result<HashSet<_>, _>>())?)
+        sql(rows.collect::<Result<HashSet<_>, _>>())
     }
 
     fn optional_column(columns: &HashSet<String>, name: &str) -> String {

@@ -9,3 +9,48 @@ schema_sha256 = "fcb6b8b329c3436b4af8c5b180b7cb06f05cbcefdf31462aeefa579b0ca99cd
 semantic_source = "app-server"
 filesystem_source = "raw-only"
 experimental_api = false
+
+[[adapter]]
+agent = "claude-code"
+adapter_version = "claude-code-adapter-v1"
+protocol = "filesystem-jsonl"
+schema_sha256 = "sha256:claude-code-jsonl-dynamic-v1"
+semantic_source = "projects/**/*.jsonl"
+filesystem_source = "semantic-and-raw"
+experimental_api = false
+
+[[adapter]]
+agent = "hermes"
+adapter_version = "hermes-adapter-v1"
+protocol = "sqlite-read-only"
+schema_sha256 = "sha256:hermes-state-db-v1"
+semantic_source = "state.db:sessions+messages"
+filesystem_source = "semantic-and-raw"
+experimental_api = false
+
+[[adapter]]
+agent = "openclaw"
+adapter_version = "openclaw-adapter-v1"
+protocol = "sqlite-read-only"
+schema_sha256 = "sha256:openclaw-sqlite-dynamic-v1"
+semantic_source = "state/openclaw.sqlite+agents/*/agent/openclaw-agent.sqlite"
+filesystem_source = "semantic-and-raw"
+experimental_api = false
+
+[[adapter]]
+agent = "opencode"
+adapter_version = "opencode-adapter-v1"
+protocol = "sqlite-read-only"
+schema_sha256 = "sha256:opencode-sqlite-session-v1"
+semantic_source = "opencode.db:session+message+part"
+filesystem_source = "semantic-and-raw"
+experimental_api = false
+
+[[adapter]]
+agent = "grok-build"
+adapter_version = "grok-build-adapter-v1"
+protocol = "filesystem-jsonl"
+schema_sha256 = "sha256:grok-build-session-jsonl-v1"
+semantic_source = "sessions/*/*/updates.jsonl"
+filesystem_source = "semantic-and-raw"
+experimental_api = false

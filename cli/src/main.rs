@@ -7,7 +7,9 @@ mod runtime;
 use std::process::ExitCode;
 
 use agentark_app::{ScanReport, ScanStatus};
-use args::{BundleCommand, Cli, Command, ProbeAgent, SessionsCommand};
+use args::{
+    AuditCommand, BundleCommand, Cli, Command, MigrationCommand, ProbeAgent, SessionsCommand,
+};
 use clap::Parser;
 use output::{failure, success};
 use runtime::RuntimeError;
@@ -101,6 +103,22 @@ fn main() -> ExitCode {
                 "bundle.restore",
                 runtime::restore_bundle(&data_root, &path),
             ),
+        },
+        Command::Migration { command } => match command {
+            MigrationCommand::Plan {
+                bundle,
+                target,
+                handoff,
+            } => print_result(
+                cli.json,
+                "migration.plan",
+                runtime::migration_plan(&bundle, &format!("{target:?}"), handoff),
+            ),
+        },
+        Command::Audit { command } => match command {
+            AuditCommand::Verify => {
+                print_result(cli.json, "audit.verify", runtime::verify_audit(&data_root))
+            }
         },
     }
 }

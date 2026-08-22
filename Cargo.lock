@@ -41,10 +41,12 @@ dependencies = [
  "agentark-adapter-opencode",
  "agentark-adapter-sdk",
  "agentark-app",
+ "agentark-audit",
  "agentark-bundle",
  "agentark-canonical",
  "agentark-cas",
  "agentark-index",
+ "agentark-migration",
  "agentark-security",
  "assert_cmd",
  "clap",
@@ -203,6 +205,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentark-audit"
+version = "0.1.0"
+dependencies = [
+ "agentark-canonical",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "agentark-bundle"
 version = "0.1.0"
 dependencies = [
@@ -262,10 +280,13 @@ dependencies = [
  "agentark-adapter-opencode",
  "agentark-adapter-sdk",
  "agentark-app",
+ "agentark-audit",
  "agentark-bundle",
+ "agentark-canonical",
  "agentark-cas",
  "agentark-index",
  "agentark-security",
+ "agentark-watch",
  "directories",
  "serde",
  "serde_json",
@@ -301,6 +322,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentark-migration"
+version = "0.1.0"
+dependencies = [
+ "agentark-canonical",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "agentark-security"
 version = "0.1.0"
 dependencies = [
@@ -319,6 +354,18 @@ dependencies = [
  "thiserror 2.0.20",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "agentark-watch"
+version = "0.1.0"
+dependencies = [
+ "agentark-security",
+ "hex",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "walkdir",
 ]
 
 [[package]]

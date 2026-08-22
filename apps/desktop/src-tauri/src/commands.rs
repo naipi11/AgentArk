@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[allow(dead_code)]
-pub const REGISTERED_COMMANDS: [&str; 21] = [
+pub const REGISTERED_COMMANDS: [&str; 22] = [
     "status",
     "sessions_list",
     "sessions_show",
@@ -32,6 +32,7 @@ pub const REGISTERED_COMMANDS: [&str; 21] = [
     "bundle_export",
     "bundle_verify",
     "bundle_restore",
+    "audit_verify",
 ];
 
 #[tauri::command]
@@ -186,6 +187,13 @@ pub fn bundle_restore(
     path: String,
 ) -> Result<crate::state::BundleReport, String> {
     state.bundle_restore(std::path::PathBuf::from(path.trim()))
+}
+
+#[tauri::command]
+pub fn audit_verify(
+    state: State<'_, AppState>,
+) -> Result<agentark_audit::AuditVerification, String> {
+    state.audit_verify()
 }
 
 fn with_query<T>(
