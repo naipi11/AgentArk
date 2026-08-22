@@ -48,6 +48,7 @@ dependencies = [
  "agentark-index",
  "agentark-migration",
  "agentark-security",
+ "agentark-sync",
  "assert_cmd",
  "clap",
  "directories",
@@ -354,6 +355,21 @@ dependencies = [
  "thiserror 2.0.20",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "agentark-sync"
+version = "0.1.0"
+dependencies = [
+ "agentark-canonical",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
 ]
 
 [[package]]

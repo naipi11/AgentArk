@@ -16,6 +16,7 @@ use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
 use agentark_migration::{ContextHandoff, MigrationPlan, build_plan, context_handoff};
 use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
+use agentark_sync::{MergeResult, merge, read_operations};
 use directories::ProjectDirs;
 use serde::Serialize;
 use uuid::Uuid;
@@ -245,6 +246,12 @@ fn bundle_error(error: BundleError) -> RuntimeError {
 
 pub fn verify_audit(root: &Path) -> Result<AuditVerification, RuntimeError> {
     verify_chain(&root.join("audit.jsonl")).map_err(|_| RuntimeError::Storage)
+}
+
+pub fn sync_merge(local: &Path, remote: &Path) -> Result<MergeResult, RuntimeError> {
+    let local = read_operations(local).map_err(|_| RuntimeError::Storage)?;
+    let remote = read_operations(remote).map_err(|_| RuntimeError::Storage)?;
+    Ok(merge(&local, &remote))
 }
 
 fn append_audit(

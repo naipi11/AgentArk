@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use agentark_app::{ScanReport, ScanStatus};
 use args::{
     AuditCommand, BundleCommand, Cli, Command, MigrationCommand, ProbeAgent, SessionsCommand,
+    SyncCommand,
 };
 use clap::Parser;
 use output::{failure, success};
@@ -118,6 +119,11 @@ fn main() -> ExitCode {
         Command::Audit { command } => match command {
             AuditCommand::Verify => {
                 print_result(cli.json, "audit.verify", runtime::verify_audit(&data_root))
+            }
+        },
+        Command::Sync { command } => match command {
+            SyncCommand::Merge { local, remote } => {
+                print_result(cli.json, "sync.merge", runtime::sync_merge(&local, &remote))
             }
         },
     }

@@ -15,6 +15,7 @@ agentark-adapter-grok = { path = "../crates/adapters/grok" }
 agentark-bundle = { path = "../crates/bundle" }
 agentark-migration = { path = "../crates/migration" }
 agentark-audit = { path = "../crates/audit" }
+agentark-sync = { path = "../crates/sync" }
 agentark-adapter-sdk = { path = "../crates/adapter-sdk" }
 agentark-app = { path = "../crates/app" }
 agentark-canonical = { path = "../crates/canonical" }

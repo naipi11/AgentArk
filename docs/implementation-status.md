@@ -31,6 +31,9 @@ Vendor databases/files are never opened writable.
   desktop background rescan loop serialized behind the scan lock.
 - `agentark-audit` provides append-only hash-chain events and checkpoint file
   manifests. CLI `audit verify` validates the local chain.
+- `agentark-sync` provides an append-only operation log, HLC metadata merge,
+  immutable message/tool-event union, and explicit conflict records; message
+  content is never silently overwritten by last-write-wins.
 
 ## Remaining release gates
 

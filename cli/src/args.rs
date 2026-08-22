@@ -51,6 +51,10 @@ pub enum Command {
         #[command(subcommand)]
         command: AuditCommand,
     },
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -74,6 +78,11 @@ pub enum MigrationCommand {
 #[derive(Subcommand, Debug)]
 pub enum AuditCommand {
     Verify,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncCommand {
+    Merge { local: PathBuf, remote: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
