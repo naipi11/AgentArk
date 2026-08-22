@@ -32,7 +32,9 @@ fn recovery_decision_normalizes_blank_source_and_target_labels() {
 
     assert_eq!(decision.source_provider.provider, None);
     assert_eq!(decision.source_provider.model, None);
-    assert_eq!(decision.target_provider.unwrap().provider, None);
+    let target_provider = decision.target_provider.unwrap();
+    assert_eq!(target_provider.provider, None);
+    assert_eq!(target_provider.model, None);
 }
 
 #[test]
