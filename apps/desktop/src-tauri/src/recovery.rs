@@ -91,6 +91,7 @@ pub struct AutomaticRecoveryReport {
     pub native_skipped_count: u64,
     pub native_conflict_count: u64,
     pub native_backup_path: Option<PathBuf>,
+    pub requires_manual_intervention: bool,
 }
 
 pub fn recover_one_codex_session(
@@ -132,6 +133,7 @@ pub fn recover_one_codex_session(
             native_skipped_count: 0,
             native_conflict_count: 0,
             native_backup_path: None,
+            requires_manual_intervention: false,
         };
     };
 
@@ -170,6 +172,7 @@ pub fn recover_one_codex_session(
                 native_skipped_count: native.skipped_count,
                 native_conflict_count: native.conflict_count,
                 native_backup_path: native.backup_path,
+                requires_manual_intervention: false,
             };
         }
         Err(native_error @ (RecoveryError::Rollback | RecoveryError::ManualIntervention)) => {
@@ -178,6 +181,7 @@ pub fn recover_one_codex_session(
             report.native_skipped_count = native_summary.skipped_count;
             report.native_conflict_count = native_summary.conflict_count;
             report.native_backup_path = native_summary.backup_path;
+            report.requires_manual_intervention = true;
             report
         }
         Err(native_error) => match executor.create_continuation(input) {
@@ -212,6 +216,7 @@ pub fn recover_one_codex_session(
                         .conflict_count
                         .max(u64::from(native_error == RecoveryError::Conflict)),
                     native_backup_path: native_summary.backup_path,
+                    requires_manual_intervention: false,
                 }
             }
             Err(
@@ -225,6 +230,7 @@ pub fn recover_one_codex_session(
                     .conflict_count
                     .max(u64::from(native_error == RecoveryError::Conflict));
                 report.native_backup_path = native_summary.backup_path;
+                report.requires_manual_intervention = true;
                 report
             }
             Err(continuation_error) => {
@@ -255,6 +261,7 @@ pub fn recover_one_codex_session(
                         .conflict_count
                         .max(u64::from(native_error == RecoveryError::Conflict)),
                     native_backup_path: native_summary.backup_path,
+                    requires_manual_intervention: false,
                 }
             }
         },
@@ -289,6 +296,7 @@ pub fn archive_only_recovery_report(
         native_skipped_count: 0,
         native_conflict_count: 0,
         native_backup_path: None,
+        requires_manual_intervention: false,
     }
 }
 
@@ -529,24 +537,27 @@ where
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), Ok(())) => Err(error),
         (Ok(report), Err(_)) => match rollback(&report) {
-            Ok(()) => Err(RecoveryError::Rollback),
-            Err(_) => Err(RecoveryError::ManualIntervention),
+            Ok(()) | Err(_) => Err(RecoveryError::ManualIntervention),
         },
         (Err(_), Err(_)) => Err(RecoveryError::ManualIntervention),
     }
 }
 
 fn remove_staged_source(path: &Path) -> Result<(), RecoveryError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(RecoveryError::Rollback),
-    }?;
     let parent = path.parent().ok_or(RecoveryError::Rollback)?;
-    match fs::remove_dir(parent) {
+    let file_cleanup = match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(RecoveryError::Rollback),
+    };
+    let directory_cleanup = match fs::remove_dir_all(parent) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(RecoveryError::Rollback),
+    };
+    match (file_cleanup, directory_cleanup) {
+        (_, Ok(())) => Ok(()),
+        (Ok(()), Err(error)) | (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -590,6 +601,7 @@ fn map_native_import_error(error: NativeImportError) -> RecoveryError {
         | NativeImportError::UnsupportedVersion
         | NativeImportError::CodexRunning => RecoveryError::Unavailable,
         NativeImportError::Rollback => RecoveryError::ManualIntervention,
+        NativeImportError::ManualIntervention => RecoveryError::ManualIntervention,
     }
 }
 
@@ -770,8 +782,22 @@ mod tests {
             },
         );
 
-        assert_eq!(result.unwrap_err(), RecoveryError::Rollback);
+        assert_eq!(result.unwrap_err(), RecoveryError::ManualIntervention);
         assert_eq!(rollback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn staging_cleanup_removes_owned_nonempty_directory() {
+        let root = TempRoot::new();
+        let staging = root.0.join("sessions/.agentark-staging-fixture");
+        let source = staging.join("source.jsonl");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(&source, b"source").unwrap();
+        fs::write(staging.join("extra.tmp"), b"extra").unwrap();
+
+        remove_staged_source(&source).unwrap();
+
+        assert!(!staging.exists());
     }
 
     #[test]

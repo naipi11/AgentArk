@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +26,8 @@ pub enum NativeImportError {
     CodexRunning,
     #[error("Codex rollback failed; manual intervention is required")]
     Rollback,
+    #[error("Codex recovery requires manual intervention")]
+    ManualIntervention,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,15 +259,15 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
         params["model"] = Value::String(model.clone());
     }
     let response = client.request("thread/fork", params)?;
-    let target_thread_id = required_nonempty_label(
-        &response.value,
-        "/result/thread/id",
-        "thread/fork returned no target thread id",
-    )?;
+    let target_thread_id = response
+        .value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or(NativeImportError::ManualIntervention)?;
     if target_thread_id == request.source_thread_id {
-        return Err(NativeImportError::Verification(
-            "thread/fork reused the source thread id".into(),
-        ));
+        return Err(NativeImportError::ManualIntervention);
     }
     let outcome = (|| {
         let rollout_path = required_nonempty_label(
@@ -568,6 +570,36 @@ pub fn write_rollout_atomic(
     path: &Path,
     lines: &[Vec<u8>],
 ) -> Result<Sha256Digest, NativeImportError> {
+    write_rollout_atomic_with_reader(path, lines, |committed| fs::read(committed))
+}
+
+/// Reader-injected form of [`write_rollout_atomic`] for post-rename failure tests.
+#[doc(hidden)]
+pub fn write_rollout_atomic_with_reader<F>(
+    path: &Path,
+    lines: &[Vec<u8>],
+    read_committed: F,
+) -> Result<Sha256Digest, NativeImportError>
+where
+    F: FnOnce(&Path) -> io::Result<Vec<u8>>,
+{
+    write_rollout_atomic_with_operations(path, lines, read_committed, |cleanup| {
+        fs::remove_file(cleanup)
+    })
+}
+
+/// Operation-injected form of [`write_rollout_atomic`] for cleanup failure tests.
+#[doc(hidden)]
+pub fn write_rollout_atomic_with_operations<F, R>(
+    path: &Path,
+    lines: &[Vec<u8>],
+    read_committed: F,
+    remove: R,
+) -> Result<Sha256Digest, NativeImportError>
+where
+    F: FnOnce(&Path) -> io::Result<Vec<u8>>,
+    R: Fn(&Path) -> io::Result<()>,
+{
     let parent = path
         .parent()
         .ok_or_else(|| NativeImportError::Invalid("rollout has no parent".into()))?;
@@ -579,6 +611,7 @@ pub fn write_rollout_atomic(
             .unwrap_or("rollout"),
         Uuid::new_v4()
     ));
+    let mut renamed = false;
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -590,13 +623,25 @@ pub fn write_rollout_atomic(
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
-        let mut committed = File::open(path)?;
-        let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut committed, &mut bytes)?;
+        renamed = true;
+        let bytes = read_committed(path)?;
         Ok(Sha256Digest::from_bytes(&bytes))
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let mut cleanup_failed = false;
+        for cleanup_path in [Some(temporary.as_path()), renamed.then_some(path)]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = remove(cleanup_path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                cleanup_failed = true;
+            }
+        }
+        if cleanup_failed {
+            return Err(NativeImportError::ManualIntervention);
+        }
     }
     result
 }

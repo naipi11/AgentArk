@@ -8,6 +8,7 @@ use agentark_adapter_codex::{
     NativeThreadExpectation, RawJsonRpc, backup_codex_targets,
     delete_thread_with_app_server_transport, ensure_codex_not_running_from_tasklist,
     fork_rollout_with_target_provider_transport, verify_thread_listing,
+    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
 };
 use agentark_canonical::Sha256Digest;
 use serde_json::{Value, json};
@@ -33,6 +34,49 @@ fn delete_thread_helper_initializes_and_deletes_exact_target() {
     assert_eq!(sent[1]["method"], "initialized");
     assert_eq!(sent[2]["method"], "thread/delete");
     assert_eq!(sent[2]["params"], json!({"threadId": "target-thread"}));
+}
+
+#[test]
+fn atomic_rollout_post_rename_read_failure_removes_committed_destination() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("sessions/rollout.jsonl");
+
+    let error = write_rollout_atomic_with_reader(&destination, &[b"fixture\n".to_vec()], |_path| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fixture post-rename read failure",
+        ))
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Io(_)));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn atomic_rollout_cleanup_failure_requires_manual_intervention() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("sessions/rollout.jsonl");
+
+    let error = write_rollout_atomic_with_operations(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        |_path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture post-rename read failure",
+            ))
+        },
+        |_path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::ManualIntervention));
 }
 
 impl ScriptedTransport {
@@ -401,6 +445,121 @@ fn fork_rollout_reports_manual_intervention_when_validation_rollback_fails() {
             .unwrap_err();
 
     assert!(matches!(error, NativeImportError::Rollback));
+}
+
+#[test]
+fn fork_rollout_missing_target_id_requires_manual_intervention_without_delete() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let (mut responses, _) =
+        continuation_responses("019target-thread", &target_rollout, &target_cwd);
+    responses[3]["result"]["thread"]
+        .as_object_mut()
+        .unwrap()
+        .remove("id");
+    responses.truncate(4);
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: None,
+        target_model: None,
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::ManualIntervention));
+    assert!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .all(|value| value["method"] != "thread/delete")
+    );
+}
+
+#[test]
+fn fork_rollout_empty_target_id_requires_manual_intervention_without_delete() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let (mut responses, _) =
+        continuation_responses("019target-thread", &target_rollout, &target_cwd);
+    responses[3]["result"]["thread"]["id"] = Value::String("   ".into());
+    responses.truncate(4);
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: None,
+        target_model: None,
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::ManualIntervention));
+    assert!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .all(|value| value["method"] != "thread/delete")
+    );
+}
+
+#[test]
+fn fork_rollout_reused_source_id_requires_manual_intervention_without_source_delete() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let source_thread_id = "019source-thread";
+    let (mut responses, _) =
+        continuation_responses("019target-thread", &target_rollout, &target_cwd);
+    responses[3]["result"]["thread"]["id"] = Value::String(source_thread_id.into());
+    responses.truncate(4);
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: source_thread_id.into(),
+        target_cwd,
+        target_provider: None,
+        target_model: None,
+    };
+
+    let error =
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
+            .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::ManualIntervention));
+    assert!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .all(|value| value["method"] != "thread/delete")
+    );
 }
 
 #[test]

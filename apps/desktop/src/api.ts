@@ -81,6 +81,7 @@ export type BundleReport = {
   archiveOnlyCount: number;
   restoreMappingCount: number;
   recoveryError?: string;
+  manualInterventionCount: number;
 };
 export type AuditVerification = { valid: boolean; eventCount: number; lastHash?: string; error?: string };
 

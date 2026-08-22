@@ -64,6 +64,7 @@ pub struct BundleReport {
     pub archive_only_count: u64,
     pub restore_mapping_count: u64,
     pub recovery_error: Option<String>,
+    pub manual_intervention_count: u64,
 }
 
 #[derive(Clone)]
@@ -641,6 +642,7 @@ impl AppState {
                 archive_only_count: 0,
                 restore_mapping_count: 0,
                 recovery_error: None,
+                manual_intervention_count: 0,
             })
         })();
         let _ = self.refresh_query_index();
@@ -691,6 +693,7 @@ impl AppState {
             archive_only_count: 0,
             restore_mapping_count: 0,
             recovery_error: None,
+            manual_intervention_count: 0,
         })
     }
 
@@ -815,6 +818,7 @@ impl AppState {
             let mut native_skipped_count = 0u64;
             let mut native_conflict_count = 0u64;
             let mut native_backup_path = None;
+            let mut manual_intervention_count = 0u64;
             let bundle_target_agent = target_agent_kind(bundle.manifest.agent.as_deref());
             for session in &sessions {
                 let mut recovery_session = session.clone();
@@ -855,6 +859,11 @@ impl AppState {
                         .native_backup_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned());
+                }
+                if recovery.requires_manual_intervention {
+                    manual_intervention_count += 1;
+                    recovery_error = Some("manual-intervention-required".into());
+                    continue;
                 }
                 let Some(target_agent) = target_agent else {
                     archive_only_count += 1;
@@ -901,6 +910,7 @@ impl AppState {
                             }
                         }
                         Err(_) => {
+                            manual_intervention_count += 1;
                             recovery_error = Some("manual-intervention-required".into());
                         }
                     },
@@ -931,6 +941,7 @@ impl AppState {
                 archive_only_count,
                 restore_mapping_count,
                 recovery_error,
+                manual_intervention_count,
             })
         })();
         let _ = self.refresh_query_index();

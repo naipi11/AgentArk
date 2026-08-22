@@ -22,7 +22,7 @@ pub use native_import::{
     ensure_codex_not_running_from_tasklist, fork_rollout_with_target_provider,
     fork_rollout_with_target_provider_transport, native_import_capability_from_outputs,
     verify_rollout_with_app_server, verify_rollouts_with_app_server, verify_thread_listing,
-    write_rollout_atomic,
+    write_rollout_atomic, write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
 };
 pub use native_payload::{
     NativePayloadError, NativeRestoreReport, NativeRolloutPayload, collect_native_rollouts,

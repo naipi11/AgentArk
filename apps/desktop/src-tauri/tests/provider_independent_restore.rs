@@ -156,7 +156,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
                 })
             }
             NativeScript::MissingProvider => Err(RecoveryError::MissingProvider),
-            NativeScript::ManualIntervention => Err(RecoveryError::ManualIntervention),
+            NativeScript::ManualIntervention => Err(RecoveryError::Rollback),
             NativeScript::VerificationWithBackup => {
                 *self.native_summary.lock().unwrap() = NativeAttemptSummary {
                     skipped_count: 0,
@@ -341,6 +341,7 @@ fn compatible_payload_retains_original_id() {
     assert_eq!(report.native_identity_count, 1);
     assert_eq!(report.continuation_count, 0);
     assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.manual_intervention_count, 0);
     assert_eq!(report.native_skipped_count, 2);
     assert!(
         report
@@ -444,14 +445,25 @@ fn all_agent_bundle_uses_safe_source_agent_mapping_and_unavailable_reason() {
 #[test]
 fn native_rollback_failure_requires_manual_intervention_without_continuation() {
     let executor = fake_executor().native_manual_intervention();
-    let report = restore_with(&executor).unwrap();
+    let fixture =
+        restore_fixture(&executor, vec![session(1, "native-one")], "codex", true).unwrap();
+    let report = &fixture.report;
     assert_eq!(report.native_identity_count, 0);
     assert_eq!(report.continuation_count, 0);
-    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.manual_intervention_count, 1);
+    assert_eq!(report.restore_mapping_count, 0);
     assert_eq!(executor.continuation_call_count(), 0);
     assert_eq!(
         report.recovery_error.as_deref(),
         Some("manual-intervention-required")
+    );
+    assert!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -507,6 +519,7 @@ fn mapping_persistence_and_rollback_failure_requires_manual_intervention() {
 
     assert_eq!(fixture.report.native_identity_count, 0);
     assert_eq!(fixture.report.archive_only_count, 0);
+    assert_eq!(fixture.report.manual_intervention_count, 1);
     assert_eq!(
         fixture.report.recovery_error.as_deref(),
         Some("manual-intervention-required")
@@ -536,12 +549,23 @@ fn failed_continuation_rollback_reports_manual_intervention() {
     let executor = fake_executor()
         .native_missing_provider()
         .continuation_manual_intervention();
-    let report = restore_with(&executor).unwrap();
+    let fixture =
+        restore_fixture(&executor, vec![session(1, "native-one")], "codex", true).unwrap();
+    let report = &fixture.report;
 
     assert_eq!(report.continuation_count, 0);
-    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.manual_intervention_count, 1);
+    assert_eq!(report.restore_mapping_count, 0);
     assert_eq!(
         report.recovery_error.as_deref(),
         Some("manual-intervention-required")
+    );
+    assert!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .is_empty()
     );
 }
