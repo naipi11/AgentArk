@@ -37,11 +37,11 @@ Vendor databases/files are never opened writable.
   immutable message/tool-event union, and explicit conflict records; message
   content is never silently overwritten by last-write-wins.
 
-## Remaining release gates
+## Release gate result
 
-The remaining work before the first user test build is release hardening rather
-than source coverage: final cross-platform full-workspace test/clippy/audit,
-installer build and hash verification, migration/backup end-to-end fixtures,
-and a clean Windows install/upgrade smoke test. No vendor-native writer is
-enabled by default; cross-agent migration remains an explicit L1 handoff until
-an official target import contract is available.
+The 0.3.0 Windows gate is verified: workspace tests, clippy, front-end tests,
+MSI/NSIS build, SHA-256 capture, administrator upgrade, and responsive desktop
+launch all passed. No vendor-native writer is enabled by default; cross-agent
+migration remains an explicit L1 handoff until an official target import
+contract is available. Cloud relay, multi-user server mode, and L3 credential
+migration remain deliberately disabled for the local-first release.
