@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Only the default core capability is enabled.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:default"]
 }

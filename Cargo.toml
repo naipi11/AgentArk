@@ -64,4 +64,5 @@ directories = "=6.0.0"
 cap-std = "=4.0.2"
 libfuzzer-sys = "=0.4.13"
 tauri = { version = "=2.11.5", features = ["tracing"] }
+tauri-plugin-dialog = "=2.7.2"
 tauri-build = "=2.6.3"

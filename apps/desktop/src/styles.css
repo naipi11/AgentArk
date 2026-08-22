@@ -45,7 +45,6 @@ dl { display: grid; grid-template-columns: 180px 1fr; gap: 10px 20px; margin: 24
 .button-row button:hover { border-color: #55b8ff; }
 .button-row button:disabled { cursor: not-allowed; opacity: .65; }
 .transfer-view > input { width: 100%; }
-.transfer-path-hint { margin-top: 8px; font-size: 12px; color: #d8b56a; }
 .transfer-projects { display: grid; gap: 7px; max-height: 220px; overflow: auto; border: 1px solid #243745; border-radius: 10px; padding: 10px; background: #0d171f; }
 .transfer-project { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; color: #dce8ef; font-size: 13px; }
 .transfer-project span { overflow-wrap: anywhere; }

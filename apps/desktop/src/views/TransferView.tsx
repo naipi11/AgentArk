@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import { api, type AgentFilter, type BundleReport, type WorkspaceDto } from '../api';
 import { AgentSelector } from '../components/AgentSelector';
 import { useI18n } from '../i18n';
+
+const bundleDialogFilters = [{ name: 'AgentArk bundle', extensions: ['ahbundle'] }];
 
 export function TransferView({ refreshToken }: { refreshToken: number }) {
   const { t } = useI18n();
@@ -26,17 +29,46 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const toggleProject = (id: string) => setSelected((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
 
   async function exportHistory() {
+    let selectedPath: string | null;
+    try {
+      selectedPath = await save({
+        title: t('transfer.export'),
+        defaultPath: 'agent-history.ahbundle',
+        filters: bundleDialogFilters,
+      });
+    } catch {
+      setMessage(t('backup.error'));
+      return;
+    }
+    if (!selectedPath) return;
+    if (!selectedPath.toLowerCase().endsWith('.ahbundle')) selectedPath += '.ahbundle';
+    setPath(selectedPath);
     setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null);
     try {
-      const report = await api.bundleExport(path, agentKind === 'all' ? undefined : agentKind, selected, includeFiles);
+      const report = await api.bundleExport(selectedPath, agentKind === 'all' ? undefined : agentKind, selected, includeFiles);
       setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
     } catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
   }
 
   async function inspectHistory() {
+    let selectedPath: string | string[] | null;
+    try {
+      selectedPath = await open({
+        title: t('transfer.import'),
+        multiple: false,
+        directory: false,
+        filters: bundleDialogFilters,
+      });
+    } catch {
+      setMessage(t('backup.error'));
+      return;
+    }
+    const chosenPath = Array.isArray(selectedPath) ? selectedPath[0] : selectedPath;
+    if (!chosenPath) return;
+    setPath(chosenPath);
     setBusy(true); setBusyAction('import'); setMessage(null);
-    try { setPreview(await api.bundleVerify(path)); }
+    try { setPreview(await api.bundleVerify(chosenPath)); }
     catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
   }
@@ -55,8 +87,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     <section className="card transfer-view" aria-label={t('transfer.title')}>
       <div className="section-heading"><div><p className="eyebrow">{t('transfer.title')}</p><h2>{t('transfer.title')}</h2></div><AgentSelector value={agentKind} onChange={(value) => { setAgentKind(value); setPreview(null); }} /></div>
       <label className="field-label" htmlFor="transfer-path">{t('transfer.path')}</label>
-      <input id="transfer-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder={t('transfer.placeholder')} disabled={busy} />
-      {!path.trim() && <p className="muted transfer-path-hint">{t('transfer.pathRequired')}</p>}
+      <input id="transfer-path" value={path} placeholder={t('transfer.placeholder')} readOnly aria-readonly="true" disabled={busy} />
       <p className="field-label">{t('transfer.projects')}</p>
       <div className="transfer-projects">
         {projects.length === 0 && <p className="muted">{t('transfer.noProjects')}</p>}
@@ -64,8 +95,8 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
       </div>
       <label className="transfer-files"><input type="checkbox" checked={includeFiles} onChange={(event) => setIncludeFiles(event.target.checked)} />{t('transfer.files')}</label>
       <div className="button-row">
-        <button className="primary-button" type="button" disabled={busy || !path.trim()} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
-        <button type="button" disabled={busy || !path.trim()} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
+        <button className="primary-button" type="button" disabled={busy} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
+        <button type="button" disabled={busy} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
       </div>
       {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
       {message && <p className="muted" role="status">{message}</p>}
