@@ -45,3 +45,7 @@ launch all passed. No vendor-native writer is enabled by default; cross-agent
 migration remains an explicit L1 handoff until an official target import
 contract is available. Cloud relay, multi-user server mode, and L3 credential
 migration remain deliberately disabled for the local-first release.
+
+The transfer UI now exposes Agent-scoped project selection, an optional project
+file checkbox, bundle verification/preview, conflict blocking, and restore into
+`restored-workspaces` on the destination device.
