@@ -9,6 +9,7 @@ publish.workspace = true
 agentark-adapter-sdk = { path = "../../adapter-sdk" }
 agentark-canonical = { path = "../../canonical" }
 agentark-security = { path = "../../security" }
+base64.workspace = true
 dunce.workspace = true
 hex.workspace = true
 serde.workspace = true

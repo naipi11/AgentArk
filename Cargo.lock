@@ -84,6 +84,7 @@ dependencies = [
  "agentark-adapter-sdk",
  "agentark-canonical",
  "agentark-security",
+ "base64 0.22.1",
  "dunce",
  "hex",
  "serde",

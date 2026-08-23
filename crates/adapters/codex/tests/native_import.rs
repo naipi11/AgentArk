@@ -627,6 +627,89 @@ fn process_guard_accepts_unrelated_hosts_with_codex_in_workspace_names() {
 }
 
 #[test]
+fn powershell_command_mode_classifies_only_nested_command_positions() {
+    let rejected = [
+        r#"powershell.exe -f C:\tools\codex.ps1"#,
+        r#"pwsh.exe -c "& 'C:\tools\codex.ps1'""#,
+        r#"powershell.exe -Command "C:\tools\codex.ps1""#,
+        r#"powershell.exe -Command "Start-Process 'C:\tools\codex.ps1'""#,
+        r#"powershell.exe -Command "Start-Process -FilePath 'C:\tools\codex.ps1' -Wait""#,
+        r#"powershell.exe -Command "Start-Process cmd.exe -ArgumentList '/c', 'C:\tools\codex.cmd'""#,
+        r#"powershell.exe -Command "cmd.exe /c C:\tools\codex.cmd""#,
+        r#"powershell.exe -Command "node.exe C:\node_modules\@openai\codex\bin\codex.js""#,
+        r#"powershell.exe -Command "powershell.exe -File C:\tools\codex.ps1""#,
+        r#"powershell.exe -Command "Write-Output safe; & 'C:\tools\codex.ps1'""#,
+        r#"pwsh.exe -c "Write-Output safe && cmd.exe /c C:\tools\codex.cmd""#,
+        r#"pwsh.exe -c "Write-Output safe & 'C:\tools\codex.ps1'""#,
+        r#"powershell.exe -Command "Write-Output safe | & 'C:\tools\codex.ps1'""#,
+        "powershell.exe -Command \"Write-Output safe\n& 'C:\\tools\\codex.ps1'\"",
+    ];
+
+    for (index, command_line) in rejected.into_iter().enumerate() {
+        let snapshot = process_snapshot("powershell.exe", 6000 + index, command_line);
+        assert!(
+            ensure_codex_not_running_from_snapshot(&snapshot).is_err(),
+            "expected nested PowerShell command to be rejected"
+        );
+    }
+
+    let safe = process_snapshot(
+        "powershell.exe",
+        6100,
+        r#"powershell.exe -Command "Write-Output C:\tools\codex.ps1""#,
+    );
+    ensure_codex_not_running_from_snapshot(&safe).unwrap();
+    let quoted_separator = process_snapshot(
+        "powershell.exe",
+        6101,
+        r#"powershell.exe -Command "Write-Output 'literal; & C:\tools\codex.ps1'""#,
+    );
+    ensure_codex_not_running_from_snapshot(&quoted_separator).unwrap();
+}
+
+#[test]
+fn powershell_encoded_command_is_decoded_and_classified_without_leaking_script() {
+    const ENCODED_CMD_CODEX: &str =
+        "YwBtAGQALgBlAHgAZQAgAC8AYwAgAEMAOgBcAHQAbwBvAGwAcwBcAGMAbwBkAGUAeAAuAGMAbQBkAA==";
+    const ENCODED_SAFE_OUTPUT: &str =
+        "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABDADoAXAB0AG8AbABzAFwAYwBvAGQAZQB4AC4AcABzADEAMQA=";
+
+    for (index, switch) in ["-EncodedCommand", "-enc", "-e"].into_iter().enumerate() {
+        let command_line = format!("powershell.exe {switch} {ENCODED_CMD_CODEX}");
+        let snapshot = process_snapshot("powershell.exe", 6200 + index, &command_line);
+        assert!(ensure_codex_not_running_from_snapshot(&snapshot).is_err());
+    }
+
+    let safe = process_snapshot(
+        "powershell.exe",
+        6300,
+        &format!("powershell.exe -enc {ENCODED_SAFE_OUTPUT}"),
+    );
+    ensure_codex_not_running_from_snapshot(&safe).unwrap();
+
+    let canary = "encoded-script-canary-do-not-leak";
+    for (index, encoded) in [canary, "YQ=="].into_iter().enumerate() {
+        let malformed = process_snapshot(
+            "powershell.exe",
+            6400 + index,
+            &format!("powershell.exe -enc {encoded}"),
+        );
+        let error = ensure_codex_not_running_from_snapshot(&malformed).unwrap_err();
+        assert!(!error.to_string().contains(canary));
+    }
+}
+
+fn process_snapshot(name: &str, process_id: usize, command_line: &str) -> String {
+    serde_json::to_string(&json!([{
+        "Name": name,
+        "ProcessId": process_id,
+        "ParentProcessId": 100,
+        "CommandLine": command_line,
+    }]))
+    .unwrap()
+}
+
+#[test]
 fn process_guard_fails_closed_on_malformed_or_ambiguous_snapshot_without_leaking_commands() {
     let canary = "sk-proj-process-command-line-canary-123456789";
     let malformed = format!(r#"[{{"Name":"node.exe","ProcessId":3001,"CommandLine":"{canary}"}}"#);
