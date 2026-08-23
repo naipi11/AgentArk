@@ -9,9 +9,10 @@ use agentark_adapter_codex::{
     CodexVisibleHistoryExpectation, JsonRpcTransport, NativeImportError, NativeThreadExpectation,
     RawJsonRpc, backup_codex_targets, delete_thread_with_app_server_transport,
     delete_thread_with_app_server_transport_guarded, ensure_codex_not_running_from_snapshot,
-    fork_rollout_with_target_provider_transport,
+    ensure_codex_not_running_from_snapshot_excluding, fork_rollout_with_target_provider_transport,
     fork_rollout_with_target_provider_transport_guarded, probe_target_default_transport,
-    verify_target_session_transport, verify_thread_listing, write_rollout_atomic_with_operations,
+    verify_target_session_transport, verify_thread_listing,
+    write_rollout_atomic_with_guarded_operations, write_rollout_atomic_with_operations,
     write_rollout_atomic_with_reader,
 };
 use agentark_canonical::Sha256Digest;
@@ -21,6 +22,7 @@ use tempfile::tempdir;
 struct ScriptedTransport {
     sent: Arc<Mutex<Vec<Value>>>,
     responses: VecDeque<Value>,
+    mutation_events: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 #[test]
@@ -50,13 +52,16 @@ fn guarded_delete_checks_processes_immediately_before_mutation() {
         json!({"jsonrpc": "2.0", "id": 3, "result": {"data": [], "nextCursor": null}}),
         json!({"jsonrpc": "2.0", "id": 4, "result": {"data": [], "nextCursor": null}}),
     ];
-    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let mutation_events = Arc::new(Mutex::new(Vec::new()));
+    let (mut transport, sent) =
+        ScriptedTransport::with_mutation_events(responses, Arc::clone(&mutation_events));
     let checks = AtomicUsize::new(0);
 
     delete_thread_with_app_server_transport_guarded(
         &mut transport,
         "target-thread",
         &|_excluded| {
+            mutation_events.lock().unwrap().push("guard".into());
             checks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         },
@@ -66,6 +71,7 @@ fn guarded_delete_checks_processes_immediately_before_mutation() {
 
     assert_eq!(checks.load(Ordering::SeqCst), 1);
     assert_eq!(sent.lock().unwrap()[2]["method"], "thread/delete");
+    assert_eq!(*mutation_events.lock().unwrap(), ["guard", "thread/delete"]);
 }
 
 #[test]
@@ -111,6 +117,79 @@ fn atomic_rollout_cleanup_failure_requires_manual_intervention() {
     assert!(matches!(error, NativeImportError::ManualIntervention));
 }
 
+#[test]
+fn guarded_atomic_rollout_checks_immediately_before_rename_and_cleanup() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("sessions/rollout.jsonl");
+    let events = Mutex::new(Vec::new());
+
+    let error = write_rollout_atomic_with_guarded_operations(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        || {
+            events.lock().unwrap().push("guard");
+            Ok(())
+        },
+        |source, target| {
+            events.lock().unwrap().push("rename");
+            fs::rename(source, target)
+        },
+        |_path| {
+            events.lock().unwrap().push("read");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture post-rename read failure",
+            ))
+        },
+        |path| {
+            events.lock().unwrap().push("remove");
+            fs::remove_file(path)
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Io(_)));
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["guard", "guard", "rename", "read", "guard", "remove"]
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn post_rename_guard_failure_preserves_target_for_manual_intervention() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("sessions/rollout.jsonl");
+    let checks = AtomicUsize::new(0);
+    let remove_calls = AtomicUsize::new(0);
+
+    let error = write_rollout_atomic_with_guarded_operations(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        || match checks.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => Ok(()),
+            _ => Err(NativeImportError::CodexRunning),
+        },
+        |source, target| fs::rename(source, target),
+        |_path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture post-rename read failure",
+            ))
+        },
+        |path| {
+            remove_calls.fetch_add(1, Ordering::SeqCst);
+            fs::remove_file(path)
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::ManualIntervention));
+    assert_eq!(checks.load(Ordering::SeqCst), 3);
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    assert!(destination.is_file());
+}
+
 impl ScriptedTransport {
     fn new(responses: Vec<Value>) -> (Self, Arc<Mutex<Vec<Value>>>) {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -118,14 +197,30 @@ impl ScriptedTransport {
             Self {
                 sent: Arc::clone(&sent),
                 responses: responses.into(),
+                mutation_events: None,
             },
             sent,
         )
+    }
+
+    fn with_mutation_events(
+        responses: Vec<Value>,
+        mutation_events: Arc<Mutex<Vec<String>>>,
+    ) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        let (mut transport, sent) = Self::new(responses);
+        transport.mutation_events = Some(mutation_events);
+        (transport, sent)
     }
 }
 
 impl JsonRpcTransport for ScriptedTransport {
     fn send_value(&mut self, value: &Value) -> Result<(), CodexError> {
+        if let Some(method) = value.get("method").and_then(Value::as_str)
+            && matches!(method, "thread/fork" | "thread/name/set" | "thread/delete")
+            && let Some(events) = &self.mutation_events
+        {
+            events.lock().unwrap().push(method.into());
+        }
         self.sent.lock().unwrap().push(value.clone());
         Ok(())
     }
@@ -444,10 +539,23 @@ fn process_guard_rejects_direct_and_wrapped_codex_invocations() {
             "powershell.exe",
             r#"powershell.exe -File C:\tools\codex.ps1"#,
         ),
+        (
+            "powershell.exe",
+            r#"powershell.exe -File C:\tools\co'dex'.ps1"#,
+        ),
+        (
+            "powershell.exe",
+            r#"powershell.exe -File C:\tools\co`dex.ps1"#,
+        ),
         ("pwsh.exe", r#"pwsh.exe -File "C:\tools\codex.ps1""#),
+        ("cmd.exe", r#"cmd.exe /c C:\tools\co"dex".cmd"#),
         (
             "node.exe",
             r#"node.exe C:\tools\node_modules\@openai\codex\bin\codex.js"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe C:\tools\node_modules\@openai\co"dex"\bin\co"dex".js"#,
         ),
         (
             "node.exe",
@@ -457,6 +565,10 @@ fn process_guard_rejects_direct_and_wrapped_codex_invocations() {
             "node.exe",
             r#"node.exe C:\npm\npm-cli.js exec --package=@openai/codex"#,
         ),
+        (
+            "powershell.exe",
+            r#"powershell.exe npm.cmd exec @openai/co'dex'"#,
+        ),
         ("cmd.exe", r#"cmd.exe /c npx.cmd @openai/codex@0.146.0"#),
     ];
 
@@ -464,6 +576,7 @@ fn process_guard_rejects_direct_and_wrapped_codex_invocations() {
         let snapshot = serde_json::to_string(&json!([{
             "Name": name,
             "ProcessId": 1000 + index,
+            "ParentProcessId": 100,
             "CommandLine": command_line,
         }]))
         .unwrap();
@@ -480,17 +593,32 @@ fn process_guard_accepts_unrelated_hosts_with_codex_in_workspace_names() {
         {
             "Name": "node.exe",
             "ProcessId": 2001,
+            "ParentProcessId": 100,
             "CommandLine": r#"node.exe C:\work\codex-native-session-import\scripts\build.js"#,
         },
         {
             "Name": "cmd.exe",
             "ProcessId": 2002,
+            "ParentProcessId": 100,
             "CommandLine": r#"cmd.exe /c cargo test --manifest-path C:\work\codex-repository\Cargo.toml"#,
         },
         {
             "Name": "powershell.exe",
             "ProcessId": 2003,
+            "ParentProcessId": 100,
             "CommandLine": r#"powershell.exe -File C:\work\codex-tools\cleanup.ps1"#,
+        },
+        {
+            "Name": "powershell.exe",
+            "ProcessId": 2004,
+            "ParentProcessId": 100,
+            "CommandLine": r#"powershell.exe -File "C:\tools\co'dex'.ps1""#,
+        },
+        {
+            "Name": "powershell.exe",
+            "ProcessId": 2005,
+            "ParentProcessId": 100,
+            "CommandLine": r#"powershell.exe -File 'C:\tools\co''dex.ps1'"#,
         }
     ]))
     .unwrap();
@@ -505,12 +633,14 @@ fn process_guard_fails_closed_on_malformed_or_ambiguous_snapshot_without_leaking
     let ambiguous = serde_json::to_string(&json!([{
         "Name": "node.exe",
         "ProcessId": 3002,
+        "ParentProcessId": 100,
         "CommandLine": null,
     }]))
     .unwrap();
     let unterminated_quote = serde_json::to_string(&json!([{
         "Name": "powershell.exe",
         "ProcessId": 3003,
+        "ParentProcessId": 100,
         "CommandLine": r#"powershell.exe -File "C:\tools\unrelated.ps1"#,
     }]))
     .unwrap();
@@ -519,6 +649,66 @@ fn process_guard_fails_closed_on_malformed_or_ambiguous_snapshot_without_leaking
         let error = ensure_codex_not_running_from_snapshot(&snapshot).unwrap_err();
         assert!(!error.to_string().contains(canary));
     }
+}
+
+#[test]
+fn process_guard_excludes_the_owned_process_tree_transitively() {
+    let snapshot = serde_json::to_string(&json!([
+        {
+            "Name": "cmd.exe",
+            "ProcessId": 4100,
+            "ParentProcessId": 100,
+            "CommandLine": r#"cmd.exe /c C:\owned\codex.cmd app-server"#,
+        },
+        {
+            "Name": "node.exe",
+            "ProcessId": 4101,
+            "ParentProcessId": 4100,
+            "CommandLine": r#"node.exe C:\owned\node_modules\@openai\codex\bin\codex.js app-server"#,
+        },
+        {
+            "Name": "codex.exe",
+            "ProcessId": 4102,
+            "ParentProcessId": 4101,
+            "CommandLine": r#"C:\owned\vendor\codex.exe app-server"#,
+        },
+        {
+            "Name": "node.exe",
+            "ProcessId": 4200,
+            "ParentProcessId": 100,
+            "CommandLine": r#"node.exe C:\work\codex-native-session-import\scripts\build.js"#,
+        }
+    ]))
+    .unwrap();
+
+    ensure_codex_not_running_from_snapshot_excluding(&snapshot, &[4100]).unwrap();
+}
+
+#[test]
+fn process_guard_does_not_exclude_an_unrelated_user_codex_tree() {
+    let snapshot = serde_json::to_string(&json!([
+        {
+            "Name": "cmd.exe",
+            "ProcessId": 4100,
+            "ParentProcessId": 100,
+            "CommandLine": r#"cmd.exe /c C:\owned\codex.cmd app-server"#,
+        },
+        {
+            "Name": "node.exe",
+            "ProcessId": 4101,
+            "ParentProcessId": 4100,
+            "CommandLine": r#"node.exe C:\owned\node_modules\@openai\codex\bin\codex.js app-server"#,
+        },
+        {
+            "Name": "codex.exe",
+            "ProcessId": 5100,
+            "ParentProcessId": 5000,
+            "CommandLine": r#"C:\user\codex.exe resume"#,
+        }
+    ]))
+    .unwrap();
+
+    assert!(ensure_codex_not_running_from_snapshot_excluding(&snapshot, &[4100]).is_err());
 }
 
 #[test]
@@ -654,7 +844,9 @@ fn guarded_fork_checks_processes_before_fork_and_name_mutations() {
             thread["name"] = Value::String("Imported fixture".into());
         }
     }
-    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let mutation_events = Arc::new(Mutex::new(Vec::new()));
+    let (mut transport, sent) =
+        ScriptedTransport::with_mutation_events(responses, Arc::clone(&mutation_events));
     let checks = AtomicUsize::new(0);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -671,6 +863,7 @@ fn guarded_fork_checks_processes_before_fork_and_name_mutations() {
         codex_home.path(),
         &request,
         &|_excluded| {
+            mutation_events.lock().unwrap().push("guard".into());
             checks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         },
@@ -690,6 +883,10 @@ fn guarded_fork_checks_processes_before_fork_and_name_mutations() {
         methods
             .windows(2)
             .any(|pair| pair == ["thread/fork", "thread/name/set"])
+    );
+    assert_eq!(
+        *mutation_events.lock().unwrap(),
+        ["guard", "thread/fork", "guard", "thread/name/set"]
     );
 }
 

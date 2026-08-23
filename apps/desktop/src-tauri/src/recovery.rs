@@ -8,9 +8,9 @@ use agentark_adapter_codex::{
     NativeRolloutPayload, NativeThreadExpectation, build_canonical_continuation_source,
     canonical_visible_history, delete_thread_with_app_server_guarded,
     ensure_codex_not_running_excluding, fork_rollout_with_target_provider_guarded,
-    native_thread_expectation, probe_target_default, restore_native_rollouts,
+    native_thread_expectation, probe_target_default, restore_native_rollouts_guarded,
     rewrite_native_workspace_paths, verify_rollouts_with_app_server, verify_target_session,
-    write_rollout_atomic,
+    write_rollout_atomic_guarded,
 };
 use agentark_canonical::{CanonicalSession, Sha256Digest};
 use agentark_migration::{
@@ -578,12 +578,15 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
             .map_err(map_native_payload_error)?
             .expectation();
         self.ensure_version_supported(&input.executable)?;
-        self.ensure_process_guard(&[])?;
-        let report = match restore_native_rollouts(
+        let report = match restore_native_rollouts_guarded(
             &input.codex_home,
             std::slice::from_ref(payload),
             &input.workspace_mappings,
             &input.backup_root,
+            &|| {
+                self.ensure_process_guard(&[])
+                    .map_err(|_| NativeImportError::CodexRunning)
+            },
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -781,9 +784,10 @@ where
             &target_default.model,
         )
         .map_err(map_native_payload_error)?;
-        guard(&[])?;
-        write_rollout_atomic(&staged_source, std::slice::from_ref(&source.bytes))
-            .map_err(map_native_import_error)?;
+        write_rollout_atomic_guarded(&staged_source, std::slice::from_ref(&source.bytes), &|| {
+            guard(&[]).map_err(|_| NativeImportError::CodexRunning)
+        })
+        .map_err(map_native_import_error)?;
         staged_written = true;
         let request = CodexContinuationRequest {
             source_rollout: staged_source.clone(),
@@ -1091,14 +1095,21 @@ mod tests {
     }
 
     #[test]
-    fn two_native_writes_take_two_process_snapshots_but_probe_version_once() {
+    fn two_native_writes_guard_each_backup_temp_and_commit_but_probe_version_once() {
         let root = TempRoot::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
         let executor = ProductionCodexRecoveryExecutor::with_preflight_and_native_verifier(
             Arc::new(SequencedPreflight {
                 events: Arc::clone(&events),
-                process_results: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+                process_results: Mutex::new(VecDeque::from([
+                    Ok(()),
+                    Ok(()),
+                    Ok(()),
+                    Ok(()),
+                    Ok(()),
+                    Ok(()),
+                ])),
             }),
             Arc::new(ExactHistoryNativeVerifier {
                 calls: Arc::clone(&calls),
@@ -1127,7 +1138,15 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             *events.lock().unwrap(),
-            ["version-probe", "process-check", "process-check"]
+            [
+                "version-probe",
+                "process-check",
+                "process-check",
+                "process-check",
+                "process-check",
+                "process-check",
+                "process-check"
+            ]
         );
     }
 
@@ -1139,6 +1158,8 @@ mod tests {
             Arc::new(SequencedPreflight {
                 events: Arc::clone(&events),
                 process_results: Mutex::new(VecDeque::from([
+                    Ok(()),
+                    Ok(()),
                     Ok(()),
                     Err(RecoveryError::Unavailable),
                 ])),
@@ -1160,7 +1181,13 @@ mod tests {
         assert!(destination.is_file());
         assert_eq!(
             *events.lock().unwrap(),
-            ["version-probe", "process-check", "process-check"]
+            [
+                "version-probe",
+                "process-check",
+                "process-check",
+                "process-check",
+                "process-check"
+            ]
         );
     }
 
@@ -1434,7 +1461,7 @@ mod tests {
             &input(&root.0),
             &target_default(),
             |_excluded| {
-                if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                if checks.fetch_add(1, Ordering::SeqCst) < 2 {
                     Ok(())
                 } else {
                     Err(RecoveryError::Unavailable)
@@ -1461,7 +1488,7 @@ mod tests {
         );
 
         assert_eq!(result.unwrap_err(), RecoveryError::ManualIntervention);
-        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
         assert_eq!(rollback_calls.load(Ordering::SeqCst), 1);
         assert!(staged.lock().unwrap().as_ref().unwrap().is_file());
     }

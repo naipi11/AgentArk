@@ -966,7 +966,25 @@ pub fn write_rollout_atomic(
     path: &Path,
     lines: &[Vec<u8>],
 ) -> Result<Sha256Digest, NativeImportError> {
-    write_rollout_atomic_with_reader(path, lines, |committed| fs::read(committed))
+    write_rollout_atomic_guarded(path, lines, &|| Ok(()))
+}
+
+pub fn write_rollout_atomic_guarded<G>(
+    path: &Path,
+    lines: &[Vec<u8>],
+    guard: &G,
+) -> Result<Sha256Digest, NativeImportError>
+where
+    G: Fn() -> Result<(), NativeImportError> + ?Sized,
+{
+    write_rollout_atomic_with_guarded_operations(
+        path,
+        lines,
+        guard,
+        |source, target| fs::rename(source, target),
+        |committed| fs::read(committed),
+        |cleanup| fs::remove_file(cleanup),
+    )
 }
 
 /// Reader-injected form of [`write_rollout_atomic`] for post-rename failure tests.
@@ -996,9 +1014,36 @@ where
     F: FnOnce(&Path) -> io::Result<Vec<u8>>,
     R: Fn(&Path) -> io::Result<()>,
 {
+    write_rollout_atomic_with_guarded_operations(
+        path,
+        lines,
+        || Ok(()),
+        |source, target| fs::rename(source, target),
+        read_committed,
+        remove,
+    )
+}
+
+/// Guard- and operation-injected form of [`write_rollout_atomic`].
+#[doc(hidden)]
+pub fn write_rollout_atomic_with_guarded_operations<G, N, F, R>(
+    path: &Path,
+    lines: &[Vec<u8>],
+    guard: G,
+    rename: N,
+    read_committed: F,
+    remove: R,
+) -> Result<Sha256Digest, NativeImportError>
+where
+    G: Fn() -> Result<(), NativeImportError>,
+    N: FnOnce(&Path, &Path) -> io::Result<()>,
+    F: FnOnce(&Path) -> io::Result<Vec<u8>>,
+    R: Fn(&Path) -> io::Result<()>,
+{
     let parent = path
         .parent()
         .ok_or_else(|| NativeImportError::Invalid("rollout has no parent".into()))?;
+    guard()?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
@@ -1007,36 +1052,42 @@ where
             .unwrap_or("rollout"),
         Uuid::new_v4()
     ));
+    let mut temporary_created = false;
     let mut renamed = false;
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temporary)?;
+        temporary_created = true;
         for line in lines {
             file.write_all(line)?;
         }
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)?;
+        guard()?;
+        rename(&temporary, path)?;
         renamed = true;
         let bytes = read_committed(path)?;
         Ok(Sha256Digest::from_bytes(&bytes))
     })();
     if result.is_err() {
-        let mut cleanup_failed = false;
-        for cleanup_path in [Some(temporary.as_path()), renamed.then_some(path)]
-            .into_iter()
-            .flatten()
-        {
+        let cleanup_path = if renamed {
+            Some(path)
+        } else if temporary_created {
+            Some(temporary.as_path())
+        } else {
+            None
+        };
+        if let Some(cleanup_path) = cleanup_path {
+            if guard().is_err() {
+                return Err(NativeImportError::ManualIntervention);
+            }
             if let Err(error) = remove(cleanup_path)
                 && error.kind() != io::ErrorKind::NotFound
             {
-                cleanup_failed = true;
+                return Err(NativeImportError::ManualIntervention);
             }
-        }
-        if cleanup_failed {
-            return Err(NativeImportError::ManualIntervention);
         }
     }
     result

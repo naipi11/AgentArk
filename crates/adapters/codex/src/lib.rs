@@ -26,7 +26,8 @@ pub use native_import::{
     fork_rollout_with_target_provider_transport_guarded, native_import_capability_from_outputs,
     probe_target_default, probe_target_default_transport, verify_rollout_with_app_server,
     verify_rollouts_with_app_server, verify_target_session, verify_target_session_transport,
-    verify_thread_listing, write_rollout_atomic, write_rollout_atomic_with_operations,
+    verify_thread_listing, write_rollout_atomic, write_rollout_atomic_guarded,
+    write_rollout_atomic_with_guarded_operations, write_rollout_atomic_with_operations,
     write_rollout_atomic_with_reader,
 };
 pub use native_payload::{
@@ -34,7 +35,7 @@ pub use native_payload::{
     CodexVisibleMessage, CodexVisibleRole, NativePayloadError, NativeRestoreReport,
     NativeRolloutPayload, build_canonical_continuation_source, canonical_visible_history,
     collect_native_rollouts, native_thread_expectation, restore_native_rollouts,
-    rewrite_native_workspace_paths, sanitize_rollout_bytes,
+    restore_native_rollouts_guarded, rewrite_native_workspace_paths, sanitize_rollout_bytes,
 };
 pub use normalize::{
     normalize_thread_read, normalize_thread_read_bytes, normalize_thread_read_bytes_for_install,
@@ -43,6 +44,6 @@ pub use probe::{CODEX_SCHEMA_SHA256, CODEX_VERSION, CodexProbe, parse_version};
 pub use process::ProcessTransport;
 pub use process_guard::{
     ensure_codex_not_running, ensure_codex_not_running_excluding,
-    ensure_codex_not_running_from_snapshot,
+    ensure_codex_not_running_from_snapshot, ensure_codex_not_running_from_snapshot_excluding,
 };
 pub use protocol::{JsonRpcTransport, MAX_JSON_LINE, RawJsonRpc, ReadOnlyAppServerClient};

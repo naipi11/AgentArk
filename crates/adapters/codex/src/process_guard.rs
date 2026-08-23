@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::Deserialize;
 
@@ -11,11 +11,20 @@ const PROCESS_SNAPSHOT_UNAVAILABLE: &str = "Codex process snapshot is unavailabl
 struct ProcessSnapshotRow {
     name: String,
     process_id: u32,
+    parent_process_id: u32,
     command_line: Option<String>,
 }
 
 pub fn ensure_codex_not_running_from_snapshot(output: &str) -> Result<(), NativeImportError> {
-    classify_process_snapshot(output, &[])
+    ensure_codex_not_running_from_snapshot_excluding(output, &[])
+}
+
+#[doc(hidden)]
+pub fn ensure_codex_not_running_from_snapshot_excluding(
+    output: &str,
+    excluded_process_ids: &[u32],
+) -> Result<(), NativeImportError> {
+    classify_process_snapshot(output, excluded_process_ids)
 }
 
 fn classify_process_snapshot(
@@ -27,12 +36,39 @@ fn classify_process_snapshot(
     if rows.is_empty() {
         return Err(snapshot_unavailable());
     }
-    let excluded = excluded_process_ids.iter().copied().collect::<HashSet<_>>();
+    if excluded_process_ids.contains(&0) {
+        return Err(snapshot_unavailable());
+    }
     let mut seen = HashSet::new();
-    for row in rows {
-        if row.process_id == 0 || row.name.trim().is_empty() || !seen.insert(row.process_id) {
+    for row in &rows {
+        if row.process_id == 0
+            || row.process_id == row.parent_process_id
+            || row.name.trim().is_empty()
+            || !seen.insert(row.process_id)
+        {
             return Err(snapshot_unavailable());
         }
+    }
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    for row in &rows {
+        children
+            .entry(row.parent_process_id)
+            .or_default()
+            .push(row.process_id);
+    }
+    let mut excluded = excluded_process_ids.iter().copied().collect::<HashSet<_>>();
+    let mut pending = excluded_process_ids
+        .iter()
+        .copied()
+        .collect::<VecDeque<_>>();
+    while let Some(parent) = pending.pop_front() {
+        for child in children.get(&parent).into_iter().flatten() {
+            if excluded.insert(*child) {
+                pending.push_back(*child);
+            }
+        }
+    }
+    for row in rows {
         if excluded.contains(&row.process_id) {
             continue;
         }
@@ -72,7 +108,8 @@ fn is_command_host(name: &str) -> bool {
 }
 
 fn command_line_runs_codex(host: &str, command_line: &str) -> Result<bool, NativeImportError> {
-    let tokens = command_line_tokens(command_line).ok_or_else(snapshot_unavailable)?;
+    let tokens = command_line_tokens(command_line, matches!(host, "powershell.exe" | "pwsh.exe"))
+        .ok_or_else(snapshot_unavailable)?;
     if matches!(host, "cmd.exe")
         && tokens.iter().any(|token| {
             matches!(
@@ -97,14 +134,42 @@ fn command_line_runs_codex(host: &str, command_line: &str) -> Result<bool, Nativ
         && tokens.iter().any(|token| is_codex_package(token)))
 }
 
-fn command_line_tokens(command_line: &str) -> Option<Vec<String>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteMode {
+    Unquoted,
+    Double,
+    PowerShellSingle,
+}
+
+fn command_line_tokens(command_line: &str, powershell_quotes: bool) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
     let mut token = String::new();
-    let mut quoted = false;
-    for character in command_line.chars() {
-        match character {
-            '"' => quoted = !quoted,
-            character if character.is_whitespace() && !quoted => {
+    let mut quote_mode = QuoteMode::Unquoted;
+    let mut characters = command_line.chars().peekable();
+    while let Some(character) = characters.next() {
+        match (quote_mode, character) {
+            (QuoteMode::Unquoted | QuoteMode::Double, '`') if powershell_quotes => {
+                match characters.next()? {
+                    '\r' => {
+                        if characters.peek() == Some(&'\n') {
+                            characters.next();
+                        }
+                    }
+                    '\n' => {}
+                    escaped => token.push(escaped),
+                }
+            }
+            (QuoteMode::Unquoted, '"') => quote_mode = QuoteMode::Double,
+            (QuoteMode::Double, '"') => quote_mode = QuoteMode::Unquoted,
+            (QuoteMode::Unquoted, '\'') if powershell_quotes => {
+                quote_mode = QuoteMode::PowerShellSingle;
+            }
+            (QuoteMode::PowerShellSingle, '\'') if characters.peek() == Some(&'\'') => {
+                characters.next();
+                token.push('\'');
+            }
+            (QuoteMode::PowerShellSingle, '\'') => quote_mode = QuoteMode::Unquoted,
+            (QuoteMode::Unquoted, character) if character.is_whitespace() => {
                 if !token.is_empty() {
                     tokens.push(std::mem::take(&mut token));
                 }
@@ -115,12 +180,12 @@ fn command_line_tokens(command_line: &str) -> Option<Vec<String>> {
     if !token.is_empty() {
         tokens.push(token);
     }
-    (!quoted).then_some(tokens)
+    (quote_mode == QuoteMode::Unquoted).then_some(tokens)
 }
 
 fn token_basename(token: &str) -> String {
     token
-        .trim_matches(|character: char| matches!(character, '\'' | '"' | '&' | '(' | ')'))
+        .trim_matches(|character: char| matches!(character, '"' | '&' | '(' | ')'))
         .rsplit(['\\', '/'])
         .next()
         .unwrap_or_default()
@@ -129,7 +194,7 @@ fn token_basename(token: &str) -> String {
 
 fn is_codex_node_entrypoint(token: &str) -> bool {
     let components = token
-        .trim_matches(|character: char| matches!(character, '\'' | '"'))
+        .trim_matches('"')
         .split(['\\', '/'])
         .filter(|component| !component.is_empty())
         .map(str::to_ascii_lowercase)
@@ -150,15 +215,26 @@ fn is_npm_launcher(token: &str) -> bool {
 }
 
 fn is_codex_package(token: &str) -> bool {
-    let token = token
-        .trim_matches(|character: char| matches!(character, '\'' | '"'))
-        .to_ascii_lowercase();
+    let token = token.trim_matches('"').to_ascii_lowercase();
     let token = token.strip_prefix("--package=").unwrap_or(&token);
     token == "@openai/codex" || token.starts_with("@openai/codex@")
 }
 
 fn snapshot_unavailable() -> NativeImportError {
     NativeImportError::Verification(PROCESS_SNAPSHOT_UNAVAILABLE.into())
+}
+
+fn ensure_snapshot_execution_succeeded(
+    timed_out: bool,
+    succeeded: bool,
+    stdout_overflowed: bool,
+    stderr_overflowed: bool,
+) -> Result<(), NativeImportError> {
+    if timed_out || !succeeded || stdout_overflowed || stderr_overflowed {
+        Err(snapshot_unavailable())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -169,14 +245,16 @@ mod windows {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{classify_process_snapshot, snapshot_unavailable};
+    use super::{
+        classify_process_snapshot, ensure_snapshot_execution_succeeded, snapshot_unavailable,
+    };
     use crate::NativeImportError;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(3);
     const MAX_STDOUT_BYTES: usize = 1024 * 1024;
     const MAX_STDERR_BYTES: usize = 64 * 1024;
-    const PROCESS_SNAPSHOT_SCRIPT: &str = "$selfPid=$PID; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $selfPid } | Select-Object Name,ProcessId,CommandLine); ConvertTo-Json -InputObject @($rows) -Compress -Depth 2";
+    const PROCESS_SNAPSHOT_SCRIPT: &str = "$selfPid=$PID; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $selfPid } | Select-Object Name,ProcessId,ParentProcessId,CommandLine); ConvertTo-Json -InputObject @($rows) -Compress -Depth 2";
 
     pub(super) fn ensure_codex_not_running_excluding(
         excluded_process_ids: &[u32],
@@ -218,9 +296,9 @@ mod windows {
                 Ok(None) | Err(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(snapshot_unavailable());
+                    drop(stdout_reader);
+                    drop(stderr_reader);
+                    return ensure_snapshot_execution_succeeded(true, false, false, false);
                 }
             }
         };
@@ -232,9 +310,12 @@ mod windows {
             .join()
             .map_err(|_| snapshot_unavailable())?
             .map_err(|_| snapshot_unavailable())?;
-        if !status.success() || stdout.overflowed || stderr.overflowed {
-            return Err(snapshot_unavailable());
-        }
+        ensure_snapshot_execution_succeeded(
+            false,
+            status.success(),
+            stdout.overflowed,
+            stderr.overflowed,
+        )?;
         let output = String::from_utf8(stdout.bytes).map_err(|_| snapshot_unavailable())?;
         classify_process_snapshot(&output, excluded_process_ids)
     }
@@ -278,4 +359,28 @@ pub fn ensure_codex_not_running_excluding(
 
 pub fn ensure_codex_not_running() -> Result<(), NativeImportError> {
     ensure_codex_not_running_excluding(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_nonzero_and_bounded_output_overflow_fail_closed() {
+        for (timed_out, succeeded, stdout_overflowed, stderr_overflowed) in [
+            (true, false, false, false),
+            (false, false, false, false),
+            (false, true, true, false),
+            (false, true, false, true),
+        ] {
+            let error = ensure_snapshot_execution_succeeded(
+                timed_out,
+                succeeded,
+                stdout_overflowed,
+                stderr_overflowed,
+            )
+            .unwrap_err();
+            assert!(matches!(error, NativeImportError::Verification(_)));
+        }
+    }
 }

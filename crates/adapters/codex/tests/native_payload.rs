@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentark_adapter_codex::{
-    NativeRolloutPayload, build_canonical_continuation_source, canonical_visible_history,
-    collect_native_rollouts, native_thread_expectation, restore_native_rollouts,
+    NativeImportError, NativePayloadError, NativeRolloutPayload,
+    build_canonical_continuation_source, canonical_visible_history, collect_native_rollouts,
+    native_thread_expectation, restore_native_rollouts, restore_native_rollouts_guarded,
     rewrite_native_workspace_paths, sanitize_rollout_bytes,
 };
 use agentark_canonical::{
@@ -390,6 +392,93 @@ fn restores_native_rollout_to_codex_home_with_mapping() {
     assert!(text.contains(r#""cwd":"C:\\target\\project""#));
     assert!(report.backup_path.is_some());
     assert_eq!(report.written_paths.len(), 1);
+}
+
+#[test]
+fn guarded_restore_checks_before_backup_temp_write_and_target_rename() {
+    let root = tempdir().unwrap();
+    let codex_home = root.path().join("codex");
+    let backup_root = root.path().join("backups");
+    let destination = codex_home
+        .join("sessions")
+        .join("2026/08/23/rollout-native.jsonl");
+    let payload = NativeRolloutPayload {
+        session_id: Uuid::from_u128(304),
+        relative_path: "2026/08/23/rollout-native.jsonl".into(),
+        bytes: br#"{"type":"session_meta","payload":{"session_id":"native-thread","cwd":"C:\\source\\project"}}
+"#
+        .to_vec(),
+        source_hash: Sha256Digest::from_bytes(b"source"),
+        redaction_count: 0,
+    };
+    let checks = AtomicUsize::new(0);
+
+    let report =
+        restore_native_rollouts_guarded(&codex_home, &[payload], &[], &backup_root, &|| {
+            match checks.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert!(!backup_root.exists());
+                    assert!(!destination.exists());
+                }
+                1 => {
+                    assert!(backup_root.is_dir());
+                    assert!(!destination.exists());
+                }
+                2 => {
+                    let parent = destination.parent().unwrap();
+                    assert!(parent.is_dir());
+                    assert!(fs::read_dir(parent).unwrap().any(|entry| {
+                        entry.unwrap().path().extension().and_then(|v| v.to_str()) == Some("tmp")
+                    }));
+                    assert!(!destination.exists());
+                }
+                _ => panic!("unexpected extra process guard"),
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(checks.load(Ordering::SeqCst), 3);
+    assert_eq!(report.imported_count, 1);
+    assert!(destination.is_file());
+}
+
+#[test]
+fn guarded_restore_requires_manual_intervention_when_post_commit_rollback_is_blocked() {
+    let root = tempdir().unwrap();
+    let codex_home = root.path().join("codex");
+    let destination = codex_home
+        .join("sessions")
+        .join("2026/08/23/rollout-native.jsonl");
+    let payload = NativeRolloutPayload {
+        session_id: Uuid::from_u128(305),
+        relative_path: "2026/08/23/rollout-native.jsonl".into(),
+        bytes: br#"{"type":"turn_context","payload":{"cwd":"C:\\source\\project"}}
+"#
+        .to_vec(),
+        source_hash: Sha256Digest::from_bytes(b"source"),
+        redaction_count: 0,
+    };
+    let checks = AtomicUsize::new(0);
+
+    let error = restore_native_rollouts_guarded(
+        &codex_home,
+        &[payload],
+        &[],
+        &root.path().join("backups"),
+        &|| match checks.fetch_add(1, Ordering::SeqCst) {
+            0..=2 => Ok(()),
+            _ => Err(NativeImportError::CodexRunning),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        NativePayloadError::NativeImport(NativeImportError::ManualIntervention)
+    ));
+    assert_eq!(checks.load(Ordering::SeqCst), 4);
+    assert!(destination.is_file());
 }
 
 #[test]

@@ -437,6 +437,25 @@ pub fn restore_native_rollouts(
     workspace_mappings: &[(String, String)],
     backup_root: &Path,
 ) -> Result<NativeRestoreReport, NativePayloadError> {
+    restore_native_rollouts_guarded(
+        codex_home,
+        payloads,
+        workspace_mappings,
+        backup_root,
+        &|| Ok(()),
+    )
+}
+
+pub fn restore_native_rollouts_guarded<G>(
+    codex_home: &Path,
+    payloads: &[NativeRolloutPayload],
+    workspace_mappings: &[(String, String)],
+    backup_root: &Path,
+    guard: &G,
+) -> Result<NativeRestoreReport, NativePayloadError>
+where
+    G: Fn() -> Result<(), crate::NativeImportError> + ?Sized,
+{
     let mut planned = Vec::new();
     let mut skipped_count = 0u64;
     for payload in payloads {
@@ -466,6 +485,7 @@ pub fn restore_native_rollouts(
         .iter()
         .map(|(_, destination, _)| destination.clone())
         .collect::<Vec<_>>();
+    guard()?;
     let backup_path = Some(crate::backup_codex_targets(
         codex_home,
         backup_root,
@@ -475,19 +495,30 @@ pub fn restore_native_rollouts(
     let mut mappings = Vec::new();
     let result = (|| {
         for (payload, destination, bytes) in planned {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            crate::write_rollout_atomic(&destination, std::slice::from_ref(&bytes))?;
+            crate::write_rollout_atomic_guarded(&destination, std::slice::from_ref(&bytes), guard)?;
+            written.push(destination.clone());
             let thread_id = extract_thread_id(&bytes)?;
             mappings.push((payload.session_id.to_string(), thread_id));
-            written.push(destination);
         }
         Ok::<(), NativePayloadError>(())
     })();
     if let Err(error) = result {
-        for path in written {
-            let _ = fs::remove_file(path);
+        let mut cleanup_failed = false;
+        for path in &written {
+            if guard().is_err() {
+                cleanup_failed = true;
+                continue;
+            }
+            if let Err(remove_error) = fs::remove_file(path)
+                && remove_error.kind() != std::io::ErrorKind::NotFound
+            {
+                cleanup_failed = true;
+            }
+        }
+        if cleanup_failed {
+            return Err(NativePayloadError::NativeImport(
+                crate::NativeImportError::ManualIntervention,
+            ));
         }
         return Err(error);
     }
