@@ -65,6 +65,7 @@ pub struct BundleReport {
     pub restore_mapping_count: u64,
     pub recovery_error: Option<String>,
     pub manual_intervention_count: u64,
+    pub provider_labels: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -570,6 +571,12 @@ impl AppState {
                 .all_sessions_filtered(agent_kind.clone())
                 .map_err(|_| "无法读取本地会话".to_owned())?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+            let provider_labels = safe_provider_labels(
+                sessions
+                    .iter()
+                    .filter_map(|session| session.model_provider.as_deref()),
+                &scanner,
+            );
             let selected = workspace_ids
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>();
@@ -618,7 +625,13 @@ impl AppState {
                 &scanner,
             )
             .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
-            append_audit_event(&self.data_root, "bundle.exported", &path, None)?;
+            append_audit_event(
+                &self.data_root,
+                "bundle.exported",
+                &path,
+                None,
+                &provider_labels,
+            )?;
             Ok(BundleReport {
                 format: manifest.format,
                 agent: manifest.agent,
@@ -643,6 +656,7 @@ impl AppState {
                 restore_mapping_count: 0,
                 recovery_error: None,
                 manual_intervention_count: 0,
+                provider_labels,
             })
         })();
         let _ = self.refresh_query_index();
@@ -651,6 +665,17 @@ impl AppState {
 
     pub fn bundle_verify(&self, path: PathBuf) -> Result<BundleReport, String> {
         let bundle = read_bundle(&path).map_err(|_| "无法验证 .ahbundle 文件".to_owned())?;
+        let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+        let recovery_manifest = bundle
+            .recovery_manifest()
+            .map_err(|_| "备份中的恢复清单无效".to_owned())?;
+        let provider_labels = safe_provider_labels(
+            recovery_manifest
+                .iter()
+                .flat_map(|manifest| manifest.sessions.iter())
+                .filter_map(|session| session.source_provider.as_deref()),
+            &scanner,
+        );
         let mut conflict_count = 0;
         let restore_root = self.data_root.join("restored-workspaces");
         for entry in bundle
@@ -694,6 +719,7 @@ impl AppState {
             restore_mapping_count: 0,
             recovery_error: None,
             manual_intervention_count: 0,
+            provider_labels,
         })
     }
 
@@ -744,6 +770,13 @@ impl AppState {
         let mut sessions = bundle
             .session_records()
             .map_err(|_| "备份中的会话数据无效".to_owned())?;
+        let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+        let provider_labels = safe_provider_labels(
+            sessions
+                .iter()
+                .filter_map(|session| session.model_provider.as_deref()),
+            &scanner,
+        );
         let workspace_ids = bundle
             .workspace_ids()
             .map_err(|_| "备份中的项目清单无效".to_owned())?;
@@ -809,7 +842,13 @@ impl AppState {
             let scan_id = index
                 .restore_sessions(&sessions)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
-            append_audit_event(&self.data_root, "bundle.restored", &path, Some(scan_id))?;
+            append_audit_event(
+                &self.data_root,
+                "bundle.restored",
+                &path,
+                Some(scan_id),
+                &provider_labels,
+            )?;
             let mut native_identity_count = 0u64;
             let mut continuation_count = 0u64;
             let mut archive_only_count = 0u64;
@@ -942,6 +981,7 @@ impl AppState {
                 restore_mapping_count,
                 recovery_error,
                 manual_intervention_count,
+                provider_labels,
             })
         })();
         let _ = self.refresh_query_index();
@@ -1110,6 +1150,7 @@ fn append_audit_event(
     event_type: &str,
     path: &Path,
     target: Option<Uuid>,
+    provider_labels: &[String],
 ) -> Result<(), String> {
     let event = AuditEvent {
         event_id: Uuid::new_v4(),
@@ -1125,12 +1166,33 @@ fn append_audit_event(
         after_hash: None,
         plan_hash: None,
         result: "success".into(),
+        provider_labels: provider_labels.to_vec(),
         previous_hash: None,
         event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
     };
     append_event(&root.join("audit.jsonl"), event)
         .map(|_| ())
         .map_err(|_| "无法写入审计账本".to_owned())
+}
+
+fn safe_provider_labels<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    scanner: &SecretScanner,
+) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let label = value.trim();
+            (!label.is_empty()
+                && scanner.sanitize(label).findings.is_empty()
+                && label.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                }))
+            .then(|| label.to_owned())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {

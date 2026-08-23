@@ -34,6 +34,8 @@ pub struct AuditEvent {
     pub after_hash: Option<Sha256Digest>,
     pub plan_hash: Option<Sha256Digest>,
     pub result: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_labels: Vec<String>,
     pub previous_hash: Option<Sha256Digest>,
     pub event_hash: Sha256Digest,
 }
@@ -206,6 +208,7 @@ mod tests {
             after_hash: None,
             plan_hash: None,
             result: "success".into(),
+            provider_labels: Vec::new(),
             previous_hash: None,
             event_hash: Sha256Digest::from_bytes(b"pending"),
         }

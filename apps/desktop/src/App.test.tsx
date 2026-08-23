@@ -16,7 +16,7 @@ const { invoke, dialog, dialogState, restoreResult } = vi.hoisted(() => ({
     open: vi.fn<() => Promise<string | null>>(() => Promise.resolve('C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle')),
   },
   restoreResult: {
-    format: '1.1', sessionCount: 4, entryCount: 4, workspaceCount: 1, fileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: 'scan-1', agent: 'codex', nativeIdentityCount: 2, continuationCount: 1, archiveOnlyCount: 1, restoreMappingCount: 3, manualInterventionCount: 0, recoveryError: undefined as string | undefined,
+    format: '1.1', sessionCount: 4, entryCount: 4, workspaceCount: 1, fileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: 'scan-1', agent: 'codex', nativeIdentityCount: 2, continuationCount: 1, archiveOnlyCount: 1, restoreMappingCount: 3, manualInterventionCount: 0, recoveryError: undefined as string | undefined, providerLabels: ['openai'],
   },
   invoke: vi.fn((command: string) => {
     if (command === 'status') return Promise.resolve({ datasetState: 'ready', capabilities: ['read'], schemaFingerprint: 'sha256:test' });

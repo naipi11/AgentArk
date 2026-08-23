@@ -1,11 +1,14 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use agentark_adapter_codex::{CodexContinuationReport, NativeRestoreReport};
-use agentark_bundle::{NativeBundleEntry, write_selected_sessions_with_native};
+use agentark_adapter_codex::{
+    CodexContinuationReport, CodexContinuationRequest, CodexError, JsonRpcTransport,
+    NativeRestoreReport, RawJsonRpc, fork_rollout_with_target_provider_transport,
+};
+use agentark_bundle::{NativeBundleEntry, read_bundle, write_selected_sessions_with_native};
 use agentark_canonical::{
     AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession, Completeness,
 };
@@ -15,7 +18,11 @@ use agentark_desktop_lib::recovery::{
 use agentark_desktop_lib::{AppState, RestoreMappingWriter};
 use agentark_index::{IndexDb, RestoreMapping};
 use agentark_security::SecretScanner;
+use serde_json::{Value, json};
 use uuid::Uuid;
+
+const SAFE_PROVIDER_LABEL: &str = "openai";
+const PROVIDER_TOKEN_CANARY: &str = "sk-proj-AgentArkProviderCanary1234567890123456";
 
 struct TempRoot(PathBuf);
 
@@ -221,6 +228,111 @@ fn fake_executor() -> FakeExecutor {
     }
 }
 
+struct ReleaseCanaryTransport {
+    sent: Arc<Mutex<Vec<Value>>>,
+    responses: VecDeque<Value>,
+}
+
+impl ReleaseCanaryTransport {
+    fn new(responses: Vec<Value>) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                sent: Arc::clone(&sent),
+                responses: responses.into(),
+            },
+            sent,
+        )
+    }
+}
+
+impl JsonRpcTransport for ReleaseCanaryTransport {
+    fn send_value(&mut self, value: &Value) -> Result<(), CodexError> {
+        self.sent.lock().unwrap().push(value.clone());
+        Ok(())
+    }
+
+    fn receive_value(&mut self) -> Result<RawJsonRpc, CodexError> {
+        let value = self.responses.pop_front().ok_or(CodexError::EndOfStream)?;
+        Ok(RawJsonRpc {
+            bytes: serde_json::to_vec(&value).unwrap(),
+            value,
+        })
+    }
+}
+
+fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> String {
+    let codex_home = root.path().join("request-codex-home");
+    let sessions = codex_home.join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = root.path().join("request-project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(
+        &source_rollout,
+        format!(r#"{{"provider":"{SAFE_PROVIDER_LABEL}","apiKey":"{PROVIDER_TOKEN_CANARY}"}}"#),
+    )
+    .unwrap();
+    fs::write(&target_rollout, b"target rollout").unwrap();
+
+    let target_thread_id = "019release-canary-target";
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {"data": [], "nextCursor": null}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {
+                "modelProvider": SAFE_PROVIDER_LABEL,
+                "model": "gpt-5",
+                "thread": {
+                    "id": target_thread_id,
+                    "path": target_rollout,
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "result": {
+                "data": [{"id": target_thread_id, "cwd": target_cwd}],
+                "nextCursor": null
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "result": {
+                "thread": {
+                    "id": target_thread_id,
+                    "cwd": target_cwd,
+                    "turns": [{"id": "turn-1"}]
+                }
+            }
+        }),
+    ];
+    let (mut transport, sent) = ReleaseCanaryTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019release-canary-source".into(),
+        target_cwd,
+        target_provider: Some(SAFE_PROVIDER_LABEL.into()),
+        target_model: Some("gpt-5".into()),
+    };
+
+    fork_rollout_with_target_provider_transport(&mut transport, &codex_home, &request).unwrap();
+
+    let sent = sent.lock().unwrap();
+    serde_json::to_string(
+        sent.iter()
+            .find(|value| value["method"] == "thread/fork")
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 fn session(id: u128, native_id: &str) -> CanonicalSession {
     let session_id = Uuid::from_u128(id);
     let mut message =
@@ -361,6 +473,69 @@ fn missing_source_provider_falls_back_to_target_default_continuation() {
     assert_eq!(report.native_identity_count, 0);
     assert_eq!(report.continuation_count, 1);
     assert_eq!(report.archive_only_count, 0);
+}
+
+#[test]
+fn provider_token_canary_stays_out_of_release_sinks_while_label_survives() {
+    let request_root = TempRoot::new("provider-token-request");
+    let continuation_request = serialized_continuation_request_with_provider_canary(&request_root);
+
+    let mut canary_session = session(7, "native-provider-canary");
+    canary_session.model_provider = Some(SAFE_PROVIDER_LABEL.into());
+    canary_session.raw_extra = BTreeMap::from([(
+        "providerConfiguration".into(),
+        json!({"apiKey": PROVIDER_TOKEN_CANARY}),
+    )]);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture(&executor, vec![canary_session], "codex", true).unwrap();
+
+    let bundle = read_bundle(&fixture._root.path().join("fixture.ahbundle")).unwrap();
+    let recovery_manifest = String::from_utf8(
+        bundle
+            .entries
+            .get("recovery/manifest.json")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let mapping = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let restore_mapping = format!("{mapping:?}");
+    let ui_report = serde_json::to_string(&fixture.report).unwrap();
+    let audit_event = fs::read_to_string(fixture._root.path().join("data/audit.jsonl")).unwrap();
+    assert!(fixture.state.audit_verify().unwrap().valid);
+
+    let sinks = [
+        ("native continuation request", continuation_request),
+        ("recovery manifest", recovery_manifest),
+        ("restore mapping", restore_mapping),
+        ("UI report", ui_report),
+        ("audit event", audit_event),
+    ];
+    let leaked_tokens = sinks
+        .iter()
+        .filter_map(|(name, value)| value.contains(PROVIDER_TOKEN_CANARY).then_some(*name))
+        .collect::<Vec<_>>();
+    let missing_labels = sinks
+        .iter()
+        .filter_map(|(name, value)| (!value.contains(SAFE_PROVIDER_LABEL)).then_some(*name))
+        .collect::<Vec<_>>();
+
+    assert!(
+        leaked_tokens.is_empty(),
+        "provider token canary leaked into: {leaked_tokens:?}"
+    );
+    assert!(
+        missing_labels.is_empty(),
+        "safe provider label missing from: {missing_labels:?}"
+    );
 }
 
 #[test]
