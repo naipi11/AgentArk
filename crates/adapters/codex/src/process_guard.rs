@@ -373,8 +373,14 @@ fn cmd_statement_runs_codex(words: &[CmdWord], nesting: usize) -> Result<bool, N
 
 fn cmd_start_runs_codex(arguments: &[CmdWord], nesting: usize) -> Result<bool, NativeImportError> {
     let mut index = 0usize;
-    while let Some(option) = arguments.get(index) {
-        let option = option.value.to_ascii_lowercase();
+    let mut title_consumed = false;
+    while let Some(word) = arguments.get(index) {
+        if word.quoted && !title_consumed {
+            title_consumed = true;
+            index += 1;
+            continue;
+        }
+        let option = word.value.to_ascii_lowercase();
         if !option.starts_with('/') {
             break;
         }
@@ -391,9 +397,6 @@ fn cmd_start_runs_codex(arguments: &[CmdWord], nesting: usize) -> Result<bool, N
             }
             _ => return Err(snapshot_unavailable()),
         }
-    }
-    if arguments.get(index).is_some_and(|word| word.quoted) {
-        index += 1;
     }
     let target = arguments.get(index).ok_or_else(snapshot_unavailable)?;
     if target.value.starts_with(['%', '!', '(']) {

@@ -828,6 +828,8 @@ fn host_parsers_classify_execution_positions_instead_of_data_arguments() {
 fn cmd_start_preserves_window_title_and_switch_value_metadata() {
     for (index, command_line) in [
         r#"cmd.exe /c start "AgentArk" C:\tools\codex.cmd"#,
+        r#"cmd.exe /c start "" /WAIT C:\tools\codex.cmd"#,
+        r#"cmd.exe /c start "AgentArk" /D C:\safe C:\tools\codex.cmd"#,
         r#"cmd.exe /c start /D C:\safe "AgentArk" C:\tools\codex.cmd"#,
         r#"cmd.exe /c start /WAIT "AgentArk" cmd.exe /c C:\tools\codex.cmd"#,
     ]
@@ -840,6 +842,7 @@ fn cmd_start_preserves_window_title_and_switch_value_metadata() {
 
     for (index, command_line) in [
         r#"cmd.exe /c start "C:\tools\codex.cmd" notepad.exe"#,
+        r#"cmd.exe /c start "C:\tools\codex.cmd" /WAIT notepad.exe"#,
         r#"cmd.exe /c start /D C:\tools\codex.cmd "AgentArk" notepad.exe"#,
     ]
     .into_iter()
