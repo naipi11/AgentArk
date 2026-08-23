@@ -19,6 +19,12 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const [busy, setBusy] = useState(false);
   const [busyAction, setBusyAction] = useState<'export' | 'import' | 'restore' | null>(null);
 
+  function safeRecoveryDiagnostic(value: string | undefined) {
+    return value && /^[a-z0-9][a-z0-9-]{0,127}$/.test(value)
+      ? value
+      : t('transfer.recoveryDiagnosticsUnavailable');
+  }
+
   useEffect(() => {
     void api.workspacesList(100, 0, agentKind === 'all' ? undefined : agentKind).then((items) => {
       setProjects(items);
@@ -111,7 +117,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         <span>{t('transfer.continuationSummary').replace('{count}', String(restoreReport.continuationCount))}</span>
         <span>{t('transfer.archiveOnlySummary').replace('{count}', String(restoreReport.archiveOnlyCount))}</span>
         {restoreReport.manualInterventionCount > 0 && <span>{t('transfer.manualInterventionSummary').replace('{count}', String(restoreReport.manualInterventionCount))}</span>}
-        {restoreReport.recoveryError && <details><summary>{t('transfer.recoveryDiagnostics')}</summary><span className="muted">{restoreReport.recoveryError}</span></details>}
+        {restoreReport.recoveryError && <details><summary>{t('transfer.recoveryDiagnostics')}</summary><span className="muted">{safeRecoveryDiagnostic(restoreReport.recoveryError)}</span></details>}
       </div>}
     </section>
   );

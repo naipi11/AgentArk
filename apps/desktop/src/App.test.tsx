@@ -120,9 +120,9 @@ test('transfer outcome localizes the continuation count in Chinese', async () =>
   expect(await screen.findByText(/已创建 1 个延续会话/)).toBeInTheDocument();
 });
 
-test('transfer keeps recovery diagnostics in a disclosure alongside the count summary', async () => {
+test('transfer replaces unsafe recovery diagnostics in the closed disclosure', async () => {
   restoreResult.manualInterventionCount = 1;
-  restoreResult.recoveryError = 'codex-recovery-partial: backup-2026.ahbundle';
+  restoreResult.recoveryError = 'https://token.example/recovery?access_token=secret';
   render(<LocaleProvider><App /></LocaleProvider>);
   await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
   fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
@@ -133,5 +133,16 @@ test('transfer keeps recovery diagnostics in a disclosure alongside the count su
   const diagnostics = screen.getByText('Recovery diagnostics').closest('details');
   expect(diagnostics).toBeInTheDocument();
   expect(diagnostics).not.toHaveAttribute('open');
-  expect(screen.getByText('codex-recovery-partial: backup-2026.ahbundle')).toBeInTheDocument();
+  expect(screen.queryByText('https://token.example/recovery?access_token=secret')).not.toBeInTheDocument();
+  expect(screen.getByText('Recovery diagnostics unavailable.')).toBeInTheDocument();
+});
+
+test('transfer displays allow-listed recovery diagnostic reason codes', async () => {
+  restoreResult.recoveryError = 'codex-recovery-partial';
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
+  expect(await screen.findByText('codex-recovery-partial')).toBeInTheDocument();
 });
