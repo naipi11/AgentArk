@@ -59,15 +59,13 @@ pub fn decide_recovery(
             reason_code: "native-identity-verified".into(),
         };
     }
-    if continuation_writer_verified {
-        if let Some(target_provider) = target_default {
-            return RecoveryDecision {
-                outcome: RestoreOutcome::Continuation,
-                source_provider: source,
-                target_provider: Some(target_provider),
-                reason_code: "target-default-continuation".into(),
-            };
-        }
+    if continuation_writer_verified && let Some(target_provider) = target_default {
+        return RecoveryDecision {
+            outcome: RestoreOutcome::Continuation,
+            source_provider: source,
+            target_provider: Some(target_provider),
+            reason_code: "target-default-continuation".into(),
+        };
     }
     RecoveryDecision {
         outcome: RestoreOutcome::ArchiveOnly,
