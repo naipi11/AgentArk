@@ -14,7 +14,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const [includeFiles, setIncludeFiles] = useState(true);
   const [path, setPath] = useState('');
   const [preview, setPreview] = useState<BundleReport | null>(null);
-  const [restoreNativeCodex, setRestoreNativeCodex] = useState(true);
+  const [restoreReport, setRestoreReport] = useState<BundleReport | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyAction, setBusyAction] = useState<'export' | 'import' | 'restore' | null>(null);
@@ -44,7 +44,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     if (!selectedPath) return;
     if (!selectedPath.toLowerCase().endsWith('.ahbundle')) selectedPath += '.ahbundle';
     setPath(selectedPath);
-    setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null);
+    setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null); setRestoreReport(null);
     try {
       const report = await api.bundleExport(selectedPath, agentKind === 'all' ? undefined : agentKind, selected, includeFiles);
       setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
@@ -68,11 +68,10 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     const chosenPath = Array.isArray(selectedPath) ? selectedPath[0] : selectedPath;
     if (!chosenPath) return;
     setPath(chosenPath);
-    setBusy(true); setBusyAction('import'); setMessage(null);
+    setBusy(true); setBusyAction('import'); setMessage(null); setRestoreReport(null);
     try {
       const report = await api.bundleVerify(chosenPath);
       setPreview(report);
-      setRestoreNativeCodex(report.agent === 'codex');
     }
     catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
@@ -81,15 +80,9 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   async function restoreHistory() {
     setBusy(true); setBusyAction('restore'); setMessage(null);
     try {
-      const report = await api.bundleRestore(path, restoreNativeCodex);
-      const nativeSummary = report.nativePayloadCount > 0
-        ? ` · ${report.nativeImportedCount} ${t('transfer.nativeSummary')} · ${report.nativeSkippedCount} ${t('transfer.nativeSkipped')} · ${report.nativeConflictCount} ${t('transfer.nativeConflict')}`
-        : '';
-      const nativeBackup = report.nativeBackupPath
-        ? ` · ${t('transfer.nativeBackup')}: ${report.nativeBackupPath}`
-        : '';
-      const nativeError = report.nativeError ? ` · ${t('transfer.nativeError')}: ${report.nativeError}` : '';
-      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files${nativeSummary}${nativeBackup}${nativeError}`);
+      const report = await api.bundleRestore(path);
+      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
+      setRestoreReport(report);
       setPreview(null);
     } catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
@@ -106,13 +99,20 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         {projects.map((project) => <label key={project.id} className="transfer-project"><input type="checkbox" checked={selectedSet.has(project.id)} onChange={() => toggleProject(project.id)} /><span>{project.pathNative}</span><small>{project.sessionCount} {t('projects.sessions')}</small></label>)}
       </div>
       <label className="transfer-files"><input type="checkbox" checked={includeFiles} onChange={(event) => setIncludeFiles(event.target.checked)} />{t('transfer.files')}</label>
-      {preview?.agent === 'codex' && <label className="transfer-files"><input type="checkbox" checked={restoreNativeCodex} onChange={(event) => setRestoreNativeCodex(event.target.checked)} />{t('transfer.nativeRestore')}</label>}
       <div className="button-row">
         <button className="primary-button" type="button" disabled={busy} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
         <button type="button" disabled={busy} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
       </div>
-      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span>{preview.agent === 'codex' && restoreNativeCodex && <span className="muted">{t('transfer.nativeRestart')}</span>}<button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
+      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><span className="muted">{t('transfer.automaticRecovery')}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
       {message && <p className="muted" role="status">{message}</p>}
+      {restoreReport && <div className="transfer-preview" role="status">
+        <strong>{t('transfer.outcomeSummary')}</strong>
+        <span>{t('transfer.nativeIdentitySummary').replace('{count}', String(restoreReport.nativeIdentityCount))}</span>
+        <span>{t('transfer.continuationSummary').replace('{count}', String(restoreReport.continuationCount))}</span>
+        <span>{t('transfer.archiveOnlySummary').replace('{count}', String(restoreReport.archiveOnlyCount))}</span>
+        {restoreReport.manualInterventionCount > 0 && <span>{t('transfer.manualInterventionSummary').replace('{count}', String(restoreReport.manualInterventionCount))}</span>}
+        {restoreReport.recoveryError && <details><summary>{t('transfer.recoveryDiagnostics')}</summary><span className="muted">{restoreReport.recoveryError}</span></details>}
+      </div>}
     </section>
   );
 }

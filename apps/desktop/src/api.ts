@@ -69,13 +69,6 @@ export type BundleReport = {
   redacted: boolean;
   redactionCount: number;
   restoreScanId?: string;
-  nativePayloadCount: number;
-  nativeImportedCount: number;
-  nativeSkippedCount: number;
-  nativeConflictCount: number;
-  nativeBackupPath?: string;
-  nativeRestartRequired: boolean;
-  nativeError?: string;
   nativeIdentityCount: number;
   continuationCount: number;
   archiveOnlyCount: number;
