@@ -824,6 +824,100 @@ fn host_parsers_classify_execution_positions_instead_of_data_arguments() {
     }
 }
 
+#[test]
+fn cmd_start_preserves_window_title_and_switch_value_metadata() {
+    for (index, command_line) in [
+        r#"cmd.exe /c start "AgentArk" C:\tools\codex.cmd"#,
+        r#"cmd.exe /c start /D C:\safe "AgentArk" C:\tools\codex.cmd"#,
+        r#"cmd.exe /c start /WAIT "AgentArk" cmd.exe /c C:\tools\codex.cmd"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("cmd.exe", 6900 + index, command_line);
+        assert!(ensure_codex_not_running_from_snapshot(&snapshot).is_err());
+    }
+
+    for (index, command_line) in [
+        r#"cmd.exe /c start "C:\tools\codex.cmd" notepad.exe"#,
+        r#"cmd.exe /c start /D C:\tools\codex.cmd "AgentArk" notepad.exe"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("cmd.exe", 7000 + index, command_line);
+        ensure_codex_not_running_from_snapshot(&snapshot).unwrap();
+    }
+}
+
+#[test]
+fn node_eval_ignores_comments_and_classifies_static_esm_execution_slots() {
+    let codex_js = r#"C:\\node_modules\\@openai\\codex\\bin\\codex.js"#;
+    for (index, command_line) in [
+        format!(r#"node.exe --input-type module -e "import '{codex_js}'""#),
+        format!(r#"node.exe --input-type=module -e "import codex from '{codex_js}'""#),
+        format!(r#"node.exe -e "import('{codex_js}')""#),
+        format!(r#"node.exe -e "import(target + '{codex_js}')""#),
+        format!(r#"node.exe -e "require(getPath('{codex_js}'))""#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("node.exe", 7100 + index, &command_line);
+        assert!(ensure_codex_not_running_from_snapshot(&snapshot).is_err());
+    }
+
+    for (index, command_line) in [
+        format!(
+            "node.exe --input-type module -e \"// require('{codex_js}')\nconsole.log('safe')\""
+        ),
+        format!(
+            r#"node.exe --input-type=module -e "/* require('{codex_js}') */ console.log('safe')""#
+        ),
+        format!(
+            r#"node.exe --input-type module -e "import safe from 'C:\\safe.js'; console.log('{codex_js}')""#
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("node.exe", 7200 + index, &command_line);
+        ensure_codex_not_running_from_snapshot(&snapshot).unwrap();
+    }
+}
+
+#[test]
+fn npm_global_options_consume_values_before_locating_subcommands() {
+    for (index, (name, command_line)) in [
+        ("npm.exe", r#"npm.exe --prefix C:\work exec @openai/codex"#),
+        ("npm.exe", r#"npm.exe --prefix=C:\work exec @openai/codex"#),
+        ("npm.exe", r#"npm.exe --workspace packages/app run codex"#),
+        ("npm.exe", r#"npm.exe -w packages/app run codex"#),
+        ("npm.exe", r#"npm.exe --workspace=packages/app run codex"#),
+        ("npx.exe", r#"npx.exe --prefix C:\work @openai/codex"#),
+        ("npm.exe", r#"npm.exe --mystery value exec @openai/codex"#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot(name, 7300 + index, command_line);
+        assert!(ensure_codex_not_running_from_snapshot(&snapshot).is_err());
+    }
+
+    for (index, command_line) in [
+        r#"npm.exe --prefix C:\work view @openai/codex"#,
+        r#"npm.exe --prefix=C:\work install @openai/codex"#,
+        r#"npm.exe -w packages/app view @openai/codex"#,
+        r#"npm.exe --workspace=packages/app install @openai/codex"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("npm.exe", 7400 + index, command_line);
+        ensure_codex_not_running_from_snapshot(&snapshot).unwrap();
+    }
+}
+
 fn process_snapshot(name: &str, process_id: usize, command_line: &str) -> String {
     serde_json::to_string(&json!([{
         "Name": name,

@@ -335,41 +335,75 @@ fn cmd_script_runs_codex(script: &str, nesting: usize) -> Result<bool, NativeImp
         return Err(snapshot_unavailable());
     }
     for statement in cmd_statements(script).ok_or_else(snapshot_unavailable)? {
-        let tokens = command_line_tokens(&statement, false).ok_or_else(snapshot_unavailable)?;
-        if cmd_statement_runs_codex(&tokens, nesting)? {
+        let words = cmd_words(&statement).ok_or_else(snapshot_unavailable)?;
+        if cmd_statement_runs_codex(&words, nesting)? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn cmd_statement_runs_codex(tokens: &[String], nesting: usize) -> Result<bool, NativeImportError> {
-    if tokens.is_empty() {
+fn cmd_statement_runs_codex(words: &[CmdWord], nesting: usize) -> Result<bool, NativeImportError> {
+    if words.is_empty() {
         return Ok(false);
     }
     let mut command_index = 0usize;
-    let mut command = tokens[command_index].trim_start_matches('@');
+    let mut command = words[command_index].value.trim_start_matches('@');
     if command.eq_ignore_ascii_case("call") {
         command_index += 1;
-        command = tokens
+        command = words
             .get(command_index)
-            .map(|token| token.trim_start_matches('@'))
+            .map(|word| word.value.trim_start_matches('@'))
             .ok_or_else(snapshot_unavailable)?;
     }
     if command.starts_with(['%', '!', '(']) {
         return Err(snapshot_unavailable());
     }
     let basename = token_basename(command);
-    let arguments = &tokens[command_index + 1..];
+    let arguments = &words[command_index + 1..];
     if basename == "start" {
-        let (target_index, target) = arguments
-            .iter()
-            .enumerate()
-            .find(|(_, argument)| !argument.starts_with('/'))
-            .ok_or_else(snapshot_unavailable)?;
-        return command_target_runs_codex(target, &arguments[target_index + 1..], nesting);
+        return cmd_start_runs_codex(arguments, nesting);
     }
-    command_target_runs_codex(command, arguments, nesting)
+    let arguments = arguments
+        .iter()
+        .map(|word| word.value.clone())
+        .collect::<Vec<_>>();
+    command_target_runs_codex(command, &arguments, nesting)
+}
+
+fn cmd_start_runs_codex(arguments: &[CmdWord], nesting: usize) -> Result<bool, NativeImportError> {
+    let mut index = 0usize;
+    while let Some(option) = arguments.get(index) {
+        let option = option.value.to_ascii_lowercase();
+        if !option.starts_with('/') {
+            break;
+        }
+        match option.as_str() {
+            "/d" | "/node" | "/affinity" | "/machine" => {
+                if arguments.get(index + 1).is_none() {
+                    return Err(snapshot_unavailable());
+                }
+                index += 2;
+            }
+            "/b" | "/wait" | "/i" | "/min" | "/max" | "/low" | "/normal" | "/high"
+            | "/realtime" | "/abovenormal" | "/belownormal" | "/separate" | "/shared" => {
+                index += 1;
+            }
+            _ => return Err(snapshot_unavailable()),
+        }
+    }
+    if arguments.get(index).is_some_and(|word| word.quoted) {
+        index += 1;
+    }
+    let target = arguments.get(index).ok_or_else(snapshot_unavailable)?;
+    if target.value.starts_with(['%', '!', '(']) {
+        return Err(snapshot_unavailable());
+    }
+    let remaining = arguments[index + 1..]
+        .iter()
+        .map(|word| word.value.clone())
+        .collect::<Vec<_>>();
+    command_target_runs_codex(&target.value, &remaining, nesting)
 }
 
 fn command_target_runs_codex(
@@ -390,6 +424,7 @@ fn command_target_runs_codex(
 struct CmdWord {
     value: String,
     end: usize,
+    quoted: bool,
 }
 
 fn cmd_words(command_line: &str) -> Option<Vec<CmdWord>> {
@@ -397,6 +432,7 @@ fn cmd_words(command_line: &str) -> Option<Vec<CmdWord>> {
     let mut value = String::new();
     let mut started = false;
     let mut quoted = false;
+    let mut word_quoted = false;
     let mut end = 0usize;
     let mut characters = command_line.char_indices().peekable();
     while let Some((index, character)) = characters.next() {
@@ -406,12 +442,18 @@ fn cmd_words(command_line: &str) -> Option<Vec<CmdWord>> {
                 let (escaped_index, escaped) = characters.next()?;
                 end = escaped_index + escaped.len_utf8();
                 started = true;
-                if !matches!(escaped, '\r' | '\n') {
+                if escaped == '\r' {
+                    if characters.peek().is_some_and(|(_, next)| *next == '\n') {
+                        let (line_feed_index, line_feed) = characters.next()?;
+                        end = line_feed_index + line_feed.len_utf8();
+                    }
+                } else if escaped != '\n' {
                     value.push(escaped);
                 }
             }
             '"' => {
                 started = true;
+                word_quoted = true;
                 quoted = !quoted;
             }
             character if character.is_whitespace() && !quoted => {
@@ -419,8 +461,10 @@ fn cmd_words(command_line: &str) -> Option<Vec<CmdWord>> {
                     words.push(CmdWord {
                         value: std::mem::take(&mut value),
                         end: index,
+                        quoted: word_quoted,
                     });
                     started = false;
+                    word_quoted = false;
                 }
             }
             _ => {
@@ -433,7 +477,11 @@ fn cmd_words(command_line: &str) -> Option<Vec<CmdWord>> {
         return None;
     }
     if started {
-        words.push(CmdWord { value, end });
+        words.push(CmdWord {
+            value,
+            end,
+            quoted: word_quoted,
+        });
     }
     Some(words)
 }
@@ -447,15 +495,16 @@ fn cmd_statements(script: &str) -> Option<Vec<String>> {
         match character {
             '^' => {
                 let escaped = characters.next()?;
-                if escaped == '\r' {
-                    if characters.peek() == Some(&'\n') {
-                        characters.next();
-                    }
-                } else if escaped != '\n' {
-                    statement.push(escaped);
+                statement.push('^');
+                statement.push(escaped);
+                if escaped == '\r' && characters.peek() == Some(&'\n') {
+                    statement.push(characters.next()?);
                 }
             }
-            '"' => quoted = !quoted,
+            '"' => {
+                quoted = !quoted;
+                statement.push(character);
+            }
             '&' | '|' if !quoted => {
                 if characters.peek() == Some(&character) {
                     characters.next();
@@ -497,6 +546,21 @@ fn node_argv_runs_codex(tokens: &[String], nesting: usize) -> Result<bool, Nativ
             "-e" | "--eval" | "-p" | "--print" => {
                 let source = tokens.get(index + 1).ok_or_else(snapshot_unavailable)?;
                 return node_eval_runs_codex(source);
+            }
+            "--input-type" => {
+                if tokens.get(index + 1).is_none() {
+                    return Err(snapshot_unavailable());
+                }
+                index += 2;
+            }
+            _ if argument.starts_with("--input-type=") => {
+                if tokens[index]
+                    .split_once('=')
+                    .is_none_or(|(_, value)| value.is_empty())
+                {
+                    return Err(snapshot_unavailable());
+                }
+                index += 1;
             }
             _ if argument.starts_with("--require=") || argument.starts_with("--import=") => {
                 let module = tokens[index]
@@ -561,6 +625,32 @@ fn node_eval_runs_codex(source: &str) -> Result<bool, NativeImportError> {
             index += 1;
             continue;
         }
+        if character == '/' && characters.get(index + 1) == Some(&'/') {
+            index += 2;
+            while characters
+                .get(index)
+                .is_some_and(|character| *character != '\n')
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if character == '/' && characters.get(index + 1) == Some(&'*') {
+            index += 2;
+            let mut closed = false;
+            while index + 1 < characters.len() {
+                if characters[index] == '*' && characters[index + 1] == '/' {
+                    index += 2;
+                    closed = true;
+                    break;
+                }
+                index += 1;
+            }
+            if !closed {
+                return Err(snapshot_unavailable());
+            }
+            continue;
+        }
         if character.is_ascii_alphabetic() || character == '_' {
             let start = index;
             while index < characters.len()
@@ -569,59 +659,15 @@ fn node_eval_runs_codex(source: &str) -> Result<bool, NativeImportError> {
                 index += 1;
             }
             let identifier = characters[start..index].iter().collect::<String>();
-            if matches!(identifier.as_str(), "require" | "import") {
-                while characters
-                    .get(index)
-                    .is_some_and(|character| character.is_whitespace())
-                {
-                    index += 1;
-                }
-                if characters.get(index) != Some(&'(') {
-                    continue;
-                }
-                index += 1;
-                while characters
-                    .get(index)
-                    .is_some_and(|character| character.is_whitespace())
-                {
-                    index += 1;
-                }
-                let delimiter = *characters.get(index).ok_or_else(snapshot_unavailable)?;
-                if !matches!(delimiter, '\'' | '"') {
-                    return Err(snapshot_unavailable());
-                }
-                index += 1;
-                let mut module = String::new();
-                while let Some(character) = characters.get(index).copied() {
-                    if character == '\\' {
-                        let escaped =
-                            *characters.get(index + 1).ok_or_else(snapshot_unavailable)?;
-                        module.push(escaped);
-                        index += 2;
-                    } else if character == delimiter {
-                        break;
-                    } else {
-                        module.push(character);
-                        index += 1;
-                    }
-                }
-                if characters.get(index) != Some(&delimiter) {
-                    return Err(snapshot_unavailable());
-                }
-                index += 1;
-                while characters
-                    .get(index)
-                    .is_some_and(|character| character.is_whitespace())
-                {
-                    index += 1;
-                }
-                if characters.get(index) != Some(&')') {
-                    return Err(snapshot_unavailable());
-                }
-                index += 1;
-                if is_codex_node_entrypoint(&module) || is_codex_package(&module) {
-                    return Ok(true);
-                }
+            let module = match identifier.as_str() {
+                "require" => parse_js_module_call(&characters, &mut index)?,
+                "import" => parse_js_import(&characters, &mut index)?,
+                _ => None,
+            };
+            if let Some(module) = module
+                && (is_codex_node_entrypoint(&module) || is_codex_package(&module))
+            {
+                return Ok(true);
             }
             continue;
         }
@@ -631,6 +677,99 @@ fn node_eval_runs_codex(source: &str) -> Result<bool, NativeImportError> {
         return Err(snapshot_unavailable());
     }
     Ok(false)
+}
+
+fn parse_js_module_call(
+    characters: &[char],
+    index: &mut usize,
+) -> Result<Option<String>, NativeImportError> {
+    skip_js_whitespace(characters, index);
+    if characters.get(*index) != Some(&'(') {
+        return Ok(None);
+    }
+    *index += 1;
+    skip_js_whitespace(characters, index);
+    let module = parse_js_string_literal(characters, index)?;
+    skip_js_whitespace(characters, index);
+    if characters.get(*index) != Some(&')') {
+        return Err(snapshot_unavailable());
+    }
+    *index += 1;
+    Ok(Some(module))
+}
+
+fn parse_js_import(
+    characters: &[char],
+    index: &mut usize,
+) -> Result<Option<String>, NativeImportError> {
+    skip_js_whitespace(characters, index);
+    if characters.get(*index) == Some(&'(') {
+        return parse_js_module_call(characters, index);
+    }
+    if characters
+        .get(*index)
+        .is_some_and(|character| matches!(character, '\'' | '"'))
+    {
+        return parse_js_string_literal(characters, index).map(Some);
+    }
+    while *index < characters.len() {
+        if matches!(characters[*index], ';' | '\r' | '\n') {
+            return Err(snapshot_unavailable());
+        }
+        if characters[*index].is_ascii_alphabetic() || characters[*index] == '_' {
+            let start = *index;
+            while *index < characters.len()
+                && (characters[*index].is_ascii_alphanumeric() || characters[*index] == '_')
+            {
+                *index += 1;
+            }
+            let identifier = characters[start..*index].iter().collect::<String>();
+            if identifier == "from" {
+                skip_js_whitespace(characters, index);
+                return parse_js_string_literal(characters, index).map(Some);
+            }
+        } else {
+            *index += 1;
+        }
+    }
+    Err(snapshot_unavailable())
+}
+
+fn parse_js_string_literal(
+    characters: &[char],
+    index: &mut usize,
+) -> Result<String, NativeImportError> {
+    let delimiter = *characters.get(*index).ok_or_else(snapshot_unavailable)?;
+    if !matches!(delimiter, '\'' | '"') {
+        return Err(snapshot_unavailable());
+    }
+    *index += 1;
+    let mut value = String::new();
+    while let Some(character) = characters.get(*index).copied() {
+        if character == '\\' {
+            let escaped = *characters
+                .get(*index + 1)
+                .ok_or_else(snapshot_unavailable)?;
+            value.push(escaped);
+            *index += 2;
+        } else if character == delimiter {
+            *index += 1;
+            return Ok(value);
+        } else {
+            value.push(character);
+            *index += 1;
+        }
+    }
+    Err(snapshot_unavailable())
+}
+
+fn skip_js_whitespace(characters: &[char], index: &mut usize) {
+    while characters
+        .get(*index)
+        .is_some_and(|character| character.is_whitespace())
+    {
+        *index += 1;
+    }
 }
 
 fn npm_argv_runs_codex(tokens: &[String]) -> Result<bool, NativeImportError> {
@@ -646,15 +785,52 @@ fn npm_argv_runs_codex(tokens: &[String]) -> Result<bool, NativeImportError> {
     let mut package_option_runs_codex = false;
     while index < tokens.len() && tokens[index].starts_with('-') {
         let option = tokens[index].to_ascii_lowercase();
-        if option == "--package" || option == "-p" {
-            let package = tokens.get(index + 1).ok_or_else(snapshot_unavailable)?;
-            package_option_runs_codex |= is_codex_package(package);
-            index += 2;
-        } else {
-            package_option_runs_codex |= option
-                .strip_prefix("--package=")
-                .is_some_and(is_codex_package);
-            index += 1;
+        match option.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "--package" | "-p" => {
+                let package = tokens.get(index + 1).ok_or_else(snapshot_unavailable)?;
+                package_option_runs_codex |= is_codex_package(package);
+                index += 2;
+            }
+            "--prefix" | "--workspace" | "-w" | "--registry" | "--userconfig" | "--cache"
+            | "--scope" | "--tag" | "--loglevel" => {
+                if tokens.get(index + 1).is_none() {
+                    return Err(snapshot_unavailable());
+                }
+                index += 2;
+            }
+            "--silent"
+            | "-s"
+            | "--yes"
+            | "-y"
+            | "--global"
+            | "-g"
+            | "--workspaces"
+            | "--include-workspace-root"
+            | "--if-present"
+            | "--ignore-scripts"
+            | "--foreground-scripts"
+            | "--json"
+            | "--dry-run"
+            | "--force"
+            | "--verbose"
+            | "-q"
+            | "-d"
+            | "-dd"
+            | "-ddd" => index += 1,
+            _ if option.starts_with("--package=") => {
+                let package = option
+                    .strip_prefix("--package=")
+                    .filter(|package| !package.is_empty())
+                    .ok_or_else(snapshot_unavailable)?;
+                package_option_runs_codex |= is_codex_package(package);
+                index += 1;
+            }
+            _ if npm_value_option_with_equals(&option) => index += 1,
+            _ => return Err(snapshot_unavailable()),
         }
     }
     if is_npx {
@@ -685,6 +861,26 @@ fn npm_argv_runs_codex(tokens: &[String]) -> Result<bool, NativeImportError> {
     }
 }
 
+fn npm_value_option_with_equals(option: &str) -> bool {
+    [
+        "--prefix=",
+        "--workspace=",
+        "-w=",
+        "--registry=",
+        "--userconfig=",
+        "--cache=",
+        "--scope=",
+        "--tag=",
+        "--loglevel=",
+    ]
+    .iter()
+    .any(|prefix| {
+        option
+            .strip_prefix(prefix)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
 fn npm_exec_runs_codex(
     arguments: &[String],
     mut package_option_runs_codex: bool,
@@ -708,7 +904,8 @@ fn npm_exec_runs_codex(
                     .is_some_and(is_codex_package);
                 index += 1;
             }
-            _ if argument.starts_with('-') => index += 1,
+            "--yes" | "-y" | "--if-present" | "--ignore-scripts" => index += 1,
+            _ if argument.starts_with('-') => return Err(snapshot_unavailable()),
             _ => break,
         }
     }
