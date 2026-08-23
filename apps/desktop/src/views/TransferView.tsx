@@ -109,7 +109,9 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     setBusy(true); setBusyAction('restore'); setMessage(null);
     try {
       const report = await api.bundleRestore(path);
-      const needsRecoveryAttention = Boolean(report.recoveryError) || report.manualInterventionCount > 0;
+      const needsRecoveryAttention = Boolean(report.recoveryError)
+        || report.manualInterventionCount > 0
+        || report.archiveOnlyCount > 0;
       setMessage(needsRecoveryAttention
         ? t('transfer.restorePartial')
         : `${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
