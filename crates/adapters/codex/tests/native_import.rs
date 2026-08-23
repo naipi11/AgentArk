@@ -1,15 +1,18 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
     CodexContinuationRequest, CodexError, CodexTargetDefault, CodexTargetSessionExpectation,
     CodexVisibleHistoryExpectation, JsonRpcTransport, NativeImportError, NativeThreadExpectation,
     RawJsonRpc, backup_codex_targets, delete_thread_with_app_server_transport,
-    ensure_codex_not_running_from_tasklist, fork_rollout_with_target_provider_transport,
-    probe_target_default_transport, verify_target_session_transport, verify_thread_listing,
-    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
+    delete_thread_with_app_server_transport_guarded, ensure_codex_not_running_from_snapshot,
+    fork_rollout_with_target_provider_transport,
+    fork_rollout_with_target_provider_transport_guarded, probe_target_default_transport,
+    verify_target_session_transport, verify_thread_listing, write_rollout_atomic_with_operations,
+    write_rollout_atomic_with_reader,
 };
 use agentark_canonical::Sha256Digest;
 use serde_json::{Value, json};
@@ -37,6 +40,32 @@ fn delete_thread_helper_initializes_and_deletes_exact_target() {
     assert_eq!(sent[1]["method"], "initialized");
     assert_eq!(sent[2]["method"], "thread/delete");
     assert_eq!(sent[2]["params"], json!({"threadId": "target-thread"}));
+}
+
+#[test]
+fn guarded_delete_checks_processes_immediately_before_mutation() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {"data": [], "nextCursor": null}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {"data": [], "nextCursor": null}}),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let checks = AtomicUsize::new(0);
+
+    delete_thread_with_app_server_transport_guarded(
+        &mut transport,
+        "target-thread",
+        &|_excluded| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.lock().unwrap()[2]["method"], "thread/delete");
 }
 
 #[test]
@@ -399,14 +428,97 @@ fn rollout_verification_requires_visible_threads() {
 }
 
 #[test]
-fn process_guard_rejects_codex_client_rows() {
-    let tasklist = r#""codex.exe","1234","Console","1","42,000 K"
-"other.exe","5678","Console","1","10,000 K""#;
-    assert!(ensure_codex_not_running_from_tasklist(tasklist).is_err());
-    assert!(
-        ensure_codex_not_running_from_tasklist(r#""other.exe","5678","Console","1","10,000 K""#)
-            .is_ok()
-    );
+fn process_guard_rejects_direct_and_wrapped_codex_invocations() {
+    let cases = [
+        ("codex.exe", r#"C:\tools\codex.exe resume"#),
+        (
+            "CodexDesktop.exe",
+            r#"C:\Program Files\Codex\CodexDesktop.exe"#,
+        ),
+        (
+            "cmd.exe",
+            r#"cmd.exe /d /s /c "C:\Users\fixture\AppData\Roaming\npm\codex.cmd""#,
+        ),
+        ("cmd.exe", r#"cmd.exe /c C:\tools\codex.opencodex-real.cmd"#),
+        (
+            "powershell.exe",
+            r#"powershell.exe -File C:\tools\codex.ps1"#,
+        ),
+        ("pwsh.exe", r#"pwsh.exe -File "C:\tools\codex.ps1""#),
+        (
+            "node.exe",
+            r#"node.exe C:\tools\node_modules\@openai\codex\bin\codex.js"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe C:\npm\npm-cli.js exec @openai/codex"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe C:\npm\npm-cli.js exec --package=@openai/codex"#,
+        ),
+        ("cmd.exe", r#"cmd.exe /c npx.cmd @openai/codex@0.146.0"#),
+    ];
+
+    for (index, (name, command_line)) in cases.into_iter().enumerate() {
+        let snapshot = serde_json::to_string(&json!([{
+            "Name": name,
+            "ProcessId": 1000 + index,
+            "CommandLine": command_line,
+        }]))
+        .unwrap();
+        assert!(
+            ensure_codex_not_running_from_snapshot(&snapshot).is_err(),
+            "expected {name} invocation to be rejected"
+        );
+    }
+}
+
+#[test]
+fn process_guard_accepts_unrelated_hosts_with_codex_in_workspace_names() {
+    let snapshot = serde_json::to_string(&json!([
+        {
+            "Name": "node.exe",
+            "ProcessId": 2001,
+            "CommandLine": r#"node.exe C:\work\codex-native-session-import\scripts\build.js"#,
+        },
+        {
+            "Name": "cmd.exe",
+            "ProcessId": 2002,
+            "CommandLine": r#"cmd.exe /c cargo test --manifest-path C:\work\codex-repository\Cargo.toml"#,
+        },
+        {
+            "Name": "powershell.exe",
+            "ProcessId": 2003,
+            "CommandLine": r#"powershell.exe -File C:\work\codex-tools\cleanup.ps1"#,
+        }
+    ]))
+    .unwrap();
+
+    ensure_codex_not_running_from_snapshot(&snapshot).unwrap();
+}
+
+#[test]
+fn process_guard_fails_closed_on_malformed_or_ambiguous_snapshot_without_leaking_commands() {
+    let canary = "sk-proj-process-command-line-canary-123456789";
+    let malformed = format!(r#"[{{"Name":"node.exe","ProcessId":3001,"CommandLine":"{canary}"}}"#);
+    let ambiguous = serde_json::to_string(&json!([{
+        "Name": "node.exe",
+        "ProcessId": 3002,
+        "CommandLine": null,
+    }]))
+    .unwrap();
+    let unterminated_quote = serde_json::to_string(&json!([{
+        "Name": "powershell.exe",
+        "ProcessId": 3003,
+        "CommandLine": r#"powershell.exe -File "C:\tools\unrelated.ps1"#,
+    }]))
+    .unwrap();
+
+    for snapshot in [malformed, ambiguous, unterminated_quote] {
+        let error = ensure_codex_not_running_from_snapshot(&snapshot).unwrap_err();
+        assert!(!error.to_string().contains(canary));
+    }
 }
 
 #[test]
@@ -510,6 +622,127 @@ fn fork_rollout_sends_selected_provider_without_secrets_and_verifies_visibility(
     assert_eq!(report.target_thread_id, target_thread_id);
     assert_eq!(report.visible_turns, 0);
     assert!(sent.iter().all(|value| value["method"] != "thread/delete"));
+}
+
+#[test]
+fn guarded_fork_checks_processes_before_fork_and_name_mutations() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let (mut responses, _) =
+        continuation_responses("019target-thread", &target_rollout, &target_cwd);
+    responses[1]["result"]["thread"]["name"] = Value::String("Imported fixture".into());
+    responses[1]["result"]["thread"]["turns"] = Value::Array(Vec::new());
+    responses.insert(2, json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    for (offset, response) in responses.iter_mut().enumerate().skip(3) {
+        response["id"] = Value::from((offset + 1) as u64);
+        if let Some(data) = response
+            .pointer_mut("/result/data")
+            .and_then(Value::as_array_mut)
+        {
+            for thread in data {
+                thread["name"] = Value::String("Imported fixture".into());
+            }
+        }
+        if let Some(thread) = response.pointer_mut("/result/thread") {
+            thread["name"] = Value::String("Imported fixture".into());
+        }
+    }
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let checks = AtomicUsize::new(0);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+        title: Some("Imported fixture".into()),
+        visible_history: empty_history(),
+    };
+
+    fork_rollout_with_target_provider_transport_guarded(
+        &mut transport,
+        codex_home.path(),
+        &request,
+        &|_excluded| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    let methods = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.get("method").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        methods
+            .windows(2)
+            .any(|pair| pair == ["thread/fork", "thread/name/set"])
+    );
+}
+
+#[test]
+fn guarded_fork_requires_manual_cleanup_when_process_appears_before_delete() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = codex_home.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let (mut responses, _) =
+        continuation_responses("019target-thread", &target_rollout, &target_cwd);
+    responses[1]["result"]["modelProvider"] = Value::String("unexpected".into());
+    responses.truncate(2);
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let checks = AtomicUsize::new(0);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
+    };
+
+    let error = fork_rollout_with_target_provider_transport_guarded(
+        &mut transport,
+        codex_home.path(),
+        &request,
+        &|_excluded| {
+            if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(NativeImportError::CodexRunning)
+            }
+        },
+        &[],
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::ManualIntervention));
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    assert!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .all(|value| value["method"] != "thread/delete")
+    );
 }
 
 #[test]

@@ -6,10 +6,11 @@ use agentark_adapter_codex::{
     CodexContinuationReport, CodexContinuationRequest, CodexProbe, CodexTargetDefault,
     CodexTargetSessionExpectation, NativeImportError, NativePayloadError, NativeRestoreReport,
     NativeRolloutPayload, NativeThreadExpectation, build_canonical_continuation_source,
-    canonical_visible_history, delete_thread_with_app_server, ensure_codex_not_running,
-    fork_rollout_with_target_provider, native_thread_expectation, probe_target_default,
-    restore_native_rollouts, rewrite_native_workspace_paths, verify_rollouts_with_app_server,
-    verify_target_session, write_rollout_atomic,
+    canonical_visible_history, delete_thread_with_app_server_guarded,
+    ensure_codex_not_running_excluding, fork_rollout_with_target_provider_guarded,
+    native_thread_expectation, probe_target_default, restore_native_rollouts,
+    rewrite_native_workspace_paths, verify_rollouts_with_app_server, verify_target_session,
+    write_rollout_atomic,
 };
 use agentark_canonical::{CanonicalSession, Sha256Digest};
 use agentark_migration::{
@@ -386,8 +387,7 @@ fn existing_target_expectation(
 }
 
 pub struct ProductionCodexRecoveryExecutor {
-    write_guard: OnceLock<Result<(), RecoveryError>>,
-    target_default: OnceLock<Result<CodexTargetDefault, RecoveryError>>,
+    version_probe: OnceLock<Result<(), RecoveryError>>,
     preflight: Arc<dyn CodexRecoveryPreflight>,
     existing_target_verifier: Arc<dyn CodexExistingTargetVerifier>,
     native_rollout_verifier: Arc<dyn CodexNativeRolloutVerifier>,
@@ -396,7 +396,7 @@ pub struct ProductionCodexRecoveryExecutor {
 
 #[doc(hidden)]
 pub trait CodexRecoveryPreflight: Send + Sync {
-    fn ensure_not_running(&self) -> Result<(), RecoveryError>;
+    fn ensure_not_running(&self, excluded_process_ids: &[u32]) -> Result<(), RecoveryError>;
     fn probe(&self, executable: &Path) -> Result<(), RecoveryError>;
 }
 
@@ -422,8 +422,8 @@ struct SystemCodexExistingTargetVerifier;
 struct SystemCodexNativeRolloutVerifier;
 
 impl CodexRecoveryPreflight for SystemCodexRecoveryPreflight {
-    fn ensure_not_running(&self) -> Result<(), RecoveryError> {
-        ensure_codex_not_running().map_err(map_native_import_error)
+    fn ensure_not_running(&self, excluded_process_ids: &[u32]) -> Result<(), RecoveryError> {
+        ensure_codex_not_running_excluding(excluded_process_ids).map_err(map_native_import_error)
     }
 
     fn probe(&self, executable: &Path) -> Result<(), RecoveryError> {
@@ -469,8 +469,7 @@ impl CodexNativeRolloutVerifier for SystemCodexNativeRolloutVerifier {
 impl ProductionCodexRecoveryExecutor {
     pub fn new() -> Self {
         Self {
-            write_guard: OnceLock::new(),
-            target_default: OnceLock::new(),
+            version_probe: OnceLock::new(),
             preflight: Arc::new(SystemCodexRecoveryPreflight),
             existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
             native_rollout_verifier: Arc::new(SystemCodexNativeRolloutVerifier),
@@ -481,8 +480,7 @@ impl ProductionCodexRecoveryExecutor {
     #[doc(hidden)]
     pub fn with_preflight(preflight: Arc<dyn CodexRecoveryPreflight>) -> Self {
         Self {
-            write_guard: OnceLock::new(),
-            target_default: OnceLock::new(),
+            version_probe: OnceLock::new(),
             preflight,
             existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
             native_rollout_verifier: Arc::new(SystemCodexNativeRolloutVerifier),
@@ -496,8 +494,7 @@ impl ProductionCodexRecoveryExecutor {
         existing_target_verifier: Arc<dyn CodexExistingTargetVerifier>,
     ) -> Self {
         Self {
-            write_guard: OnceLock::new(),
-            target_default: OnceLock::new(),
+            version_probe: OnceLock::new(),
             preflight,
             existing_target_verifier,
             native_rollout_verifier: Arc::new(SystemCodexNativeRolloutVerifier),
@@ -511,8 +508,7 @@ impl ProductionCodexRecoveryExecutor {
         native_rollout_verifier: Arc<dyn CodexNativeRolloutVerifier>,
     ) -> Self {
         Self {
-            write_guard: OnceLock::new(),
-            target_default: OnceLock::new(),
+            version_probe: OnceLock::new(),
             preflight,
             existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
             native_rollout_verifier,
@@ -520,11 +516,14 @@ impl ProductionCodexRecoveryExecutor {
         }
     }
 
-    fn ensure_vendor_write_allowed(&self, executable: &Path) -> Result<(), RecoveryError> {
-        *self.write_guard.get_or_init(|| {
-            self.preflight.ensure_not_running()?;
-            self.preflight.probe(executable)
-        })
+    fn ensure_version_supported(&self, executable: &Path) -> Result<(), RecoveryError> {
+        *self
+            .version_probe
+            .get_or_init(|| self.preflight.probe(executable))
+    }
+
+    fn ensure_process_guard(&self, excluded_process_ids: &[u32]) -> Result<(), RecoveryError> {
+        self.preflight.ensure_not_running(excluded_process_ids)
     }
 }
 
@@ -539,13 +538,8 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
         &self,
         input: &RecoveryInput,
     ) -> Result<CodexTargetDefault, RecoveryError> {
-        self.ensure_vendor_write_allowed(&input.executable)?;
-        self.target_default
-            .get_or_init(|| {
-                probe_target_default(&input.executable, &input.codex_home)
-                    .map_err(map_native_import_error)
-            })
-            .clone()
+        self.ensure_version_supported(&input.executable)?;
+        probe_target_default(&input.executable, &input.codex_home).map_err(map_native_import_error)
     }
 
     fn try_native_identity(
@@ -583,7 +577,8 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
         expectation.visible_history = canonical_visible_history(&input.session)
             .map_err(map_native_payload_error)?
             .expectation();
-        self.ensure_vendor_write_allowed(&input.executable)?;
+        self.ensure_version_supported(&input.executable)?;
+        self.ensure_process_guard(&[])?;
         let report = match restore_native_rollouts(
             &input.codex_home,
             std::slice::from_ref(payload),
@@ -617,6 +612,8 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
             .native_rollout_verifier
             .verify(input, &destination, &expectation)
         {
+            self.ensure_process_guard(&[])
+                .map_err(|_| RecoveryError::ManualIntervention)?;
             cleanup_native_paths(&report.written_paths, |path| fs::remove_file(path))?;
             return Err(error);
         }
@@ -631,20 +628,33 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
         if input.codex_home.as_os_str().is_empty() || !input.codex_home.is_dir() {
             return Err(RecoveryError::Unavailable);
         }
-        self.ensure_vendor_write_allowed(&input.executable)?;
-        create_continuation_with_operations(
+        self.ensure_version_supported(&input.executable)?;
+        create_continuation_with_guarded_operations(
             input,
             target_default,
+            |excluded_process_ids| self.ensure_process_guard(excluded_process_ids),
             |_staged, request| {
-                fork_rollout_with_target_provider(&input.executable, &input.codex_home, request)
-                    .map_err(map_native_import_error)
+                fork_rollout_with_target_provider_guarded(
+                    &input.executable,
+                    &input.codex_home,
+                    request,
+                    &|excluded_process_ids| {
+                        self.ensure_process_guard(excluded_process_ids)
+                            .map_err(|_| NativeImportError::CodexRunning)
+                    },
+                )
+                .map_err(map_native_import_error)
             },
             remove_staged_source,
             |report| {
-                delete_thread_with_app_server(
+                delete_thread_with_app_server_guarded(
                     &input.executable,
                     &input.codex_home,
                     &report.target_thread_id,
+                    &|excluded_process_ids| {
+                        self.ensure_process_guard(excluded_process_ids)
+                            .map_err(|_| NativeImportError::CodexRunning)
+                    },
                 )
                 .map_err(|_| RecoveryError::ManualIntervention)
             },
@@ -669,6 +679,8 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
     ) -> Result<(), RecoveryError> {
         match report.outcome {
             RestoreOutcome::NativeIdentity => {
+                self.ensure_process_guard(&[])
+                    .map_err(|_| RecoveryError::ManualIntervention)?;
                 cleanup_native_paths(&report.rollback_paths, |path| fs::remove_file(path))
             }
             RestoreOutcome::Continuation => {
@@ -676,10 +688,14 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
                     .target_native_id
                     .as_deref()
                     .ok_or(RecoveryError::ManualIntervention)?;
-                delete_thread_with_app_server(
+                delete_thread_with_app_server_guarded(
                     &input.executable,
                     &input.codex_home,
                     target_thread_id,
+                    &|excluded_process_ids| {
+                        self.ensure_process_guard(excluded_process_ids)
+                            .map_err(|_| NativeImportError::CodexRunning)
+                    },
                 )
                 .map_err(|_| RecoveryError::ManualIntervention)
             }
@@ -713,6 +729,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn create_continuation_with_operations<F, C, R>(
     input: &RecoveryInput,
     target_default: &CodexTargetDefault,
@@ -725,11 +742,36 @@ where
     C: FnOnce(&Path) -> Result<(), RecoveryError>,
     R: FnOnce(&CodexContinuationReport) -> Result<(), RecoveryError>,
 {
+    create_continuation_with_guarded_operations(
+        input,
+        target_default,
+        |_| Ok(()),
+        fork,
+        cleanup,
+        rollback,
+    )
+}
+
+fn create_continuation_with_guarded_operations<F, C, R, G>(
+    input: &RecoveryInput,
+    target_default: &CodexTargetDefault,
+    guard: G,
+    fork: F,
+    cleanup: C,
+    rollback: R,
+) -> Result<CodexContinuationReport, RecoveryError>
+where
+    F: FnOnce(&Path, &CodexContinuationRequest) -> Result<CodexContinuationReport, RecoveryError>,
+    C: FnOnce(&Path) -> Result<(), RecoveryError>,
+    R: FnOnce(&CodexContinuationReport) -> Result<(), RecoveryError>,
+    G: Fn(&[u32]) -> Result<(), RecoveryError>,
+{
     let staging_directory = input
         .codex_home
         .join("sessions")
         .join(format!(".agentark-staging-{}", Uuid::new_v4()));
     let staged_source = staging_directory.join("source.jsonl");
+    let mut staged_written = false;
     let operation = (|| {
         let target_cwd = continuation_target_cwd(input);
         let source = build_canonical_continuation_source(
@@ -739,8 +781,10 @@ where
             &target_default.model,
         )
         .map_err(map_native_payload_error)?;
+        guard(&[])?;
         write_rollout_atomic(&staged_source, std::slice::from_ref(&source.bytes))
             .map_err(map_native_import_error)?;
+        staged_written = true;
         let request = CodexContinuationRequest {
             source_rollout: staged_source.clone(),
             source_thread_id: source.thread_id,
@@ -752,7 +796,11 @@ where
         };
         fork(&staged_source, &request)
     })();
-    let cleanup_result = cleanup(&staged_source);
+    let cleanup_result = if staged_written {
+        guard(&[]).and_then(|()| cleanup(&staged_source))
+    } else {
+        Ok(())
+    };
     match (operation, cleanup_result) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), Ok(())) => Err(error),
@@ -828,6 +876,7 @@ fn map_native_import_error(error: NativeImportError) -> RecoveryError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -914,16 +963,39 @@ mod tests {
 
     struct AcceptingPreflight;
 
+    struct SequencedPreflight {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        process_results: Mutex<VecDeque<Result<(), RecoveryError>>>,
+    }
+
     struct ExactHistoryNativeVerifier {
         calls: Arc<AtomicUsize>,
     }
 
+    struct RejectingNativeVerifier;
+
     impl CodexRecoveryPreflight for AcceptingPreflight {
-        fn ensure_not_running(&self) -> Result<(), RecoveryError> {
+        fn ensure_not_running(&self, _excluded_process_ids: &[u32]) -> Result<(), RecoveryError> {
             Ok(())
         }
 
         fn probe(&self, _executable: &Path) -> Result<(), RecoveryError> {
+            Ok(())
+        }
+    }
+
+    impl CodexRecoveryPreflight for SequencedPreflight {
+        fn ensure_not_running(&self, _excluded_process_ids: &[u32]) -> Result<(), RecoveryError> {
+            self.events.lock().unwrap().push("process-check");
+            self.process_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+
+        fn probe(&self, _executable: &Path) -> Result<(), RecoveryError> {
+            self.events.lock().unwrap().push("version-probe");
             Ok(())
         }
     }
@@ -945,6 +1017,17 @@ mod tests {
         }
     }
 
+    impl CodexNativeRolloutVerifier for RejectingNativeVerifier {
+        fn verify(
+            &self,
+            _input: &RecoveryInput,
+            _destination: &Path,
+            _expected: &NativeThreadExpectation,
+        ) -> Result<(), RecoveryError> {
+            Err(RecoveryError::Verification)
+        }
+    }
+
     impl CodexExistingTargetVerifier for RecordingExistingTargetVerifier {
         fn verify(
             &self,
@@ -957,7 +1040,7 @@ mod tests {
     }
 
     impl CodexRecoveryPreflight for RejectingProbe {
-        fn ensure_not_running(&self) -> Result<(), RecoveryError> {
+        fn ensure_not_running(&self, _excluded_process_ids: &[u32]) -> Result<(), RecoveryError> {
             self.events.lock().unwrap().push("process-check");
             Ok(())
         }
@@ -969,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_probe_rejects_before_native_writer() {
+    fn unsupported_version_probe_is_cached_without_process_snapshot_or_vendor_write() {
         let root = TempRoot::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let executor = ProductionCodexRecoveryExecutor::with_preflight(Arc::new(RejectingProbe {
@@ -989,7 +1072,7 @@ mod tests {
                 .unwrap_err(),
             RecoveryError::Unavailable
         );
-        assert_eq!(*events.lock().unwrap(), ["process-check", "version-probe"]);
+        assert_eq!(*events.lock().unwrap(), ["version-probe"]);
         assert!(!input.backup_root.exists());
         assert!(
             !input
@@ -1005,6 +1088,113 @@ mod tests {
                 )
                 .exists()
         );
+    }
+
+    #[test]
+    fn two_native_writes_take_two_process_snapshots_but_probe_version_once() {
+        let root = TempRoot::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = ProductionCodexRecoveryExecutor::with_preflight_and_native_verifier(
+            Arc::new(SequencedPreflight {
+                events: Arc::clone(&events),
+                process_results: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+            }),
+            Arc::new(ExactHistoryNativeVerifier {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let first = input(&root.0);
+        let mut second = input(&root.0);
+        second.session.id = Uuid::from_u128(11);
+        second.session.source_session_id = "source-native-id-two".into();
+        let payload = second.native_payload.as_mut().unwrap();
+        payload.session_id = second.session.id;
+        payload.relative_path = "2026/08/23/rollout-source-two.jsonl".into();
+        payload.bytes = String::from_utf8(payload.bytes.clone())
+            .unwrap()
+            .replace("source-native-id", "source-native-id-two")
+            .into_bytes();
+        payload.source_hash = Sha256Digest::from_bytes(&payload.bytes);
+
+        executor
+            .try_native_identity(&first, &target_default())
+            .unwrap();
+        executor
+            .try_native_identity(&second, &target_default())
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["version-probe", "process-check", "process-check"]
+        );
+    }
+
+    #[test]
+    fn process_appearing_after_native_write_blocks_cleanup_and_requires_manual_intervention() {
+        let root = TempRoot::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor = ProductionCodexRecoveryExecutor::with_preflight_and_native_verifier(
+            Arc::new(SequencedPreflight {
+                events: Arc::clone(&events),
+                process_results: Mutex::new(VecDeque::from([
+                    Ok(()),
+                    Err(RecoveryError::Unavailable),
+                ])),
+            }),
+            Arc::new(RejectingNativeVerifier),
+        );
+        let input = input(&root.0);
+        let destination = input
+            .codex_home
+            .join("sessions")
+            .join(&input.native_payload.as_ref().unwrap().relative_path);
+
+        assert_eq!(
+            executor
+                .try_native_identity(&input, &target_default())
+                .unwrap_err(),
+            RecoveryError::ManualIntervention
+        );
+        assert!(destination.is_file());
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["version-probe", "process-check", "process-check"]
+        );
+    }
+
+    #[test]
+    fn mapping_failure_rollback_rechecks_processes_before_filesystem_delete() {
+        let root = TempRoot::new();
+        let rollback_path = root.0.join("sessions/rollback.jsonl");
+        fs::write(&rollback_path, b"written vendor state").unwrap();
+        let executor =
+            ProductionCodexRecoveryExecutor::with_preflight(Arc::new(SequencedPreflight {
+                events: Arc::new(Mutex::new(Vec::new())),
+                process_results: Mutex::new(VecDeque::from([Err(RecoveryError::Unavailable)])),
+            }));
+        let report = AutomaticRecoveryReport {
+            outcome: RestoreOutcome::NativeIdentity,
+            source_native_id: Some("source".into()),
+            target_native_id: Some("target".into()),
+            source_provider: ProviderIdentity::new(Some("source-provider".into()), None),
+            target_provider: Some(ProviderIdentity::new(Some("source-provider".into()), None)),
+            source_hash: Sha256Digest::from_bytes(b"source"),
+            target_hash: Some(Sha256Digest::from_bytes(b"target")),
+            reason_code: "native-identity-verified".into(),
+            rollback_paths: vec![rollback_path.clone()],
+            native_skipped_count: 0,
+            native_conflict_count: 0,
+            native_backup_path: None,
+            requires_manual_intervention: false,
+        };
+
+        assert_eq!(
+            executor.rollback(&input(&root.0), &report).unwrap_err(),
+            RecoveryError::ManualIntervention
+        );
+        assert!(rollback_path.is_file());
     }
 
     #[test]
@@ -1204,6 +1394,76 @@ mod tests {
         });
         assert_eq!(result.unwrap_err(), RecoveryError::Verification);
         assert!(!staged.lock().unwrap().as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn process_snapshot_failure_prevents_staging_vendor_write() {
+        let root = TempRoot::new();
+        let fork_calls = AtomicUsize::new(0);
+
+        let result = create_continuation_with_guarded_operations(
+            &input(&root.0),
+            &target_default(),
+            |_excluded| Err(RecoveryError::Unavailable),
+            |_path, _request| {
+                fork_calls.fetch_add(1, Ordering::SeqCst);
+                Err(RecoveryError::Verification)
+            },
+            remove_staged_source,
+            |_report| Ok(()),
+        );
+
+        assert_eq!(result.unwrap_err(), RecoveryError::Unavailable);
+        assert_eq!(fork_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            fs::read_dir(root.0.join("sessions"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn process_appearing_before_staging_cleanup_requires_manual_intervention() {
+        let root = TempRoot::new();
+        let checks = AtomicUsize::new(0);
+        let rollback_calls = AtomicUsize::new(0);
+        let staged = Mutex::new(None::<PathBuf>);
+
+        let result = create_continuation_with_guarded_operations(
+            &input(&root.0),
+            &target_default(),
+            |_excluded| {
+                if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(RecoveryError::Unavailable)
+                }
+            },
+            |path, request| {
+                *staged.lock().unwrap() = Some(path.to_path_buf());
+                Ok(CodexContinuationReport {
+                    source_thread_id: request.source_thread_id.clone(),
+                    target_thread_id: "target-native-id".into(),
+                    rollout_path: root.0.join("sessions/target.jsonl"),
+                    model_provider: "target-provider".into(),
+                    model: "target-model".into(),
+                    visible_turns: 1,
+                    rollout_hash: Sha256Digest::from_bytes(b"target rollout"),
+                    visible_history: request.visible_history.clone(),
+                })
+            },
+            remove_staged_source,
+            |_report| {
+                rollback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), RecoveryError::ManualIntervention);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(rollback_calls.load(Ordering::SeqCst), 1);
+        assert!(staged.lock().unwrap().as_ref().unwrap().is_file());
     }
 
     #[test]

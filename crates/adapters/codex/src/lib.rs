@@ -8,6 +8,7 @@ mod native_payload;
 mod normalize;
 mod probe;
 mod process;
+mod process_guard;
 mod protocol;
 
 pub use adapter::CodexAdapter;
@@ -18,13 +19,15 @@ pub use filesystem::{
 pub use native_import::{
     CodexContinuationReport, CodexContinuationRequest, CodexTargetDefault,
     CodexTargetSessionExpectation, NativeCapability, NativeImportError, NativeThreadExpectation,
-    backup_codex_targets, delete_thread_with_app_server, delete_thread_with_app_server_transport,
-    ensure_codex_not_running, ensure_codex_not_running_from_tasklist,
-    fork_rollout_with_target_provider, fork_rollout_with_target_provider_transport,
-    native_import_capability_from_outputs, probe_target_default, probe_target_default_transport,
-    verify_rollout_with_app_server, verify_rollouts_with_app_server, verify_target_session,
-    verify_target_session_transport, verify_thread_listing, write_rollout_atomic,
-    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
+    backup_codex_targets, delete_thread_with_app_server, delete_thread_with_app_server_guarded,
+    delete_thread_with_app_server_transport, delete_thread_with_app_server_transport_guarded,
+    fork_rollout_with_target_provider, fork_rollout_with_target_provider_guarded,
+    fork_rollout_with_target_provider_transport,
+    fork_rollout_with_target_provider_transport_guarded, native_import_capability_from_outputs,
+    probe_target_default, probe_target_default_transport, verify_rollout_with_app_server,
+    verify_rollouts_with_app_server, verify_target_session, verify_target_session_transport,
+    verify_thread_listing, write_rollout_atomic, write_rollout_atomic_with_operations,
+    write_rollout_atomic_with_reader,
 };
 pub use native_payload::{
     CanonicalContinuationSource, CodexVisibleHistory, CodexVisibleHistoryExpectation,
@@ -38,4 +41,8 @@ pub use normalize::{
 };
 pub use probe::{CODEX_SCHEMA_SHA256, CODEX_VERSION, CodexProbe, parse_version};
 pub use process::ProcessTransport;
+pub use process_guard::{
+    ensure_codex_not_running, ensure_codex_not_running_excluding,
+    ensure_codex_not_running_from_snapshot,
+};
 pub use protocol::{JsonRpcTransport, MAX_JSON_LINE, RawJsonRpc, ReadOnlyAppServerClient};

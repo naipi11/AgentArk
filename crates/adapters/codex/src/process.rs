@@ -13,6 +13,10 @@ pub struct ProcessTransport {
 }
 
 impl ProcessTransport {
+    pub(crate) fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn spawn(executable: &Path) -> Result<Self, CodexError> {
         Self::spawn_with_codex_home(executable, None)
     }

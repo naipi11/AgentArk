@@ -89,33 +89,6 @@ pub struct CodexTargetSessionExpectation {
     pub visible_history: CodexVisibleHistoryExpectation,
 }
 
-pub fn ensure_codex_not_running_from_tasklist(output: &str) -> Result<(), NativeImportError> {
-    let names = ["codex.exe", "codex-desktop.exe", "codexdesktop.exe"];
-    if output.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        names
-            .iter()
-            .any(|name| lower.contains(&format!("\"{name}\"")))
-    }) {
-        return Err(NativeImportError::CodexRunning);
-    }
-    Ok(())
-}
-
-pub fn ensure_codex_not_running() -> Result<(), NativeImportError> {
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FO", "CSV", "/NH"])
-            .output()?;
-        ensure_codex_not_running_from_tasklist(&String::from_utf8_lossy(&output.stdout))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-}
-
 pub fn backup_codex_targets(
     codex_home: &Path,
     backup_root: &Path,
@@ -350,10 +323,34 @@ pub fn fork_rollout_with_target_provider(
     codex_home: &Path,
     request: &CodexContinuationRequest,
 ) -> Result<CodexContinuationReport, NativeImportError> {
+    fork_rollout_with_target_provider_guarded(
+        executable,
+        codex_home,
+        request,
+        &crate::ensure_codex_not_running_excluding,
+    )
+}
+
+pub fn fork_rollout_with_target_provider_guarded<G>(
+    executable: &Path,
+    codex_home: &Path,
+    request: &CodexContinuationRequest,
+    guard: &G,
+) -> Result<CodexContinuationReport, NativeImportError>
+where
+    G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
+{
     let report = {
         let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
             .map_err(map_codex_error)?;
-        fork_rollout_with_target_provider_transport(&mut transport, codex_home, request)?
+        let excluded_process_ids = [transport.process_id()];
+        fork_rollout_with_target_provider_transport_guarded(
+            &mut transport,
+            codex_home,
+            request,
+            guard,
+            &excluded_process_ids,
+        )?
     };
     let expected = CodexTargetSessionExpectation {
         thread_id: report.target_thread_id.clone(),
@@ -364,8 +361,13 @@ pub fn fork_rollout_with_target_provider(
         visible_history: report.visible_history.clone(),
     };
     if let Err(error) = verify_target_session(executable, codex_home, &expected) {
-        delete_thread_with_app_server(executable, codex_home, &report.target_thread_id)
-            .map_err(|_| NativeImportError::ManualIntervention)?;
+        delete_thread_with_app_server_guarded(
+            executable,
+            codex_home,
+            &report.target_thread_id,
+            guard,
+        )
+        .map_err(|_| NativeImportError::ManualIntervention)?;
         return Err(error);
     }
     Ok(report)
@@ -376,9 +378,32 @@ pub fn delete_thread_with_app_server(
     codex_home: &Path,
     thread_id: &str,
 ) -> Result<(), NativeImportError> {
+    delete_thread_with_app_server_guarded(
+        executable,
+        codex_home,
+        thread_id,
+        &crate::ensure_codex_not_running_excluding,
+    )
+}
+
+pub fn delete_thread_with_app_server_guarded<G>(
+    executable: &Path,
+    codex_home: &Path,
+    thread_id: &str,
+    guard: &G,
+) -> Result<(), NativeImportError>
+where
+    G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
+{
     let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
         .map_err(map_codex_error)?;
-    delete_thread_with_app_server_transport(&mut transport, thread_id)
+    let excluded_process_ids = [transport.process_id()];
+    delete_thread_with_app_server_transport_guarded(
+        &mut transport,
+        thread_id,
+        guard,
+        &excluded_process_ids,
+    )
 }
 
 /// Transport-injected form of [`delete_thread_with_app_server`].
@@ -387,9 +412,25 @@ pub fn delete_thread_with_app_server_transport<T: JsonRpcTransport>(
     transport: &mut T,
     thread_id: &str,
 ) -> Result<(), NativeImportError> {
+    delete_thread_with_app_server_transport_guarded(transport, thread_id, &|_| Ok(()), &[])
+}
+
+/// Guard-injected form of [`delete_thread_with_app_server_transport`].
+#[doc(hidden)]
+pub fn delete_thread_with_app_server_transport_guarded<T, G>(
+    transport: &mut T,
+    thread_id: &str,
+    guard: &G,
+    excluded_process_ids: &[u32],
+) -> Result<(), NativeImportError>
+where
+    T: JsonRpcTransport,
+    G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
+{
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
-    delete_and_confirm(&mut client, thread_id).map_err(|_| NativeImportError::ManualIntervention)
+    delete_and_confirm_guarded(&mut client, thread_id, guard, excluded_process_ids)
+        .map_err(|_| NativeImportError::ManualIntervention)
 }
 
 /// Transport-injected form of [`fork_rollout_with_target_provider`].
@@ -402,6 +443,28 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
     codex_home: &Path,
     request: &CodexContinuationRequest,
 ) -> Result<CodexContinuationReport, NativeImportError> {
+    fork_rollout_with_target_provider_transport_guarded(
+        transport,
+        codex_home,
+        request,
+        &|_| Ok(()),
+        &[],
+    )
+}
+
+/// Guard-injected form of [`fork_rollout_with_target_provider_transport`].
+#[doc(hidden)]
+pub fn fork_rollout_with_target_provider_transport_guarded<T, G>(
+    transport: &mut T,
+    codex_home: &Path,
+    request: &CodexContinuationRequest,
+    guard: &G,
+    excluded_process_ids: &[u32],
+) -> Result<CodexContinuationReport, NativeImportError>
+where
+    T: JsonRpcTransport,
+    G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
+{
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
 
@@ -418,6 +481,7 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
     if let Some(model) = &request.target_model {
         params["model"] = Value::String(model.clone());
     }
+    guard(excluded_process_ids)?;
     let response = client.request("thread/fork", params)?;
     let target_thread_id = response
         .value
@@ -462,6 +526,7 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
         }
 
         if let Some(title) = &request.title {
+            guard(excluded_process_ids)?;
             client.request(
                 "thread/name/set",
                 json!({"threadId": target_thread_id, "name": title}),
@@ -515,17 +580,29 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
 
     match outcome {
         Ok(report) => Ok(report),
-        Err(error) => match delete_and_confirm(&mut client, &target_thread_id) {
+        Err(error) => match delete_and_confirm_guarded(
+            &mut client,
+            &target_thread_id,
+            guard,
+            excluded_process_ids,
+        ) {
             Ok(()) => Err(error),
             Err(_) => Err(NativeImportError::ManualIntervention),
         },
     }
 }
 
-fn delete_and_confirm<T: JsonRpcTransport>(
+fn delete_and_confirm_guarded<T, G>(
     client: &mut NativeAppServerClient<'_, T>,
     thread_id: &str,
-) -> Result<(), NativeImportError> {
+    guard: &G,
+    excluded_process_ids: &[u32],
+) -> Result<(), NativeImportError>
+where
+    T: JsonRpcTransport,
+    G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
+{
+    guard(excluded_process_ids)?;
     client.request("thread/delete", json!({"threadId": thread_id}))?;
     for archived in [false, true] {
         if find_thread_in_listing(client, archived, thread_id)?.is_some() {
