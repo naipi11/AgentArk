@@ -17,6 +17,7 @@ const publicRecoveryReasonCodes = Object.freeze([
   'manual-intervention-required',
   'native-payload-unavailable',
   'target-default-unavailable',
+  'audit-persistence-failed',
 ] as const);
 
 function isPublicRecoveryReasonCode(value: string): boolean {
@@ -108,7 +109,10 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     setBusy(true); setBusyAction('restore'); setMessage(null);
     try {
       const report = await api.bundleRestore(path);
-      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
+      const needsRecoveryAttention = Boolean(report.recoveryError) || report.manualInterventionCount > 0;
+      setMessage(needsRecoveryAttention
+        ? t('transfer.restorePartial')
+        : `${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
       setRestoreReport(report);
       setPreview(null);
     } catch { setMessage(t('backup.error')); }

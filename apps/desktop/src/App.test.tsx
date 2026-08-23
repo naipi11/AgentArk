@@ -150,6 +150,34 @@ test('transfer displays the stable manual-intervention recovery diagnostic', asy
   expect(await screen.findByText('manual-intervention-required')).toBeInTheDocument();
 });
 
+test('transfer discloses audit persistence failure without claiming restore success', async () => {
+  restoreResult.recoveryError = 'audit-persistence-failed';
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
+
+  expect(await screen.findByText('Archive restored, but vendor recovery needs attention.')).toBeInTheDocument();
+  expect(screen.queryByText(/Backup operation completed/)).not.toBeInTheDocument();
+  expect(screen.getByText('audit-persistence-failed')).toBeInTheDocument();
+  expect(screen.getByText(/2 original sessions retained/i)).toBeInTheDocument();
+});
+
+test('transfer localizes the partial restore status in Chinese', async () => {
+  window.localStorage.setItem('agentark.locale', 'zh-CN');
+  restoreResult.manualInterventionCount = 1;
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('状态')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '迁移' }));
+  fireEvent.click(await screen.findByRole('button', { name: '导入会话历史' }));
+  fireEvent.click(await screen.findByRole('button', { name: '恢复导入的历史' }));
+
+  expect(await screen.findByText('归档已恢复，但 Agent 客户端恢复需要处理。')).toBeInTheDocument();
+  expect(screen.queryByText(/备份操作已完成/)).not.toBeInTheDocument();
+  expect(screen.getByText(/1 个会话需要手动处理/)).toBeInTheDocument();
+});
+
 test('transfer never renders credential-shaped recovery diagnostics that match the legacy lowercase pattern', async () => {
   restoreResult.manualInterventionCount = 1;
   restoreResult.recoveryError = 'sk-proj-lowercase-ui-canary-123456789';

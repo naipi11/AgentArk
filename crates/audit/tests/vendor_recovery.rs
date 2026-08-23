@@ -1,30 +1,8 @@
 use std::fs;
 
-use agentark_audit::{
-    AuditEvent, VendorRecoveryAudit, VendorRecoveryStatus, append_event, verify_chain,
-};
+use agentark_audit::{AuditEvent, VendorRecoveryAudit, VendorRecoveryStatus, verify_chain};
 use agentark_canonical::Sha256Digest;
 use tempfile::tempdir;
-use uuid::Uuid;
-
-fn event(vendor_recovery: Option<VendorRecoveryAudit>) -> AuditEvent {
-    AuditEvent {
-        event_id: Uuid::from_u128(1),
-        event_type: "vendor.recovery.completed".into(),
-        timestamp: "2026-08-24T00:00:00Z".into(),
-        actor: "test".into(),
-        source: None,
-        target: None,
-        before_hash: None,
-        after_hash: None,
-        plan_hash: None,
-        result: "complete".into(),
-        provider_labels: vec!["openai".into()],
-        vendor_recovery,
-        previous_hash: None,
-        event_hash: Sha256Digest::from_bytes(b"pending"),
-    }
-}
 
 #[test]
 fn aggregate_hashes_are_exact_and_independent_of_input_order() {
@@ -70,17 +48,29 @@ fn status_is_closed_and_derived_from_outcome_counts() {
 }
 
 #[test]
-fn absent_vendor_recovery_keeps_legacy_event_shape_and_chain_valid() {
+fn fixed_pre_vendor_recovery_chain_rehashes_and_verifies_unchanged() {
+    const LEGACY_CHAIN: &str = concat!(
+        r#"{"eventId":"00000000-0000-0000-0000-000000000001","eventType":"bundle.restored","timestamp":"2026-08-23T00:00:00Z","actor":"agentark-desktop","source":"legacy.ahbundle","target":null,"beforeHash":null,"afterHash":null,"planHash":null,"result":"success","providerLabels":["openai"],"previousHash":null,"eventHash":"sha256:77b250aa0ead12edb04fb70558f5920eecc7f32e46312b1e90e8247ddb3f727c"}"#,
+        "\n",
+        r#"{"eventId":"00000000-0000-0000-0000-000000000002","eventType":"migration.completed","timestamp":"2026-08-23T00:00:01Z","actor":"agentark-desktop","source":null,"target":"00000000-0000-0000-0000-000000000003","beforeHash":null,"afterHash":null,"planHash":null,"result":"partial","previousHash":"sha256:77b250aa0ead12edb04fb70558f5920eecc7f32e46312b1e90e8247ddb3f727c","eventHash":"sha256:d6dd1e4d441813db0828daef20937d8e4d4a42004799f5c1c48236992287aa9d"}"#,
+        "\n",
+    );
     let dir = tempdir().unwrap();
     let path = dir.path().join("audit.jsonl");
-    let appended = append_event(&path, event(None)).unwrap();
-    let line = fs::read_to_string(&path).unwrap();
+    fs::write(&path, LEGACY_CHAIN).unwrap();
 
-    assert!(!line.contains("vendorRecovery"));
-    let legacy: AuditEvent = serde_json::from_str(&line).unwrap();
-    assert_eq!(legacy.vendor_recovery, None);
-    assert_eq!(legacy.event_hash, appended.event_hash);
-    assert!(verify_chain(&path).unwrap().valid);
+    let events = LEGACY_CHAIN
+        .lines()
+        .map(|line| serde_json::from_str::<AuditEvent>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| event.vendor_recovery.is_none()));
+    let verification = verify_chain(&path).unwrap();
+    assert!(verification.valid, "{:?}", verification.error);
+    assert_eq!(verification.event_count, 2);
+    assert_eq!(
+        verification.last_hash.unwrap().as_str(),
+        "sha256:d6dd1e4d441813db0828daef20937d8e4d4a42004799f5c1c48236992287aa9d"
+    );
 }
 
 #[test]

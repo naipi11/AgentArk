@@ -1649,6 +1649,14 @@ fn mapping_persistence_failure_rolls_back_and_is_not_counted_as_success() {
             .unwrap()
             .is_empty()
     );
+    let audit = vendor_summary(&fixture);
+    assert_eq!(audit.archive_only_count, 1);
+    assert_eq!(audit.manual_intervention_count, 0);
+    assert_eq!(audit.status, VendorRecoveryStatus::Partial);
+    assert_eq!(
+        audit.target_hashes_digest.as_str(),
+        "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    );
 }
 
 #[test]
@@ -1669,6 +1677,14 @@ fn mapping_persistence_and_rollback_failure_requires_manual_intervention() {
     assert_eq!(
         fixture.report.recovery_error.as_deref(),
         Some("manual-intervention-required")
+    );
+    let audit = vendor_summary(&fixture);
+    assert_eq!(audit.archive_only_count, 0);
+    assert_eq!(audit.manual_intervention_count, 1);
+    assert_eq!(audit.status, VendorRecoveryStatus::ManualIntervention);
+    assert_eq!(
+        audit.target_hashes_digest.as_str(),
+        "sha256:3bff9163cef68f1366cd6b53e5679e897fae1f3cf20b1014afcfe78836dce698"
     );
 }
 
