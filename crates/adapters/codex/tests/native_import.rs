@@ -699,6 +699,131 @@ fn powershell_encoded_command_is_decoded_and_classified_without_leaking_script()
     }
 }
 
+#[test]
+fn start_process_dynamic_targets_fail_closed_but_static_data_arguments_are_safe() {
+    for (index, command_line) in [
+        r#"powershell.exe -Command "Start-Process $target""#,
+        r#"powershell.exe -Command "Start-Process -FilePath ${target}""#,
+        r#"powershell.exe -Command "Start-Process -FilePath C:\$target\safe.exe""#,
+        r#"powershell.exe -Command "Start-Process -FilePath (Get-Command codex)""#,
+        r#"powershell.exe -Command "Start-Process (Join-Path C:\tools codex.ps1)""#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("powershell.exe", 6500 + index, command_line);
+        assert!(ensure_codex_not_running_from_snapshot(&snapshot).is_err());
+    }
+
+    for (index, command_line) in [
+        r#"powershell.exe -Command "Start-Process notepad.exe C:\tools\codex.ps1""#,
+        r#"powershell.exe -Command "Start-Process -FilePath C:\tools\safe.exe -ArgumentList C:\tools\codex.ps1""#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let snapshot = process_snapshot("powershell.exe", 6600 + index, command_line);
+        ensure_codex_not_running_from_snapshot(&snapshot).unwrap();
+    }
+}
+
+#[test]
+fn host_parsers_classify_execution_positions_instead_of_data_arguments() {
+    let rejected = [
+        ("cmd.exe", r#"cmd.exe /d /s /c C:\tools\co^dex.cmd"#),
+        (
+            "cmd.exe",
+            r#"cmd.exe /c echo safe & call C:\tools\codex.cmd"#,
+        ),
+        (
+            "cmd.exe",
+            r#"cmd.exe /d /s /c "echo safe & call C:\tools\codex.cmd""#,
+        ),
+        ("cmd.exe", r#"cmd.exe /c start "" C:\tools\codex.cmd"#),
+        (
+            "cmd.exe",
+            r#"cmd.exe /c start "" cmd.exe /c C:\tools\co^dex.cmd"#,
+        ),
+        (
+            "cmd.exe",
+            r#"cmd.exe /c node.exe C:\node_modules\@openai\codex\bin\codex.js"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe C:\node_modules\@openai\codex\bin\codex.js"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe -r C:\node_modules\@openai\codex\bin\codex.js C:\safe.js"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe -e "require('C:\\node_modules\\@openai\\codex\\bin\\codex.js')""#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe --require=C:\node_modules\@openai\codex\bin\codex.js C:\safe.js"#,
+        ),
+        ("node.exe", r#"node.exe -e "require(target)""#),
+        ("npm.exe", r#"npm.exe exec @openai/codex"#),
+        ("npm.exe", r#"npm.exe x --package=@openai/codex"#),
+        ("npx.exe", r#"npx.exe @openai/codex"#),
+        ("npm.exe", r#"npm.exe run codex"#),
+        (
+            "powershell.exe",
+            r#"powershell.exe -Command "cmd.exe /c C:\tools\co^dex.cmd""#,
+        ),
+        (
+            "powershell.exe",
+            r#"powershell.exe -Command "npm.exe exec @openai/codex""#,
+        ),
+    ];
+    for (index, (name, command_line)) in rejected.into_iter().enumerate() {
+        let snapshot = process_snapshot(name, 6700 + index, command_line);
+        assert!(ensure_codex_not_running_from_snapshot(&snapshot).is_err());
+    }
+
+    let accepted = [
+        ("cmd.exe", r#"cmd.exe /c echo C:\tools\codex.cmd"#),
+        ("cmd.exe", r#"cmd.exe /c echo safe ^& C:\tools\codex.cmd"#),
+        (
+            "node.exe",
+            r#"node.exe C:\safe.js C:\node_modules\@openai\codex\bin\codex.js"#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe -e "console.log('C:\\node_modules\\@openai\\codex\\bin\\codex.js')""#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe -e "require('C:\\safe.js'); console.log('C:\\node_modules\\@openai\\codex\\bin\\codex.js')""#,
+        ),
+        (
+            "node.exe",
+            r#"node.exe --require=C:\safe.js C:\safe.js C:\node_modules\@openai\codex\bin\codex.js"#,
+        ),
+        ("npm.exe", r#"npm.exe view @openai/codex"#),
+        ("npm.exe", r#"npm.exe install @openai/codex"#),
+        ("npm.exe", r#"npm.exe exec echo -- @openai/codex"#),
+        (
+            "powershell.exe",
+            r#"powershell.exe -Command "cmd.exe /c echo C:\tools\codex.cmd""#,
+        ),
+        (
+            "powershell.exe",
+            r#"powershell.exe -Command "node.exe C:\safe.js C:\node_modules\@openai\codex\bin\codex.js""#,
+        ),
+        (
+            "powershell.exe",
+            r#"powershell.exe -Command "npm.exe view @openai/codex""#,
+        ),
+    ];
+    for (index, (name, command_line)) in accepted.into_iter().enumerate() {
+        let snapshot = process_snapshot(name, 6800 + index, command_line);
+        ensure_codex_not_running_from_snapshot(&snapshot).unwrap();
+    }
+}
+
 fn process_snapshot(name: &str, process_id: usize, command_line: &str) -> String {
     serde_json::to_string(&json!([{
         "Name": name,

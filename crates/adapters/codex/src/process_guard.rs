@@ -116,15 +116,14 @@ fn command_line_runs_codex(host: &str, command_line: &str) -> Result<bool, Nativ
         let tokens = command_line_tokens(command_line, true).ok_or_else(snapshot_unavailable)?;
         return powershell_argv_runs_codex(&tokens, 0);
     }
+    if host == "cmd.exe" {
+        return cmd_command_line_runs_codex(command_line, 0);
+    }
     let tokens = command_line_tokens(command_line, false).ok_or_else(snapshot_unavailable)?;
-    if matches!(host, "cmd.exe") && cmd_tokens_run_codex(&tokens) {
-        return Ok(true);
+    if host == "node.exe" {
+        return node_argv_runs_codex(&tokens, 0);
     }
-    if matches!(host, "node.exe") && tokens.iter().any(|token| is_codex_node_entrypoint(token)) {
-        return Ok(true);
-    }
-    Ok(tokens.iter().any(|token| is_npm_launcher(token))
-        && tokens.iter().any(|token| is_codex_package(token)))
+    npm_argv_runs_codex(&tokens)
 }
 
 fn powershell_argv_runs_codex(
@@ -236,18 +235,13 @@ fn nested_launcher_runs_codex(
             .to_owned()
     }));
     match launcher {
-        "cmd" | "cmd.exe" => Ok(cmd_tokens_run_codex(&invocation)),
-        "node" | "node.exe" => Ok(invocation
-            .iter()
-            .any(|token| is_codex_node_entrypoint(token))
-            || (invocation.iter().any(|token| is_npm_launcher(token))
-                && invocation.iter().any(|token| is_codex_package(token)))),
+        "cmd" | "cmd.exe" => cmd_argv_runs_codex(&invocation, nesting + 1),
+        "node" | "node.exe" => node_argv_runs_codex(&invocation, nesting + 1),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => {
             powershell_argv_runs_codex(&invocation, nesting + 1)
         }
-        "npm" | "npm.cmd" | "npm.exe" | "npx" | "npx.cmd" | "npx.exe" => {
-            Ok(invocation.iter().any(|token| is_codex_package(token)))
-        }
+        "npm" | "npm.cmd" | "npm.exe" | "npm-cli.js" | "npx" | "npx.cmd" | "npx.exe"
+        | "npx-cli.js" => npm_argv_runs_codex(&invocation),
         _ => Ok(false),
     }
 }
@@ -270,6 +264,9 @@ fn start_process_runs_codex(
     let target = arguments
         .get(target_index)
         .ok_or_else(snapshot_unavailable)?;
+    if target.trim_start().starts_with(['(', '{', '[', '@']) || target.contains('$') {
+        return Err(snapshot_unavailable());
+    }
     if is_codex_powershell_script(target)
         || is_codex_cmd_script(target)
         || is_codex_node_entrypoint(target)
@@ -292,8 +289,434 @@ fn start_process_runs_codex(
     nested_launcher_runs_codex(&launcher, &nested_arguments, nesting)
 }
 
-fn cmd_tokens_run_codex(tokens: &[String]) -> bool {
-    tokens.iter().any(|token| is_codex_cmd_script(token))
+fn cmd_command_line_runs_codex(
+    command_line: &str,
+    nesting: usize,
+) -> Result<bool, NativeImportError> {
+    let words = cmd_words(command_line).ok_or_else(snapshot_unavailable)?;
+    let Some(command_switch) = words
+        .iter()
+        .position(|word| matches!(word.value.to_ascii_lowercase().as_str(), "/c" | "/k"))
+    else {
+        return Ok(false);
+    };
+    let script = strip_cmd_outer_quotes(command_line[words[command_switch].end..].trim_start());
+    if script.is_empty() {
+        return Err(snapshot_unavailable());
+    }
+    cmd_script_runs_codex(script, nesting)
+}
+
+fn strip_cmd_outer_quotes(script: &str) -> &str {
+    script
+        .strip_prefix('"')
+        .and_then(|script| script.strip_suffix('"'))
+        .unwrap_or(script)
+}
+
+fn cmd_argv_runs_codex(tokens: &[String], nesting: usize) -> Result<bool, NativeImportError> {
+    let Some(command_switch) = tokens
+        .iter()
+        .position(|token| matches!(token.to_ascii_lowercase().as_str(), "/c" | "/k"))
+    else {
+        return Ok(false);
+    };
+    let script = tokens
+        .get(command_switch + 1..)
+        .ok_or_else(snapshot_unavailable)?;
+    if script.is_empty() {
+        return Err(snapshot_unavailable());
+    }
+    cmd_script_runs_codex(&script.join(" "), nesting)
+}
+
+fn cmd_script_runs_codex(script: &str, nesting: usize) -> Result<bool, NativeImportError> {
+    if nesting > MAX_POWERSHELL_NESTING {
+        return Err(snapshot_unavailable());
+    }
+    for statement in cmd_statements(script).ok_or_else(snapshot_unavailable)? {
+        let tokens = command_line_tokens(&statement, false).ok_or_else(snapshot_unavailable)?;
+        if cmd_statement_runs_codex(&tokens, nesting)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn cmd_statement_runs_codex(tokens: &[String], nesting: usize) -> Result<bool, NativeImportError> {
+    if tokens.is_empty() {
+        return Ok(false);
+    }
+    let mut command_index = 0usize;
+    let mut command = tokens[command_index].trim_start_matches('@');
+    if command.eq_ignore_ascii_case("call") {
+        command_index += 1;
+        command = tokens
+            .get(command_index)
+            .map(|token| token.trim_start_matches('@'))
+            .ok_or_else(snapshot_unavailable)?;
+    }
+    if command.starts_with(['%', '!', '(']) {
+        return Err(snapshot_unavailable());
+    }
+    let basename = token_basename(command);
+    let arguments = &tokens[command_index + 1..];
+    if basename == "start" {
+        let (target_index, target) = arguments
+            .iter()
+            .enumerate()
+            .find(|(_, argument)| !argument.starts_with('/'))
+            .ok_or_else(snapshot_unavailable)?;
+        return command_target_runs_codex(target, &arguments[target_index + 1..], nesting);
+    }
+    command_target_runs_codex(command, arguments, nesting)
+}
+
+fn command_target_runs_codex(
+    command: &str,
+    arguments: &[String],
+    nesting: usize,
+) -> Result<bool, NativeImportError> {
+    if is_codex_cmd_script(command)
+        || is_codex_powershell_script(command)
+        || is_codex_node_entrypoint(command)
+        || is_direct_codex_executable(&token_basename(command))
+    {
+        return Ok(true);
+    }
+    nested_launcher_runs_codex(&token_basename(command), arguments, nesting)
+}
+
+struct CmdWord {
+    value: String,
+    end: usize,
+}
+
+fn cmd_words(command_line: &str) -> Option<Vec<CmdWord>> {
+    let mut words = Vec::new();
+    let mut value = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    let mut end = 0usize;
+    let mut characters = command_line.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        end = index + character.len_utf8();
+        match character {
+            '^' => {
+                let (escaped_index, escaped) = characters.next()?;
+                end = escaped_index + escaped.len_utf8();
+                started = true;
+                if !matches!(escaped, '\r' | '\n') {
+                    value.push(escaped);
+                }
+            }
+            '"' => {
+                started = true;
+                quoted = !quoted;
+            }
+            character if character.is_whitespace() && !quoted => {
+                if started {
+                    words.push(CmdWord {
+                        value: std::mem::take(&mut value),
+                        end: index,
+                    });
+                    started = false;
+                }
+            }
+            _ => {
+                started = true;
+                value.push(character);
+            }
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if started {
+        words.push(CmdWord { value, end });
+    }
+    Some(words)
+}
+
+fn cmd_statements(script: &str) -> Option<Vec<String>> {
+    let mut statements = Vec::new();
+    let mut statement = String::new();
+    let mut quoted = false;
+    let mut characters = script.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '^' => {
+                let escaped = characters.next()?;
+                if escaped == '\r' {
+                    if characters.peek() == Some(&'\n') {
+                        characters.next();
+                    }
+                } else if escaped != '\n' {
+                    statement.push(escaped);
+                }
+            }
+            '"' => quoted = !quoted,
+            '&' | '|' if !quoted => {
+                if characters.peek() == Some(&character) {
+                    characters.next();
+                }
+                push_powershell_statement(&mut statements, &mut statement);
+            }
+            '\r' | '\n' if !quoted => {
+                push_powershell_statement(&mut statements, &mut statement);
+            }
+            _ => statement.push(character),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    push_powershell_statement(&mut statements, &mut statement);
+    Some(statements)
+}
+
+fn node_argv_runs_codex(tokens: &[String], nesting: usize) -> Result<bool, NativeImportError> {
+    if tokens.is_empty() || nesting > MAX_POWERSHELL_NESTING {
+        return Err(snapshot_unavailable());
+    }
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let argument = tokens[index].to_ascii_lowercase();
+        match argument.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-r" | "--require" | "--import" => {
+                let module = tokens.get(index + 1).ok_or_else(snapshot_unavailable)?;
+                if is_codex_node_entrypoint(module) || is_codex_package(module) {
+                    return Ok(true);
+                }
+                index += 2;
+            }
+            "-e" | "--eval" | "-p" | "--print" => {
+                let source = tokens.get(index + 1).ok_or_else(snapshot_unavailable)?;
+                return node_eval_runs_codex(source);
+            }
+            _ if argument.starts_with("--require=") || argument.starts_with("--import=") => {
+                let module = tokens[index]
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or("");
+                if module.is_empty() {
+                    return Err(snapshot_unavailable());
+                }
+                if is_codex_node_entrypoint(module) || is_codex_package(module) {
+                    return Ok(true);
+                }
+                index += 1;
+            }
+            _ if argument.starts_with("--eval=") || argument.starts_with("--print=") => {
+                let source = tokens[index]
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or("");
+                if source.is_empty() {
+                    return Err(snapshot_unavailable());
+                }
+                return node_eval_runs_codex(source);
+            }
+            _ if argument.starts_with('-') => index += 1,
+            _ => break,
+        }
+    }
+    let Some(script) = tokens.get(index) else {
+        return Ok(false);
+    };
+    if is_codex_node_entrypoint(script) || is_codex_package(script) {
+        return Ok(true);
+    }
+    if is_npm_launcher(script) {
+        let mut npm = vec![token_basename(script)];
+        npm.extend_from_slice(&tokens[index + 1..]);
+        return npm_argv_runs_codex(&npm);
+    }
+    Ok(false)
+}
+
+fn node_eval_runs_codex(source: &str) -> Result<bool, NativeImportError> {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut quote = None::<char>;
+    while index < characters.len() {
+        let character = characters[index];
+        if let Some(delimiter) = quote {
+            if character == '\\' {
+                index = (index + 2).min(characters.len());
+                continue;
+            }
+            if character == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            quote = Some(character);
+            index += 1;
+            continue;
+        }
+        if character.is_ascii_alphabetic() || character == '_' {
+            let start = index;
+            while index < characters.len()
+                && (characters[index].is_ascii_alphanumeric() || characters[index] == '_')
+            {
+                index += 1;
+            }
+            let identifier = characters[start..index].iter().collect::<String>();
+            if matches!(identifier.as_str(), "require" | "import") {
+                while characters
+                    .get(index)
+                    .is_some_and(|character| character.is_whitespace())
+                {
+                    index += 1;
+                }
+                if characters.get(index) != Some(&'(') {
+                    continue;
+                }
+                index += 1;
+                while characters
+                    .get(index)
+                    .is_some_and(|character| character.is_whitespace())
+                {
+                    index += 1;
+                }
+                let delimiter = *characters.get(index).ok_or_else(snapshot_unavailable)?;
+                if !matches!(delimiter, '\'' | '"') {
+                    return Err(snapshot_unavailable());
+                }
+                index += 1;
+                let mut module = String::new();
+                while let Some(character) = characters.get(index).copied() {
+                    if character == '\\' {
+                        let escaped =
+                            *characters.get(index + 1).ok_or_else(snapshot_unavailable)?;
+                        module.push(escaped);
+                        index += 2;
+                    } else if character == delimiter {
+                        break;
+                    } else {
+                        module.push(character);
+                        index += 1;
+                    }
+                }
+                if characters.get(index) != Some(&delimiter) {
+                    return Err(snapshot_unavailable());
+                }
+                index += 1;
+                while characters
+                    .get(index)
+                    .is_some_and(|character| character.is_whitespace())
+                {
+                    index += 1;
+                }
+                if characters.get(index) != Some(&')') {
+                    return Err(snapshot_unavailable());
+                }
+                index += 1;
+                if is_codex_node_entrypoint(&module) || is_codex_package(&module) {
+                    return Ok(true);
+                }
+            }
+            continue;
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return Err(snapshot_unavailable());
+    }
+    Ok(false)
+}
+
+fn npm_argv_runs_codex(tokens: &[String]) -> Result<bool, NativeImportError> {
+    if tokens.is_empty() {
+        return Err(snapshot_unavailable());
+    }
+    let launcher = token_basename(&tokens[0]);
+    let is_npx = matches!(
+        launcher.as_str(),
+        "npx" | "npx.cmd" | "npx.exe" | "npx-cli.js"
+    );
+    let mut index = 1usize;
+    let mut package_option_runs_codex = false;
+    while index < tokens.len() && tokens[index].starts_with('-') {
+        let option = tokens[index].to_ascii_lowercase();
+        if option == "--package" || option == "-p" {
+            let package = tokens.get(index + 1).ok_or_else(snapshot_unavailable)?;
+            package_option_runs_codex |= is_codex_package(package);
+            index += 2;
+        } else {
+            package_option_runs_codex |= option
+                .strip_prefix("--package=")
+                .is_some_and(is_codex_package);
+            index += 1;
+        }
+    }
+    if is_npx {
+        let command = tokens.get(index);
+        return Ok(package_option_runs_codex
+            || command.is_some_and(|command| {
+                is_codex_package(command)
+                    || matches!(token_basename(command).as_str(), "codex" | "codex.cmd")
+            }));
+    }
+    let Some(subcommand) = tokens
+        .get(index)
+        .map(|command| command.to_ascii_lowercase())
+    else {
+        return Ok(false);
+    };
+    let arguments = &tokens[index + 1..];
+    match subcommand.as_str() {
+        "exec" | "x" => npm_exec_runs_codex(arguments, package_option_runs_codex),
+        "run" | "run-script" => Ok(arguments
+            .iter()
+            .find(|argument| !argument.starts_with('-'))
+            .is_some_and(|script| {
+                let script = script.to_ascii_lowercase();
+                script == "codex" || script.starts_with("codex:") || is_codex_package(&script)
+            })),
+        _ => Ok(false),
+    }
+}
+
+fn npm_exec_runs_codex(
+    arguments: &[String],
+    mut package_option_runs_codex: bool,
+) -> Result<bool, NativeImportError> {
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let argument = arguments[index].to_ascii_lowercase();
+        match argument.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "--package" | "-p" => {
+                let package = arguments.get(index + 1).ok_or_else(snapshot_unavailable)?;
+                package_option_runs_codex |= is_codex_package(package);
+                index += 2;
+            }
+            _ if argument.starts_with("--package=") => {
+                package_option_runs_codex |= argument
+                    .strip_prefix("--package=")
+                    .is_some_and(is_codex_package);
+                index += 1;
+            }
+            _ if argument.starts_with('-') => index += 1,
+            _ => break,
+        }
+    }
+    let command_runs_codex = arguments.get(index).is_some_and(|command| {
+        is_codex_package(command)
+            || matches!(token_basename(command).as_str(), "codex" | "codex.cmd")
+    });
+    Ok(package_option_runs_codex || command_runs_codex)
 }
 
 fn is_codex_cmd_script(token: &str) -> bool {
@@ -489,20 +912,6 @@ fn snapshot_unavailable() -> NativeImportError {
 }
 
 #[cfg(windows)]
-fn ensure_snapshot_execution_succeeded(
-    timed_out: bool,
-    succeeded: bool,
-    stdout_overflowed: bool,
-    stderr_overflowed: bool,
-) -> Result<(), NativeImportError> {
-    if timed_out || !succeeded || stdout_overflowed || stderr_overflowed {
-        Err(snapshot_unavailable())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
 mod windows {
     use std::io::{self, Read};
     use std::os::windows::process::CommandExt;
@@ -510,9 +919,7 @@ mod windows {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{
-        classify_process_snapshot, ensure_snapshot_execution_succeeded, snapshot_unavailable,
-    };
+    use super::{classify_process_snapshot, snapshot_unavailable};
     use crate::NativeImportError;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -549,28 +956,55 @@ mod windows {
         stdout: Vec<u8>,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BoundedCommandFailure {
+        Spawn,
+        MissingStdout,
+        MissingStderr,
+        Poll,
+        Kill,
+        Wait,
+        Timeout,
+        StdoutReaderPanic,
+        StderrReaderPanic,
+        StdoutRead,
+        StderrRead,
+        NonZero(i32),
+        UnknownExit,
+        StdoutOverflow,
+        StderrOverflow,
+    }
+
     fn run_bounded_command(
-        mut command: Command,
+        command: Command,
         deadline: Duration,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
     ) -> Result<BoundedCommandOutput, NativeImportError> {
+        run_bounded_command_typed(command, deadline, max_stdout_bytes, max_stderr_bytes)
+            .map_err(map_bounded_command_failure)
+    }
+
+    fn run_bounded_command_typed(
+        mut command: Command,
+        deadline: Duration,
+        max_stdout_bytes: usize,
+        max_stderr_bytes: usize,
+    ) -> Result<BoundedCommandOutput, BoundedCommandFailure> {
         let mut child = command
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|_| snapshot_unavailable())?;
+            .map_err(|_| BoundedCommandFailure::Spawn)?;
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(snapshot_unavailable());
+            stop_owned_child(&mut child)?;
+            return Err(BoundedCommandFailure::MissingStdout);
         };
         let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(snapshot_unavailable());
+            stop_owned_child(&mut child)?;
+            return Err(BoundedCommandFailure::MissingStderr);
         };
         let stdout_reader = thread::spawn(move || read_bounded(stdout, max_stdout_bytes));
         let stderr_reader = thread::spawn(move || read_bounded(stderr, max_stderr_bytes));
@@ -580,33 +1014,53 @@ mod windows {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                Ok(None) | Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                Ok(None) => {
+                    stop_owned_child(&mut child)?;
                     drop(stdout_reader);
                     drop(stderr_reader);
-                    ensure_snapshot_execution_succeeded(true, false, false, false)?;
-                    unreachable!("a timed out process snapshot cannot succeed");
+                    return Err(BoundedCommandFailure::Timeout);
+                }
+                Err(_) => {
+                    stop_owned_child(&mut child)?;
+                    drop(stdout_reader);
+                    drop(stderr_reader);
+                    return Err(BoundedCommandFailure::Poll);
                 }
             }
         };
         let stdout = stdout_reader
             .join()
-            .map_err(|_| snapshot_unavailable())?
-            .map_err(|_| snapshot_unavailable())?;
+            .map_err(|_| BoundedCommandFailure::StdoutReaderPanic)?
+            .map_err(|_| BoundedCommandFailure::StdoutRead)?;
         let stderr = stderr_reader
             .join()
-            .map_err(|_| snapshot_unavailable())?
-            .map_err(|_| snapshot_unavailable())?;
-        ensure_snapshot_execution_succeeded(
-            false,
-            status.success(),
-            stdout.overflowed,
-            stderr.overflowed,
-        )?;
+            .map_err(|_| BoundedCommandFailure::StderrReaderPanic)?
+            .map_err(|_| BoundedCommandFailure::StderrRead)?;
+        if stdout.overflowed {
+            return Err(BoundedCommandFailure::StdoutOverflow);
+        }
+        if stderr.overflowed {
+            return Err(BoundedCommandFailure::StderrOverflow);
+        }
+        if !status.success() {
+            return Err(match status.code() {
+                Some(code) => BoundedCommandFailure::NonZero(code),
+                None => BoundedCommandFailure::UnknownExit,
+            });
+        }
         Ok(BoundedCommandOutput {
             stdout: stdout.bytes,
         })
+    }
+
+    fn stop_owned_child(child: &mut std::process::Child) -> Result<(), BoundedCommandFailure> {
+        child.kill().map_err(|_| BoundedCommandFailure::Kill)?;
+        child.wait().map_err(|_| BoundedCommandFailure::Wait)?;
+        Ok(())
+    }
+
+    fn map_bounded_command_failure(_failure: BoundedCommandFailure) -> NativeImportError {
+        snapshot_unavailable()
     }
 
     struct BoundedOutput {
@@ -642,30 +1096,35 @@ mod windows {
         #[test]
         fn bounded_runner_times_out_and_kills_owned_sleeping_powershell() {
             let root = tempdir().unwrap();
-            let marker = root.path().join("owned-child-survived.txt");
+            let started_marker = root.path().join("owned-child-started.txt");
+            let delayed_marker = root.path().join("owned-child-survived.txt");
             let script = format!(
-                "Start-Sleep -Milliseconds 600; Set-Content -LiteralPath '{}' -Value survived",
-                marker.to_string_lossy().replace('\'', "''")
+                "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Milliseconds 800; Set-Content -LiteralPath '{}' -Value survived",
+                started_marker.to_string_lossy().replace('\'', "''"),
+                delayed_marker.to_string_lossy().replace('\'', "''")
             );
             let started = Instant::now();
 
-            let error = run_bounded_command(
+            let outcome = run_bounded_command_typed(
                 powershell_command(&script),
-                Duration::from_millis(100),
+                Duration::from_millis(500),
                 64 * 1024,
                 64 * 1024,
             )
             .unwrap_err();
 
-            assert!(matches!(error, NativeImportError::Verification(_)));
-            assert!(started.elapsed() < Duration::from_secs(5));
-            thread::sleep(Duration::from_millis(800));
-            assert!(!marker.exists());
+            let elapsed = started.elapsed();
+            assert_eq!(outcome, BoundedCommandFailure::Timeout);
+            assert!(elapsed >= Duration::from_millis(300));
+            assert!(elapsed < Duration::from_secs(3));
+            assert!(started_marker.is_file());
+            thread::sleep(Duration::from_millis(500));
+            assert!(!delayed_marker.exists());
         }
 
         #[test]
         fn bounded_runner_propagates_owned_child_nonzero_exit() {
-            let error = run_bounded_command(
+            let outcome = run_bounded_command_typed(
                 powershell_command("exit 23"),
                 Duration::from_secs(5),
                 64 * 1024,
@@ -673,20 +1132,71 @@ mod windows {
             )
             .unwrap_err();
 
-            assert!(matches!(error, NativeImportError::Verification(_)));
+            assert_eq!(outcome, BoundedCommandFailure::NonZero(23));
         }
 
         #[test]
         fn bounded_runner_detects_actual_stdout_and_stderr_overflow() {
-            for script in [
-                "[Console]::Out.Write(('x' * 4096))",
-                "[Console]::Error.Write(('x' * 4096))",
-            ] {
-                let error =
-                    run_bounded_command(powershell_command(script), Duration::from_secs(5), 64, 64)
-                        .unwrap_err();
+            let root = tempdir().unwrap();
+            for (index, (write, expected)) in [
+                (
+                    "[Console]::Out.Write(('x' * 4096))",
+                    BoundedCommandFailure::StdoutOverflow,
+                ),
+                (
+                    "[Console]::Error.Write(('x' * 4096))",
+                    BoundedCommandFailure::StderrOverflow,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let marker = root.path().join(format!("overflow-{index}-started.txt"));
+                let script = format!(
+                    "Set-Content -LiteralPath '{}' -Value started; {write}",
+                    marker.to_string_lossy().replace('\'', "''")
+                );
+                let outcome = run_bounded_command_typed(
+                    powershell_command(&script),
+                    Duration::from_secs(5),
+                    64,
+                    64,
+                )
+                .unwrap_err();
 
+                assert_eq!(outcome, expected);
+                assert!(marker.is_file());
+            }
+        }
+
+        #[test]
+        fn bounded_runner_reports_spawn_and_maps_every_failure_to_sanitized_error() {
+            let missing = "agentark-owned-missing-process-fixture.exe";
+            let outcome =
+                run_bounded_command_typed(Command::new(missing), Duration::from_secs(1), 64, 64)
+                    .unwrap_err();
+            assert_eq!(outcome, BoundedCommandFailure::Spawn);
+
+            for failure in [
+                BoundedCommandFailure::Spawn,
+                BoundedCommandFailure::MissingStdout,
+                BoundedCommandFailure::MissingStderr,
+                BoundedCommandFailure::Poll,
+                BoundedCommandFailure::Kill,
+                BoundedCommandFailure::Wait,
+                BoundedCommandFailure::Timeout,
+                BoundedCommandFailure::StdoutReaderPanic,
+                BoundedCommandFailure::StderrReaderPanic,
+                BoundedCommandFailure::StdoutRead,
+                BoundedCommandFailure::StderrRead,
+                BoundedCommandFailure::NonZero(23),
+                BoundedCommandFailure::UnknownExit,
+                BoundedCommandFailure::StdoutOverflow,
+                BoundedCommandFailure::StderrOverflow,
+            ] {
+                let error = map_bounded_command_failure(failure);
                 assert!(matches!(error, NativeImportError::Verification(_)));
+                assert!(!error.to_string().contains(missing));
             }
         }
 
