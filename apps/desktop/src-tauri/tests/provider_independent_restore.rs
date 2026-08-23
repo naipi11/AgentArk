@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use agentark_adapter_codex::{
     CodexContinuationReport, CodexContinuationRequest, CodexError, CodexTargetDefault,
@@ -67,14 +69,58 @@ struct FakeExecutor {
     target_default: Mutex<CodexTargetDefault>,
     existing_verification: Mutex<Result<(), RecoveryError>>,
     vendor_writes: AtomicUsize,
+    target_probe_calls: AtomicUsize,
     native_calls: AtomicUsize,
     continuation_calls: AtomicUsize,
     rollback_calls: AtomicUsize,
     rollback_fails: bool,
     native_summary: Mutex<NativeAttemptSummary>,
+    concurrent_fork_gate: Option<Arc<ConcurrentForkGate>>,
+}
+
+struct ConcurrentForkGate {
+    arrivals: Mutex<usize>,
+    wake: Condvar,
+}
+
+impl ConcurrentForkGate {
+    fn new() -> Self {
+        Self {
+            arrivals: Mutex::new(0),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn wait_for_competing_fork(&self) {
+        let mut arrivals = self.arrivals.lock().unwrap();
+        *arrivals += 1;
+        self.wake.notify_all();
+        if *arrivals == 1 {
+            let _ = self
+                .wake
+                .wait_timeout_while(arrivals, Duration::from_millis(500), |count| *count < 2)
+                .unwrap();
+        }
+    }
 }
 
 impl FakeExecutor {
+    fn set_target_default(&self, provider: &str, model: &str) {
+        *self.target_default.lock().unwrap() = CodexTargetDefault {
+            model_provider: provider.into(),
+            model: model.into(),
+        };
+    }
+
+    fn target_probe_call_count(&self) -> usize {
+        self.target_probe_calls.load(Ordering::SeqCst)
+    }
+
+    fn with_concurrent_fork_gate(mut self, gate: Arc<ConcurrentForkGate>) -> Self {
+        self.concurrent_fork_gate = Some(gate);
+        self
+    }
+
     fn existing_target_conflict(self) -> Self {
         *self.existing_verification.lock().unwrap() = Err(RecoveryError::Conflict);
         self
@@ -156,6 +202,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
         &self,
         _input: &RecoveryInput,
     ) -> Result<CodexTargetDefault, RecoveryError> {
+        self.target_probe_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.target_default.lock().unwrap().clone())
     }
 
@@ -200,6 +247,9 @@ impl CodexRecoveryExecutor for FakeExecutor {
         target_default: &CodexTargetDefault,
     ) -> Result<CodexContinuationReport, RecoveryError> {
         self.continuation_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.concurrent_fork_gate {
+            gate.wait_for_competing_fork();
+        }
         match self.continuation.lock().unwrap().pop_front().unwrap() {
             ContinuationScript::Success => {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
@@ -259,11 +309,13 @@ fn fake_executor() -> FakeExecutor {
         }),
         existing_verification: Mutex::new(Ok(())),
         vendor_writes: AtomicUsize::new(0),
+        target_probe_calls: AtomicUsize::new(0),
         native_calls: AtomicUsize::new(0),
         continuation_calls: AtomicUsize::new(0),
         rollback_calls: AtomicUsize::new(0),
         rollback_fails: false,
         native_summary: Mutex::new(NativeAttemptSummary::default()),
+        concurrent_fork_gate: None,
     }
 }
 
@@ -655,6 +707,96 @@ fn restore_again(
         .unwrap()
 }
 
+fn restore_again_with_writer(
+    fixture: &RestoredFixture,
+    executor: &dyn CodexRecoveryExecutor,
+    mapping_writer: &dyn RestoreMappingWriter,
+) -> agentark_desktop_lib::BundleReport {
+    fixture
+        .state
+        .bundle_restore_with_executor_and_mapping_writer(
+            fixture.bundle_path.clone(),
+            executor,
+            mapping_writer,
+            fixture.codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            fixture.codex_home.join("agentark-backups"),
+        )
+        .unwrap()
+}
+
+#[test]
+fn concurrent_restores_share_one_fork_and_one_persistent_mapping() {
+    let root = TempRoot::new("concurrent-provider-restore");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("fixture.ahbundle");
+    let restored_session = session(30, "native-concurrent");
+    write_selected_sessions_with_native(
+        &bundle_path,
+        "codex",
+        std::slice::from_ref(&restored_session),
+        &[],
+        &[payload(&restored_session)],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let state = AppState::for_data_root(data_root);
+    let gate = Arc::new(ConcurrentForkGate::new());
+    let executor = Arc::new(
+        fake_executor()
+            .native_missing_provider()
+            .native_missing_provider()
+            .continuation_success()
+            .continuation_success()
+            .with_concurrent_fork_gate(gate),
+    );
+
+    let first_state = state.clone();
+    let first_executor = Arc::clone(&executor);
+    let first_bundle = bundle_path.clone();
+    let first_home = codex_home.clone();
+    let first = thread::spawn(move || {
+        first_state.bundle_restore_with_executor(
+            first_bundle,
+            first_executor.as_ref(),
+            first_home.clone(),
+            PathBuf::from("fake-codex"),
+            first_home.join("agentark-backups"),
+        )
+    });
+    let second_state = state.clone();
+    let second_executor = Arc::clone(&executor);
+    let second_bundle = bundle_path.clone();
+    let second_home = codex_home.clone();
+    let second = thread::spawn(move || {
+        second_state.bundle_restore_with_executor(
+            second_bundle,
+            second_executor.as_ref(),
+            second_home.clone(),
+            PathBuf::from("fake-codex"),
+            second_home.join("agentark-backups"),
+        )
+    });
+
+    let first_report = first.join().unwrap().unwrap();
+    let second_report = second.join().unwrap().unwrap();
+    let mappings = state.restore_mappings_for(restored_session.id).unwrap();
+
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), 1);
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(
+        mappings[0].target_native_id.as_deref(),
+        Some("continued-native-concurrent")
+    );
+    assert_eq!(
+        first_report.restore_mapping_count + second_report.restore_mapping_count,
+        2
+    );
+}
+
 #[test]
 fn compatible_payload_retains_original_id() {
     let executor = fake_executor().native_success();
@@ -740,6 +882,8 @@ fn repeating_verified_continuation_reuses_one_target_and_one_mapping() {
         .into_iter()
         .next()
         .unwrap();
+    assert_eq!(executor.target_probe_call_count(), 1);
+    executor.set_target_default("other-provider", "other-model");
 
     let second = restore_again(&fixture, &executor);
     let mappings = fixture
@@ -749,7 +893,11 @@ fn repeating_verified_continuation_reuses_one_target_and_one_mapping() {
 
     assert_eq!(executor.continuation_call_count(), 1);
     assert_eq!(executor.vendor_write_count(), 1);
-    assert_eq!(second.continuation_count, 1);
+    assert_eq!(executor.target_probe_call_count(), 1);
+    assert_eq!(second.native_identity_count, 0);
+    assert_eq!(second.continuation_count, 0);
+    assert_eq!(second.native_imported_count, 0);
+    assert!(!second.native_restart_required);
     assert_eq!(second.restore_mapping_count, 1);
     assert_eq!(mappings.len(), 1);
     assert_eq!(mappings[0].target_native_id, original.target_native_id);
@@ -1040,6 +1188,44 @@ impl RestoreMappingWriter for FailingMappingWriter {
     fn record(&self, _index: &mut IndexDb, _mapping: &RestoreMapping) -> Result<(), String> {
         Err("fixture-mapping-failure".into())
     }
+}
+
+#[test]
+fn failed_archive_upgrade_keeps_existing_mapping_count_after_rollback() {
+    let initial_executor = fake_executor()
+        .native_missing_provider()
+        .continuation_unavailable();
+    let fixture = restore_fixture(
+        &initial_executor,
+        vec![session(31, "native-archive-upgrade")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let retry_executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+
+    let report = restore_again_with_writer(&fixture, &retry_executor, &FailingMappingWriter);
+    let mappings = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+
+    assert_eq!(retry_executor.rollback_call_count(), 1);
+    assert_eq!(report.native_identity_count, 0);
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(report.restore_mapping_count, 1);
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("restore-mapping-persistence-failed")
+    );
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(
+        mappings[0].outcome,
+        agentark_migration::RestoreOutcome::ArchiveOnly
+    );
 }
 
 #[test]

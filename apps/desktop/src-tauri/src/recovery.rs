@@ -373,6 +373,7 @@ pub struct ProductionCodexRecoveryExecutor {
     write_guard: OnceLock<Result<(), RecoveryError>>,
     target_default: OnceLock<Result<CodexTargetDefault, RecoveryError>>,
     preflight: Arc<dyn CodexRecoveryPreflight>,
+    existing_target_verifier: Arc<dyn CodexExistingTargetVerifier>,
     native_summary: Mutex<NativeAttemptSummary>,
 }
 
@@ -382,7 +383,16 @@ pub trait CodexRecoveryPreflight: Send + Sync {
     fn probe(&self, executable: &Path) -> Result<(), RecoveryError>;
 }
 
+trait CodexExistingTargetVerifier: Send + Sync {
+    fn verify(
+        &self,
+        input: &RecoveryInput,
+        target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError>;
+}
+
 struct SystemCodexRecoveryPreflight;
+struct SystemCodexExistingTargetVerifier;
 
 impl CodexRecoveryPreflight for SystemCodexRecoveryPreflight {
     fn ensure_not_running(&self) -> Result<(), RecoveryError> {
@@ -398,12 +408,32 @@ impl CodexRecoveryPreflight for SystemCodexRecoveryPreflight {
     }
 }
 
+impl CodexExistingTargetVerifier for SystemCodexExistingTargetVerifier {
+    fn verify(
+        &self,
+        input: &RecoveryInput,
+        target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError> {
+        verify_target_session(
+            &input.executable,
+            &input.codex_home,
+            &CodexTargetSessionExpectation {
+                thread_id: target.target_native_id.clone(),
+                model_provider: target.model_provider.clone(),
+                rollout_hash: target.rollout_hash.clone(),
+            },
+        )
+        .map_err(|_| RecoveryError::Conflict)
+    }
+}
+
 impl ProductionCodexRecoveryExecutor {
     pub fn new() -> Self {
         Self {
             write_guard: OnceLock::new(),
             target_default: OnceLock::new(),
             preflight: Arc::new(SystemCodexRecoveryPreflight),
+            existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
     }
@@ -414,6 +444,21 @@ impl ProductionCodexRecoveryExecutor {
             write_guard: OnceLock::new(),
             target_default: OnceLock::new(),
             preflight,
+            existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
+            native_summary: Mutex::new(NativeAttemptSummary::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_preflight_and_target_verifier(
+        preflight: Arc<dyn CodexRecoveryPreflight>,
+        existing_target_verifier: Arc<dyn CodexExistingTargetVerifier>,
+    ) -> Self {
+        Self {
+            write_guard: OnceLock::new(),
+            target_default: OnceLock::new(),
+            preflight,
+            existing_target_verifier,
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
     }
@@ -550,20 +595,7 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
         if input.codex_home.as_os_str().is_empty() || !input.codex_home.is_dir() {
             return Err(RecoveryError::Unavailable);
         }
-        let current = self.probe_target_default(input)?;
-        if current.model_provider != target.model_provider {
-            return Err(RecoveryError::Conflict);
-        }
-        verify_target_session(
-            &input.executable,
-            &input.codex_home,
-            &CodexTargetSessionExpectation {
-                thread_id: target.target_native_id.clone(),
-                model_provider: target.model_provider.clone(),
-                rollout_hash: target.rollout_hash.clone(),
-            },
-        )
-        .map_err(|_| RecoveryError::Conflict)
+        self.existing_target_verifier.verify(input, target)
     }
 
     fn rollback(
@@ -813,6 +845,21 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
+    struct RecordingExistingTargetVerifier {
+        targets: Arc<Mutex<Vec<ExistingRestoreTarget>>>,
+    }
+
+    impl CodexExistingTargetVerifier for RecordingExistingTargetVerifier {
+        fn verify(
+            &self,
+            _input: &RecoveryInput,
+            target: &ExistingRestoreTarget,
+        ) -> Result<(), RecoveryError> {
+            self.targets.lock().unwrap().push(target.clone());
+            Ok(())
+        }
+    }
+
     impl CodexRecoveryPreflight for RejectingProbe {
         fn ensure_not_running(&self) -> Result<(), RecoveryError> {
             self.events.lock().unwrap().push("process-check");
@@ -862,6 +909,34 @@ mod tests {
                 )
                 .exists()
         );
+    }
+
+    #[test]
+    fn existing_target_verification_does_not_probe_current_default() {
+        let root = TempRoot::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let executor = ProductionCodexRecoveryExecutor::with_preflight_and_target_verifier(
+            Arc::new(RejectingProbe {
+                events: Arc::clone(&events),
+            }),
+            Arc::new(RecordingExistingTargetVerifier {
+                targets: Arc::clone(&targets),
+            }),
+        );
+        let target = ExistingRestoreTarget {
+            outcome: RestoreOutcome::Continuation,
+            target_native_id: "stored-target-id".into(),
+            model_provider: "stored-provider".into(),
+            rollout_hash: Sha256Digest::from_bytes(b"stored rollout"),
+        };
+
+        executor
+            .verify_existing_target(&input(&root.0), &target)
+            .unwrap();
+
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(*targets.lock().unwrap(), [target]);
     }
 
     #[test]

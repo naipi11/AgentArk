@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,7 @@ pub struct AppState {
     pub services: Arc<Mutex<AppServices>>,
     data_root: PathBuf,
     scan_lock: Arc<Mutex<()>>,
+    restore_lock: Arc<Mutex<()>>,
     watch_roots: Arc<Mutex<Vec<WatchRoot>>>,
     watcher_started: Arc<AtomicBool>,
 }
@@ -90,6 +91,10 @@ impl RestoreMappingWriter for IndexRestoreMappingWriter {
             .record_restore_mapping(mapping)
             .map_err(|_| "restore-mapping-persistence-failed".into())
     }
+}
+
+fn acquire_restore_lock(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
+    lock.lock().map_err(|_| "恢复操作锁不可用".to_owned())
 }
 
 struct EmptyUseCase;
@@ -152,6 +157,7 @@ impl AppState {
             })),
             data_root: default_data_dir(),
             scan_lock: Arc::new(Mutex::new(())),
+            restore_lock: Arc::new(Mutex::new(())),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -170,6 +176,7 @@ impl AppState {
             })),
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
+            restore_lock: Arc::new(Mutex::new(())),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -187,6 +194,7 @@ impl AppState {
             })),
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
+            restore_lock: Arc::new(Mutex::new(())),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -760,6 +768,7 @@ impl AppState {
         executable: PathBuf,
         backup_root: PathBuf,
     ) -> Result<BundleReport, String> {
+        let _restore_guard = acquire_restore_lock(&self.restore_lock)?;
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
@@ -936,11 +945,6 @@ impl AppState {
                         continue;
                     }
                     restore_mapping_count += 1;
-                    match mapping.outcome {
-                        RestoreOutcome::NativeIdentity => native_identity_count += 1,
-                        RestoreOutcome::Continuation => continuation_count += 1,
-                        RestoreOutcome::ArchiveOnly => unreachable!(),
-                    }
                     continue;
                 }
                 let has_archive_mapping = target_mappings
@@ -1019,6 +1023,9 @@ impl AppState {
                     Err(_) => match executor.rollback(&input, &recovery) {
                         Ok(()) => {
                             archive_only_count += 1;
+                            if has_archive_mapping {
+                                restore_mapping_count += 1;
+                            }
                             if recovery_error.is_none() {
                                 recovery_error = Some("restore-mapping-persistence-failed".into());
                             }
@@ -1406,4 +1413,28 @@ fn resolve_codex_executable() -> PathBuf {
         }
     }
     PathBuf::from("codex")
+}
+
+#[cfg(test)]
+mod restore_lock_tests {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use super::acquire_restore_lock;
+
+    #[test]
+    fn poisoned_restore_lock_fails_closed() {
+        let lock = Arc::new(Mutex::new(()));
+        let poisoned = Arc::clone(&lock);
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison restore lock fixture");
+        })
+        .join();
+
+        assert_eq!(
+            acquire_restore_lock(&lock).err().as_deref(),
+            Some("恢复操作锁不可用")
+        );
+    }
 }
