@@ -46,6 +46,21 @@ impl JsonRpcTransport for ScriptedTransport {
     }
 }
 
+fn delete_listing_sequence(sent: &[Value]) -> Vec<(&str, Option<bool>, Option<&str>)> {
+    sent.iter()
+        .filter_map(|request| {
+            let method = request.get("method")?.as_str()?;
+            matches!(method, "thread/delete" | "thread/list").then(|| {
+                (
+                    method,
+                    request.pointer("/params/archived").and_then(Value::as_bool),
+                    request.pointer("/params/cursor").and_then(Value::as_str),
+                )
+            })
+        })
+        .collect()
+}
+
 fn expected(cwd: &Path, hash: Sha256Digest) -> CodexTargetSessionExpectation {
     CodexTargetSessionExpectation {
         thread_id: "019exact-target".into(),
@@ -507,4 +522,97 @@ fn delete_helper_rejects_repeated_thread_list_cursor() {
         delete_thread_with_app_server_transport(&mut transport, "019delete-target"),
         Err(NativeImportError::ManualIntervention)
     ));
+}
+
+#[test]
+fn delete_helper_finds_target_on_second_archived_page() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"data": [], "nextCursor": null}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {"data": [], "nextCursor": "archived-page-2"}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "result": {"data": [{"id": "019delete-target"}], "nextCursor": null}
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    assert!(matches!(
+        delete_thread_with_app_server_transport(&mut transport, "019delete-target"),
+        Err(NativeImportError::ManualIntervention)
+    ));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        delete_listing_sequence(&sent),
+        [
+            ("thread/delete", None, None),
+            ("thread/list", Some(false), None),
+            ("thread/list", Some(true), None),
+            ("thread/list", Some(true), Some("archived-page-2")),
+        ]
+    );
+}
+
+#[test]
+fn delete_helper_rejects_empty_thread_list_cursor() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"data": [], "nextCursor": ""}
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    assert!(matches!(
+        delete_thread_with_app_server_transport(&mut transport, "019delete-target"),
+        Err(NativeImportError::ManualIntervention)
+    ));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        delete_listing_sequence(&sent),
+        [
+            ("thread/delete", None, None),
+            ("thread/list", Some(false), None),
+        ]
+    );
+}
+
+#[test]
+fn delete_helper_rejects_non_string_thread_list_cursor() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"data": [], "nextCursor": 42}
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    assert!(matches!(
+        delete_thread_with_app_server_transport(&mut transport, "019delete-target"),
+        Err(NativeImportError::ManualIntervention)
+    ));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        delete_listing_sequence(&sent),
+        [
+            ("thread/delete", None, None),
+            ("thread/list", Some(false), None),
+        ]
+    );
 }
