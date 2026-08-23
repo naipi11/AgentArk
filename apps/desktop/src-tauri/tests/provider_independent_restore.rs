@@ -71,6 +71,7 @@ struct FakeExecutor {
     target_probe_calls: AtomicUsize,
     native_calls: AtomicUsize,
     continuation_calls: AtomicUsize,
+    existing_verification_calls: AtomicUsize,
     rollback_calls: AtomicUsize,
     rollback_fails: bool,
     native_summary: Mutex<NativeAttemptSummary>,
@@ -172,6 +173,10 @@ impl FakeExecutor {
         self.continuation_calls.load(Ordering::SeqCst)
     }
 
+    fn existing_verification_call_count(&self) -> usize {
+        self.existing_verification_calls.load(Ordering::SeqCst)
+    }
+
     fn rollback_failure(mut self) -> Self {
         self.rollback_fails = true;
         self
@@ -270,6 +275,8 @@ impl CodexRecoveryExecutor for FakeExecutor {
         _input: &RecoveryInput,
         _target: &ExistingRestoreTarget,
     ) -> Result<(), RecoveryError> {
+        self.existing_verification_calls
+            .fetch_add(1, Ordering::SeqCst);
         *self.existing_verification.lock().unwrap()
     }
 
@@ -304,6 +311,7 @@ fn fake_executor() -> FakeExecutor {
         target_probe_calls: AtomicUsize::new(0),
         native_calls: AtomicUsize::new(0),
         continuation_calls: AtomicUsize::new(0),
+        existing_verification_calls: AtomicUsize::new(0),
         rollback_calls: AtomicUsize::new(0),
         rollback_fails: false,
         native_summary: Mutex::new(NativeAttemptSummary::default()),
@@ -876,7 +884,6 @@ fn restore_lock_spans_vendor_write_mapping_and_repeat_reuse() {
         .unwrap();
     let mappings = state.restore_mappings_for(restored_session.id).unwrap();
 
-    assert!(state.try_restore_lock_for_test().unwrap());
     assert_eq!(executor.restore_lock_check_count(), 2);
     assert_eq!(mapping_writer.call_count(), 1);
     assert_eq!(executor.continuation_call_count(), 1);
@@ -891,6 +898,14 @@ fn restore_lock_spans_vendor_write_mapping_and_repeat_reuse() {
     assert_eq!(first_report.continuation_count, 1);
     assert_eq!(second_report.continuation_count, 0);
     assert!(!second_report.native_restart_required);
+}
+
+#[test]
+fn isolated_test_states_share_one_restore_lock() {
+    let first = AppState::for_data_root(TempRoot::new("shared-lock-first").path().join("data"));
+    let second = AppState::for_data_root(TempRoot::new("shared-lock-second").path().join("data"));
+
+    assert!(first.shares_restore_lock_for_test(&second));
 }
 
 #[test]
@@ -1424,6 +1439,82 @@ impl RestoreMappingWriter for MissingTargetHashMappingWriter {
             .record_restore_mapping(&incomplete)
             .map_err(|_| "fixture-mapping-failure".into())
     }
+}
+
+struct LegacyPayloadHashMappingWriter {
+    source_hash: agentark_canonical::Sha256Digest,
+}
+
+impl RestoreMappingWriter for LegacyPayloadHashMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        let mut legacy = mapping.clone();
+        legacy.source_hash = self.source_hash.clone();
+        index
+            .record_restore_mapping(&legacy)
+            .map_err(|_| "fixture-mapping-failure".into())
+    }
+}
+
+#[test]
+fn legacy_payload_hash_mapping_reuses_exact_target_without_repeat_write() {
+    let restored_session = session(45, "legacy-payload-hash");
+    let legacy_hash =
+        agentark_canonical::Sha256Digest::from_bytes(&payload(&restored_session).bytes);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![restored_session],
+        "codex",
+        true,
+        Some(&LegacyPayloadHashMappingWriter {
+            source_hash: legacy_hash,
+        }),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.existing_verification_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(second.manual_intervention_count, 0);
+}
+
+#[test]
+fn legacy_payload_hash_mapping_still_conflicts_when_exact_target_is_invalid() {
+    let restored_session = session(46, "legacy-payload-hash-invalid-target");
+    let legacy_hash =
+        agentark_canonical::Sha256Digest::from_bytes(&payload(&restored_session).bytes);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success()
+        .existing_target_conflict();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![restored_session],
+        "codex",
+        true,
+        Some(&LegacyPayloadHashMappingWriter {
+            source_hash: legacy_hash,
+        }),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.existing_verification_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
 }
 
 #[test]

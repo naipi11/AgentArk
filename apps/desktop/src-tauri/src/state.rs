@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,9 @@ use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, RestoreMapping};
 use agentark_migration::{RestoreOutcome, agent_label};
-use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
+use agentark_security::{
+    DatasetBootstrap, MasterKeyStore, MemoryMasterKeyStore, OsMasterKeyStore, SecretScanner,
+};
 use agentark_watch::{
     ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
 };
@@ -74,8 +76,15 @@ pub struct AppState {
     data_root: PathBuf,
     scan_lock: Arc<Mutex<()>>,
     restore_lock: Arc<Mutex<()>>,
+    key_store: StorageKeyStore,
     watch_roots: Arc<Mutex<Vec<WatchRoot>>>,
     watcher_started: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum StorageKeyStore {
+    Os,
+    Memory(MemoryMasterKeyStore),
 }
 
 #[doc(hidden)]
@@ -95,6 +104,11 @@ impl RestoreMappingWriter for IndexRestoreMappingWriter {
 
 fn acquire_restore_lock(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
     lock.lock().map_err(|_| "恢复操作锁不可用".to_owned())
+}
+
+fn isolated_test_restore_lock() -> Arc<Mutex<()>> {
+    static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
 }
 
 struct EmptyUseCase;
@@ -158,6 +172,7 @@ impl AppState {
             data_root: default_data_dir(),
             scan_lock: Arc::new(Mutex::new(())),
             restore_lock: Arc::new(Mutex::new(())),
+            key_store: StorageKeyStore::Os,
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -165,7 +180,8 @@ impl AppState {
 
     pub fn open_default() -> Self {
         let data_root = default_data_dir();
-        let Some(index) = open_index(&data_root) else {
+        let key_store = StorageKeyStore::Os;
+        let Some(index) = open_index(&data_root, &key_store) else {
             return Self::empty();
         };
         Self {
@@ -177,6 +193,7 @@ impl AppState {
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
             restore_lock: Arc::new(Mutex::new(())),
+            key_store,
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -194,7 +211,8 @@ impl AppState {
             })),
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
-            restore_lock: Arc::new(Mutex::new(())),
+            restore_lock: isolated_test_restore_lock(),
+            key_store: StorageKeyStore::Memory(MemoryMasterKeyStore::empty()),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -207,6 +225,11 @@ impl AppState {
             Err(TryLockError::WouldBlock) => Ok(false),
             Err(TryLockError::Poisoned(_)) => Err("恢复操作锁不可用".to_owned()),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn shares_restore_lock_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.restore_lock, &other.restore_lock)
     }
 
     pub fn scan_codex(&self, source_root: PathBuf) -> Result<ScanReport, String> {
@@ -254,7 +277,7 @@ impl AppState {
 
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -313,7 +336,7 @@ impl AppState {
 
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -371,7 +394,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -429,7 +452,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -490,7 +513,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -548,7 +571,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -582,8 +605,8 @@ impl AppState {
         }
         self.release_query_index()?;
         let result = (|| {
-            let index =
-                open_index(&self.data_root).ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
+            let index = open_index(&self.data_root, &self.key_store)
+                .ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
             let sessions = index
                 .all_sessions_filtered(agent_kind.clone())
                 .map_err(|_| "无法读取本地会话".to_owned())?;
@@ -856,7 +879,7 @@ impl AppState {
         }
         self.release_query_index()?;
         let result = (|| {
-            let (_cas, mut index) = open_storage(&self.data_root)?;
+            let (_cas, mut index) = open_storage(&self.data_root, &self.key_store)?;
             let scan_id = index
                 .restore_sessions(&sessions)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
@@ -940,14 +963,6 @@ impl AppState {
                     continue;
                 }
                 if let Some(mapping) = durable_mappings.first() {
-                    let current_source_hash = match recovery_source_hash(&input) {
-                        Ok(hash) => hash,
-                        Err(_) => {
-                            manual_intervention_count += 1;
-                            recovery_error = Some("restore-mapping-conflict".into());
-                            continue;
-                        }
-                    };
                     let target = mapping
                         .target_native_id
                         .clone()
@@ -961,11 +976,18 @@ impl AppState {
                                 rollout_hash,
                             }
                         });
-                    if mapping.source_hash != current_source_hash
-                        || target.as_ref().is_none_or(|target| {
-                            executor.verify_existing_target(&input, target).is_err()
-                        })
-                    {
+                    let target_is_exact = target.as_ref().is_some_and(|target| {
+                        executor.verify_existing_target(&input, target).is_ok()
+                    });
+                    let current_source_hash = recovery_source_hash(&input).ok();
+                    let source_hash_matches = current_source_hash
+                        .as_ref()
+                        .is_some_and(|hash| mapping.source_hash == *hash)
+                        || input
+                            .native_payload
+                            .as_ref()
+                            .is_some_and(|payload| mapping.source_hash == payload.source_hash);
+                    if !target_is_exact || !source_hash_matches {
                         manual_intervention_count += 1;
                         recovery_error = Some("restore-mapping-conflict".into());
                         continue;
@@ -1099,7 +1121,7 @@ impl AppState {
     #[doc(hidden)]
     pub fn restore_mappings_for(&self, session_id: Uuid) -> Result<Vec<RestoreMapping>, String> {
         self.release_query_index()?;
-        let result = open_index(&self.data_root)
+        let result = open_index(&self.data_root, &self.key_store)
             .ok_or_else(|| "无法打开本地加密索引".to_owned())?
             .restore_mappings_for(session_id)
             .map_err(|_| "无法读取恢复映射".to_owned());
@@ -1204,7 +1226,7 @@ impl AppState {
     }
 
     fn refresh_query_index(&self) -> Result<(), String> {
-        let index = open_index(&self.data_root)
+        let index = open_index(&self.data_root, &self.key_store)
             .ok_or_else(|| "扫描完成，但无法重新打开本地索引".to_owned())?;
         let mut services = self
             .services
@@ -1365,34 +1387,56 @@ fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".agentark-data"))
 }
 
-fn open_index(root: &Path) -> Option<IndexDb> {
+fn open_index(root: &Path, key_store: &StorageKeyStore) -> Option<IndexDb> {
+    let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
+    match key_store {
+        StorageKeyStore::Os => {
+            let store = OsMasterKeyStore::new(machine_id).ok()?;
+            open_index_with_store(root, &store)
+        }
+        StorageKeyStore::Memory(store) => open_index_with_store(root, store),
+    }
+}
+
+fn open_index_with_store(root: &Path, store: &dyn MasterKeyStore) -> Option<IndexDb> {
     let bootstrap_path = root.join("bootstrap.json");
     if !bootstrap_path.is_file() {
         return None;
     }
     let bootstrap: DatasetBootstrap =
         serde_json::from_slice(&std::fs::read(bootstrap_path).ok()?).ok()?;
-    let machine_id = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        root.to_string_lossy().as_bytes(),
-    );
-    let store = OsMasterKeyStore::new(machine_id).ok()?;
-    let keys = bootstrap.unlock(&store).ok()?;
+    let keys = bootstrap.unlock(store).ok()?;
     IndexDb::open(&root.join("index.db"), keys.sqlcipher_key()).ok()
 }
 
-fn open_storage(root: &Path) -> Result<(EncryptedCas, IndexDb), String> {
+fn open_storage(
+    root: &Path,
+    key_store: &StorageKeyStore,
+) -> Result<(EncryptedCas, IndexDb), String> {
+    let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
+    match key_store {
+        StorageKeyStore::Os => {
+            let store =
+                OsMasterKeyStore::new(machine_id).map_err(|_| "系统密钥存储不可用".to_owned())?;
+            open_storage_with_store(root, &store)
+        }
+        StorageKeyStore::Memory(store) => open_storage_with_store(root, store),
+    }
+}
+
+fn open_storage_with_store(
+    root: &Path,
+    store: &dyn MasterKeyStore,
+) -> Result<(EncryptedCas, IndexDb), String> {
     fs::create_dir_all(root).map_err(|_| "无法创建 AgentArk 数据目录".to_owned())?;
     let bootstrap_path = root.join("bootstrap.json");
-    let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
-    let store = OsMasterKeyStore::new(machine_id).map_err(|_| "系统密钥存储不可用".to_owned())?;
     let bootstrap = if bootstrap_path.is_file() {
         serde_json::from_slice(
             &fs::read(&bootstrap_path).map_err(|_| "无法读取本地数据密钥".to_owned())?,
         )
         .map_err(|_| "本地数据密钥格式无效".to_owned())?
     } else {
-        let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store)
+        let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), store)
             .map_err(|_| "无法创建本地数据密钥".to_owned())?;
         fs::write(
             &bootstrap_path,
@@ -1403,7 +1447,7 @@ fn open_storage(root: &Path) -> Result<(EncryptedCas, IndexDb), String> {
         bootstrap
     };
     let keys = bootstrap
-        .unlock(&store)
+        .unlock(store)
         .map_err(|_| "无法解锁本地数据密钥".to_owned())?;
     let cas = EncryptedCas::open(root.join("cas"), &keys)
         .map_err(|_| "无法打开本地加密归档".to_owned())?;

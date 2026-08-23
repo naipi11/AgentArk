@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -225,21 +226,13 @@ fn verify_native_list_and_read<T: JsonRpcTransport>(
     client: &mut NativeAppServerClient<'_, T>,
     expected: &NativeThreadExpectation,
 ) -> Result<(), NativeImportError> {
-    let active = client.request("thread/list", continuation_list_params(false))?;
-    let active_threads = active
-        .value
-        .pointer("/result/data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
-    if active_threads
-        .iter()
-        .any(|thread| thread.get("id").and_then(Value::as_str) == Some(expected.thread_id.as_str()))
-    {
-        verify_thread_listing(&active.value, expected)?;
-    } else {
-        let archived = client.request("thread/list", continuation_list_params(true))?;
-        verify_thread_listing(&archived.value, expected)?;
-    }
+    let thread = match find_thread_in_listing(client, false, &expected.thread_id)? {
+        Some(thread) => thread,
+        None => find_thread_in_listing(client, true, &expected.thread_id)?.ok_or_else(|| {
+            NativeImportError::Verification("imported thread is not listed".into())
+        })?,
+    };
+    verify_native_thread_listing(&thread, expected)?;
     let read = client.request(
         "thread/read",
         json!({"threadId": expected.thread_id, "includeTurns": true}),
@@ -325,16 +318,14 @@ pub fn verify_target_session_transport<T: JsonRpcTransport>(
 ) -> Result<(), NativeImportError> {
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
-    let active = client.request("thread/list", continuation_list_params(false))?;
-    let rollout_path = match existing_target_rollout(&active.value, codex_home, expected)? {
-        Some(path) => path,
-        None => {
-            let archived = client.request("thread/list", continuation_list_params(true))?;
-            existing_target_rollout(&archived.value, codex_home, expected)?.ok_or_else(|| {
-                NativeImportError::Verification("mapped target thread is not listed".into())
-            })?
-        }
-    };
+    let thread =
+        match find_thread_in_listing(&mut client, false, &expected.thread_id)? {
+            Some(thread) => thread,
+            None => find_thread_in_listing(&mut client, true, &expected.thread_id)?.ok_or_else(
+                || NativeImportError::Verification("mapped target thread is not listed".into()),
+            )?,
+        };
+    let rollout_path = existing_target_rollout(&thread, codex_home, expected)?;
     let bytes = fs::read(&rollout_path).map_err(|_| {
         NativeImportError::Verification("mapped target rollout cannot be read".into())
     })?;
@@ -490,12 +481,15 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
             visible_history: request.visible_history.clone(),
         };
 
-        let active = client.request("thread/list", continuation_list_params(false))?;
-        match existing_target_rollout(&active.value, codex_home, &expected)? {
-            Some(_) => {}
+        match find_thread_in_listing(&mut client, false, &target_thread_id)? {
+            Some(thread) => {
+                let _ = existing_target_rollout(&thread, codex_home, &expected)?;
+            }
             None => {
-                let archived = client.request("thread/list", continuation_list_params(true))?;
-                let _ = existing_target_rollout(&archived.value, codex_home, &expected)?;
+                if let Some(thread) = find_thread_in_listing(&mut client, true, &target_thread_id)?
+                {
+                    let _ = existing_target_rollout(&thread, codex_home, &expected)?;
+                }
             }
         }
         let read = client.request(
@@ -534,16 +528,7 @@ fn delete_and_confirm<T: JsonRpcTransport>(
 ) -> Result<(), NativeImportError> {
     client.request("thread/delete", json!({"threadId": thread_id}))?;
     for archived in [false, true] {
-        let listed = client.request("thread/list", continuation_list_params(archived))?;
-        let threads = listed
-            .value
-            .pointer("/result/data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
-        if threads
-            .iter()
-            .any(|thread| thread.get("id").and_then(Value::as_str) == Some(thread_id))
-        {
+        if find_thread_in_listing(client, archived, thread_id)?.is_some() {
             return Err(NativeImportError::ManualIntervention);
         }
     }
@@ -570,19 +555,10 @@ fn validated_label(value: &Value, kind: &str) -> Result<String, NativeImportErro
 }
 
 fn existing_target_rollout(
-    response: &Value,
+    thread: &Value,
     codex_home: &Path,
     expected: &CodexTargetSessionExpectation,
-) -> Result<Option<PathBuf>, NativeImportError> {
-    let threads = response
-        .pointer("/result/data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
-    let Some(thread) = threads.iter().find(|thread| {
-        thread.get("id").and_then(Value::as_str) == Some(expected.thread_id.as_str())
-    }) else {
-        return Ok(None);
-    };
+) -> Result<PathBuf, NativeImportError> {
     if thread.get("modelProvider").and_then(Value::as_str) != Some(expected.model_provider.as_str())
     {
         return Err(NativeImportError::Verification(
@@ -606,10 +582,52 @@ fn existing_target_rollout(
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
         .ok_or_else(|| NativeImportError::Verification("mapped target path is missing".into()))?;
-    Ok(Some(verified_session_rollout_path(
-        codex_home,
-        Path::new(path),
-    )?))
+    verified_session_rollout_path(codex_home, Path::new(path))
+}
+
+fn find_thread_in_listing<T: JsonRpcTransport>(
+    client: &mut NativeAppServerClient<'_, T>,
+    archived: bool,
+    thread_id: &str,
+) -> Result<Option<Value>, NativeImportError> {
+    const MAX_LIST_PAGES: usize = 10_000;
+    let mut cursor = None::<String>;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..MAX_LIST_PAGES {
+        let listed = client.request(
+            "thread/list",
+            continuation_list_params(archived, cursor.as_deref()),
+        )?;
+        let threads = listed
+            .value
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
+        if let Some(thread) = threads
+            .iter()
+            .find(|thread| thread.get("id").and_then(Value::as_str) == Some(thread_id))
+        {
+            return Ok(Some(thread.clone()));
+        }
+        let next_cursor = match listed.value.pointer("/result/nextCursor") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::String(cursor)) if !cursor.trim().is_empty() => cursor.clone(),
+            Some(_) => {
+                return Err(NativeImportError::Verification(
+                    "thread/list cursor is malformed".into(),
+                ));
+            }
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(NativeImportError::Verification(
+                "thread/list cursor repeated".into(),
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+    Err(NativeImportError::Verification(
+        "thread/list pagination limit exceeded".into(),
+    ))
 }
 
 fn verify_target_thread_read(
@@ -725,12 +743,16 @@ fn verified_session_rollout_path(
     Ok(rollout)
 }
 
-fn continuation_list_params(archived: bool) -> Value {
-    json!({
+fn continuation_list_params(archived: bool, cursor: Option<&str>) -> Value {
+    let mut params = json!({
         "archived": archived,
         "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
         "limit": 1000
-    })
+    });
+    if let Some(cursor) = cursor {
+        params["cursor"] = Value::String(cursor.to_owned());
+    }
+    params
 }
 
 fn verify_thread_read(
@@ -833,6 +855,13 @@ pub fn verify_thread_listing(
             thread.get("id").and_then(Value::as_str) == Some(expected.thread_id.as_str())
         })
         .ok_or_else(|| NativeImportError::Verification("imported thread is not listed".into()))?;
+    verify_native_thread_listing(thread, expected)
+}
+
+fn verify_native_thread_listing(
+    thread: &Value,
+    expected: &NativeThreadExpectation,
+) -> Result<(), NativeImportError> {
     if thread.get("cwd").and_then(Value::as_str) != Some(expected.cwd.as_str()) {
         return Err(NativeImportError::Verification(
             "imported thread cwd does not match".into(),

@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use agentark_adapter_codex::{
     CodexContinuationReport, CodexContinuationRequest, CodexProbe, CodexTargetDefault,
     CodexTargetSessionExpectation, NativeImportError, NativePayloadError, NativeRestoreReport,
-    NativeRolloutPayload, build_canonical_continuation_source, canonical_visible_history,
-    delete_thread_with_app_server, ensure_codex_not_running, fork_rollout_with_target_provider,
-    native_thread_expectation, probe_target_default, restore_native_rollouts,
-    rewrite_native_workspace_paths, verify_rollouts_with_app_server, verify_target_session,
-    write_rollout_atomic,
+    NativeRolloutPayload, NativeThreadExpectation, build_canonical_continuation_source,
+    canonical_visible_history, delete_thread_with_app_server, ensure_codex_not_running,
+    fork_rollout_with_target_provider, native_thread_expectation, probe_target_default,
+    restore_native_rollouts, rewrite_native_workspace_paths, verify_rollouts_with_app_server,
+    verify_target_session, write_rollout_atomic,
 };
 use agentark_canonical::{CanonicalSession, Sha256Digest};
 use agentark_migration::{
@@ -390,6 +390,7 @@ pub struct ProductionCodexRecoveryExecutor {
     target_default: OnceLock<Result<CodexTargetDefault, RecoveryError>>,
     preflight: Arc<dyn CodexRecoveryPreflight>,
     existing_target_verifier: Arc<dyn CodexExistingTargetVerifier>,
+    native_rollout_verifier: Arc<dyn CodexNativeRolloutVerifier>,
     native_summary: Mutex<NativeAttemptSummary>,
 }
 
@@ -407,8 +408,18 @@ trait CodexExistingTargetVerifier: Send + Sync {
     ) -> Result<(), RecoveryError>;
 }
 
+trait CodexNativeRolloutVerifier: Send + Sync {
+    fn verify(
+        &self,
+        input: &RecoveryInput,
+        destination: &Path,
+        expected: &NativeThreadExpectation,
+    ) -> Result<(), RecoveryError>;
+}
+
 struct SystemCodexRecoveryPreflight;
 struct SystemCodexExistingTargetVerifier;
+struct SystemCodexNativeRolloutVerifier;
 
 impl CodexRecoveryPreflight for SystemCodexRecoveryPreflight {
     fn ensure_not_running(&self) -> Result<(), RecoveryError> {
@@ -439,6 +450,22 @@ impl CodexExistingTargetVerifier for SystemCodexExistingTargetVerifier {
     }
 }
 
+impl CodexNativeRolloutVerifier for SystemCodexNativeRolloutVerifier {
+    fn verify(
+        &self,
+        input: &RecoveryInput,
+        destination: &Path,
+        expected: &NativeThreadExpectation,
+    ) -> Result<(), RecoveryError> {
+        verify_rollouts_with_app_server(
+            &input.executable,
+            &input.codex_home,
+            &[(destination.to_path_buf(), expected.clone())],
+        )
+        .map_err(map_native_import_error)
+    }
+}
+
 impl ProductionCodexRecoveryExecutor {
     pub fn new() -> Self {
         Self {
@@ -446,6 +473,7 @@ impl ProductionCodexRecoveryExecutor {
             target_default: OnceLock::new(),
             preflight: Arc::new(SystemCodexRecoveryPreflight),
             existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
+            native_rollout_verifier: Arc::new(SystemCodexNativeRolloutVerifier),
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
     }
@@ -457,6 +485,7 @@ impl ProductionCodexRecoveryExecutor {
             target_default: OnceLock::new(),
             preflight,
             existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
+            native_rollout_verifier: Arc::new(SystemCodexNativeRolloutVerifier),
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
     }
@@ -471,6 +500,22 @@ impl ProductionCodexRecoveryExecutor {
             target_default: OnceLock::new(),
             preflight,
             existing_target_verifier,
+            native_rollout_verifier: Arc::new(SystemCodexNativeRolloutVerifier),
+            native_summary: Mutex::new(NativeAttemptSummary::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_preflight_and_native_verifier(
+        preflight: Arc<dyn CodexRecoveryPreflight>,
+        native_rollout_verifier: Arc<dyn CodexNativeRolloutVerifier>,
+    ) -> Self {
+        Self {
+            write_guard: OnceLock::new(),
+            target_default: OnceLock::new(),
+            preflight,
+            existing_target_verifier: Arc::new(SystemCodexExistingTargetVerifier),
+            native_rollout_verifier,
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
     }
@@ -528,8 +573,16 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
         }
         let rewritten = rewrite_native_workspace_paths(&payload.bytes, &input.workspace_mappings)
             .map_err(map_native_payload_error)?;
-        let expectation =
+        let mut expectation =
             native_thread_expectation(&rewritten).map_err(map_native_payload_error)?;
+        if expectation.thread_id != input.session.source_session_id
+            || expectation.model_provider != target_default.model_provider
+        {
+            return Err(RecoveryError::Verification);
+        }
+        expectation.visible_history = canonical_visible_history(&input.session)
+            .map_err(map_native_payload_error)?
+            .expectation();
         self.ensure_vendor_write_allowed(&input.executable)?;
         let report = match restore_native_rollouts(
             &input.codex_home,
@@ -560,13 +613,12 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
             .codex_home
             .join("sessions")
             .join(&payload.relative_path);
-        if let Err(error) = verify_rollouts_with_app_server(
-            &input.executable,
-            &input.codex_home,
-            &[(destination, expectation)],
-        ) {
+        if let Err(error) = self
+            .native_rollout_verifier
+            .verify(input, &destination, &expectation)
+        {
             cleanup_native_paths(&report.written_paths, |path| fs::remove_file(path))?;
-            return Err(map_native_import_error(error));
+            return Err(error);
         }
         Ok(report)
     }
@@ -860,6 +912,39 @@ mod tests {
         targets: Arc<Mutex<Vec<ExistingRestoreTarget>>>,
     }
 
+    struct AcceptingPreflight;
+
+    struct ExactHistoryNativeVerifier {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CodexRecoveryPreflight for AcceptingPreflight {
+        fn ensure_not_running(&self) -> Result<(), RecoveryError> {
+            Ok(())
+        }
+
+        fn probe(&self, _executable: &Path) -> Result<(), RecoveryError> {
+            Ok(())
+        }
+    }
+
+    impl CodexNativeRolloutVerifier for ExactHistoryNativeVerifier {
+        fn verify(
+            &self,
+            _input: &RecoveryInput,
+            destination: &Path,
+            expected: &NativeThreadExpectation,
+        ) -> Result<(), RecoveryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let actual = native_thread_expectation(&fs::read(destination).unwrap()).unwrap();
+            if actual.visible_history == expected.visible_history {
+                Ok(())
+            } else {
+                Err(RecoveryError::Verification)
+            }
+        }
+    }
+
     impl CodexExistingTargetVerifier for RecordingExistingTargetVerifier {
         fn verify(
             &self,
@@ -920,6 +1005,101 @@ mod tests {
                 )
                 .exists()
         );
+    }
+
+    #[test]
+    fn same_count_native_text_divergence_fails_verification_and_removes_written_target() {
+        let root = TempRoot::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = ProductionCodexRecoveryExecutor::with_preflight_and_native_verifier(
+            Arc::new(AcceptingPreflight),
+            Arc::new(ExactHistoryNativeVerifier {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let mut input = input(&root.0);
+        let payload = input.native_payload.as_mut().unwrap();
+        payload.bytes = String::from_utf8(payload.bytes.clone())
+            .unwrap()
+            .replace("sanitized", "different")
+            .into_bytes();
+        let destination = input
+            .codex_home
+            .join("sessions")
+            .join(&payload.relative_path);
+
+        assert_eq!(
+            executor
+                .try_native_identity(&input, &target_default())
+                .unwrap_err(),
+            RecoveryError::Verification
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn mismatched_internal_native_id_fails_before_vendor_write() {
+        let root = TempRoot::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = ProductionCodexRecoveryExecutor::with_preflight_and_native_verifier(
+            Arc::new(AcceptingPreflight),
+            Arc::new(ExactHistoryNativeVerifier {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let mut input = input(&root.0);
+        let payload = input.native_payload.as_mut().unwrap();
+        payload.bytes = String::from_utf8(payload.bytes.clone())
+            .unwrap()
+            .replace("source-native-id", "different-native-id")
+            .into_bytes();
+        let destination = input
+            .codex_home
+            .join("sessions")
+            .join(&payload.relative_path);
+
+        assert_eq!(
+            executor
+                .try_native_identity(&input, &target_default())
+                .unwrap_err(),
+            RecoveryError::Verification
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!destination.exists());
+        assert!(!input.backup_root.exists());
+    }
+
+    #[test]
+    fn mismatched_internal_native_provider_fails_before_vendor_write() {
+        let root = TempRoot::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = ProductionCodexRecoveryExecutor::with_preflight_and_native_verifier(
+            Arc::new(AcceptingPreflight),
+            Arc::new(ExactHistoryNativeVerifier {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let mut input = input(&root.0);
+        let payload = input.native_payload.as_mut().unwrap();
+        payload.bytes = String::from_utf8(payload.bytes.clone())
+            .unwrap()
+            .replace("source-provider", "other-provider")
+            .into_bytes();
+        let destination = input
+            .codex_home
+            .join("sessions")
+            .join(&payload.relative_path);
+
+        assert_eq!(
+            executor
+                .try_native_identity(&input, &target_default())
+                .unwrap_err(),
+            RecoveryError::Verification
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!destination.exists());
+        assert!(!input.backup_root.exists());
     }
 
     #[test]

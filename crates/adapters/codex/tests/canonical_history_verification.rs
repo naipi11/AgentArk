@@ -451,3 +451,60 @@ fn delete_helper_requires_manual_intervention_when_target_remains_listed() {
         Err(NativeImportError::ManualIntervention)
     ));
 }
+
+#[test]
+fn delete_helper_finds_target_on_second_active_page() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"data": [], "nextCursor": "active-page-2"}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {"data": [{"id": "019delete-target"}], "nextCursor": null}
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    assert!(matches!(
+        delete_thread_with_app_server_transport(&mut transport, "019delete-target"),
+        Err(NativeImportError::ManualIntervention)
+    ));
+    let sent = sent.lock().unwrap();
+    let lists = sent
+        .iter()
+        .filter(|request| request["method"] == "thread/list")
+        .collect::<Vec<_>>();
+    assert_eq!(lists.len(), 2);
+    assert_eq!(lists[0]["params"]["archived"], false);
+    assert_eq!(lists[1]["params"]["archived"], false);
+    assert_eq!(lists[1]["params"]["cursor"], "active-page-2");
+}
+
+#[test]
+fn delete_helper_rejects_repeated_thread_list_cursor() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"data": [], "nextCursor": "repeated"}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {"data": [], "nextCursor": "repeated"}
+        }),
+    ];
+    let (mut transport, _) = ScriptedTransport::new(responses);
+
+    assert!(matches!(
+        delete_thread_with_app_server_transport(&mut transport, "019delete-target"),
+        Err(NativeImportError::ManualIntervention)
+    ));
+}
