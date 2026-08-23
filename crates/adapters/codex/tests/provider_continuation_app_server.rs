@@ -17,6 +17,7 @@ struct FixtureContext {
     _root: TempDir,
     codex_home: PathBuf,
     executable: PathBuf,
+    rollout_path: PathBuf,
     initial_visible_turns: usize,
 }
 
@@ -100,6 +101,7 @@ fn fork_fixture_with_target_provider(
             _root: root,
             codex_home,
             executable,
+            rollout_path: report.rollout_path.clone(),
             initial_visible_turns: report.visible_turns,
         },
     );
@@ -117,6 +119,24 @@ fn start_and_wait_for_turn(thread_id: &str, prompt: &str) -> Result<(), Box<dyn 
     transport.send_value(&json!({
         "jsonrpc": "2.0",
         "id": 2,
+        "method": "thread/resume",
+        "params": {
+            "threadId": thread_id,
+            "path": context.rollout_path
+        }
+    }))?;
+    let resumed = receive_response(&mut transport, 2)?;
+    if resumed
+        .value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        != Some(thread_id)
+    {
+        return Err(io::Error::other("thread/resume returned a different thread").into());
+    }
+    transport.send_value(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
         "method": "turn/start",
         "params": {
             "threadId": thread_id,
@@ -127,7 +147,7 @@ fn start_and_wait_for_turn(thread_id: &str, prompt: &str) -> Result<(), Box<dyn 
     let mut completed = false;
     while !started || !completed {
         let response = transport.receive_value()?;
-        if response.value.get("id") == Some(&Value::from(2)) {
+        if response.value.get("id") == Some(&Value::from(3)) {
             if let Some(error) = response.value.get("error") {
                 return Err(io::Error::other(format!("turn/start failed: {error}")).into());
             }
