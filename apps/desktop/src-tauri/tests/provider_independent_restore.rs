@@ -1,10 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
     CodexContinuationReport, CodexContinuationRequest, CodexError, CodexTargetDefault,
@@ -75,17 +73,27 @@ struct FakeExecutor {
     rollback_calls: AtomicUsize,
     rollback_fails: bool,
     native_summary: Mutex<NativeAttemptSummary>,
-}
-
-#[derive(Default)]
-struct RestoreAttemptState {
-    attempted: bool,
-    allow_attempt: bool,
-    hook_released: bool,
-    completed: bool,
+    restore_lock_probe: Option<AppState>,
+    restore_lock_checks: AtomicUsize,
 }
 
 impl FakeExecutor {
+    fn with_restore_lock_probe(mut self, state: AppState) -> Self {
+        self.restore_lock_probe = Some(state);
+        self
+    }
+
+    fn assert_restore_lock_held(&self) {
+        if let Some(state) = &self.restore_lock_probe {
+            assert!(!state.try_restore_lock_for_test().unwrap());
+            self.restore_lock_checks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn restore_lock_check_count(&self) -> usize {
+        self.restore_lock_checks.load(Ordering::SeqCst)
+    }
+
     fn set_target_default(&self, provider: &str, model: &str) {
         *self.target_default.lock().unwrap() = CodexTargetDefault {
             model_provider: provider.into(),
@@ -187,6 +195,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
         input: &RecoveryInput,
         _target_default: &CodexTargetDefault,
     ) -> Result<NativeRestoreReport, RecoveryError> {
+        self.assert_restore_lock_held();
         self.native_calls.fetch_add(1, Ordering::SeqCst);
         match self.native.lock().unwrap().pop_front().unwrap() {
             NativeScript::Success => {
@@ -222,6 +231,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
         input: &RecoveryInput,
         target_default: &CodexTargetDefault,
     ) -> Result<CodexContinuationReport, RecoveryError> {
+        self.assert_restore_lock_held();
         self.continuation_calls.fetch_add(1, Ordering::SeqCst);
         match self.continuation.lock().unwrap().pop_front().unwrap() {
             ContinuationScript::Success => {
@@ -288,6 +298,8 @@ fn fake_executor() -> FakeExecutor {
         rollback_calls: AtomicUsize::new(0),
         rollback_fails: false,
         native_summary: Mutex::new(NativeAttemptSummary::default()),
+        restore_lock_probe: None,
+        restore_lock_checks: AtomicUsize::new(0),
     }
 }
 
@@ -697,8 +709,36 @@ fn restore_again_with_writer(
         .unwrap()
 }
 
+struct LockCheckingMappingWriter {
+    state: AppState,
+    calls: AtomicUsize,
+}
+
+impl LockCheckingMappingWriter {
+    fn new(state: AppState) -> Self {
+        Self {
+            state,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl RestoreMappingWriter for LockCheckingMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        assert!(!self.state.try_restore_lock_for_test().unwrap());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        index
+            .record_restore_mapping(mapping)
+            .map_err(|_| "fixture-mapping-failure".into())
+    }
+}
+
 #[test]
-fn shared_restore_lock_serializes_restore_and_repeat_reuse() {
+fn restore_lock_spans_vendor_write_mapping_and_repeat_reuse() {
     let root = TempRoot::new("shared-restore-lock");
     let data_root = root.path().join("data");
     let codex_home = root.path().join("codex-home");
@@ -715,74 +755,27 @@ fn shared_restore_lock_serializes_restore_and_repeat_reuse() {
     )
     .unwrap();
     let state = AppState::for_data_root(data_root);
-    let attempt = Arc::new((Mutex::new(RestoreAttemptState::default()), Condvar::new()));
-    let hook_attempt = Arc::clone(&attempt);
-    state
-        .set_restore_lock_attempt_hook_for_test(Arc::new(move || {
-            let (attempt, wake) = &*hook_attempt;
-            let mut observed = attempt.lock().unwrap();
-            observed.attempted = true;
-            wake.notify_all();
-            while !observed.allow_attempt {
-                observed = wake.wait(observed).unwrap();
-            }
-            observed.hook_released = true;
-            wake.notify_all();
-        }))
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success()
+        .with_restore_lock_probe(state.clone());
+    let mapping_writer = LockCheckingMappingWriter::new(state.clone());
+
+    let first_report = state
+        .bundle_restore_with_executor_and_mapping_writer(
+            bundle_path.clone(),
+            &executor,
+            &mapping_writer,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
         .unwrap();
-    let held_guard = state.hold_restore_lock_for_test().unwrap();
-    assert!(!state.clone().try_restore_lock_for_test().unwrap());
-    let executor = Arc::new(
-        fake_executor()
-            .native_missing_provider()
-            .continuation_success(),
-    );
-
-    let first_state = state.clone();
-    let first_executor = Arc::clone(&executor);
-    let first_bundle = bundle_path.clone();
-    let first_home = codex_home.clone();
-    let completion = Arc::clone(&attempt);
-    let first = thread::spawn(move || {
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            first_state.bundle_restore_with_executor(
-                first_bundle,
-                first_executor.as_ref(),
-                first_home.clone(),
-                PathBuf::from("fake-codex"),
-                first_home.join("agentark-backups"),
-            )
-        }));
-        let (attempt, wake) = &*completion;
-        attempt.lock().unwrap().completed = true;
-        wake.notify_all();
-        outcome
-    });
-
-    let (attempt_state, wake) = &*attempt;
-    let mut observed = attempt_state.lock().unwrap();
-    while !observed.attempted && !observed.completed {
-        observed = wake.wait(observed).unwrap();
-    }
-    assert!(
-        observed.attempted,
-        "restore completed without using the shared outer restore lock"
-    );
-    observed.allow_attempt = true;
-    wake.notify_all();
-    while !observed.hook_released {
-        observed = wake.wait(observed).unwrap();
-    }
-    drop(observed);
-    assert!(!state.clone().try_restore_lock_for_test().unwrap());
-    drop(held_guard);
-
-    let first_report = first.join().unwrap().unwrap().unwrap();
-    assert!(state.clone().try_restore_lock_for_test().unwrap());
     let second_report = state
-        .bundle_restore_with_executor(
+        .bundle_restore_with_executor_and_mapping_writer(
             bundle_path,
-            executor.as_ref(),
+            &executor,
+            &mapping_writer,
             codex_home.clone(),
             PathBuf::from("fake-codex"),
             codex_home.join("agentark-backups"),
@@ -790,6 +783,9 @@ fn shared_restore_lock_serializes_restore_and_repeat_reuse() {
         .unwrap();
     let mappings = state.restore_mappings_for(restored_session.id).unwrap();
 
+    assert!(state.try_restore_lock_for_test().unwrap());
+    assert_eq!(executor.restore_lock_check_count(), 2);
+    assert_eq!(mapping_writer.call_count(), 1);
     assert_eq!(executor.continuation_call_count(), 1);
     assert_eq!(executor.vendor_write_count(), 1);
     assert_eq!(mappings.len(), 1);
