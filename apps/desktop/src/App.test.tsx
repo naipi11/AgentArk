@@ -41,6 +41,9 @@ beforeEach(() => {
   dialogState.importPath = 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle';
   restoreResult.manualInterventionCount = 0;
   restoreResult.recoveryError = undefined;
+  restoreResult.nativeIdentityCount = 2;
+  restoreResult.continuationCount = 1;
+  restoreResult.archiveOnlyCount = 1;
   window.localStorage.clear();
 });
 
@@ -107,7 +110,7 @@ test('codex restore reports automatic recovery outcomes without a native-target 
   await waitFor(() => expect(invoke).toHaveBeenCalledWith('bundle_restore', { path: expect.any(String) }));
   expect(await screen.findByText(/2 original sessions retained/i)).toBeInTheDocument();
   expect(screen.getByText(/1 continuation created/i)).toBeInTheDocument();
-  expect(screen.getByText(/1 available in AgentArk archive only/i)).toBeInTheDocument();
+  expect(screen.getByText(/1 session available in AgentArk archive only/i)).toBeInTheDocument();
 });
 
 test('transfer outcome localizes the continuation count in Chinese', async () => {
@@ -137,12 +140,56 @@ test('transfer replaces unsafe recovery diagnostics in the closed disclosure', a
   expect(screen.getByText('Recovery diagnostics unavailable.')).toBeInTheDocument();
 });
 
-test('transfer displays allow-listed recovery diagnostic reason codes', async () => {
-  restoreResult.recoveryError = 'codex-recovery-partial';
+test('transfer displays the stable manual-intervention recovery diagnostic', async () => {
+  restoreResult.recoveryError = 'manual-intervention-required';
   render(<LocaleProvider><App /></LocaleProvider>);
   await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
   fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
-  expect(await screen.findByText('codex-recovery-partial')).toBeInTheDocument();
+  expect(await screen.findByText('manual-intervention-required')).toBeInTheDocument();
+});
+
+test('transfer never renders credential-shaped recovery diagnostics that match the legacy lowercase pattern', async () => {
+  restoreResult.manualInterventionCount = 1;
+  restoreResult.recoveryError = 'sk-proj-lowercase-ui-canary-123456789';
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
+  expect(await screen.findByText('Recovery diagnostics unavailable.')).toBeInTheDocument();
+  expect(screen.queryByText('sk-proj-lowercase-ui-canary-123456789')).not.toBeInTheDocument();
+});
+
+test('transfer uses English singular recovery outcome summaries', async () => {
+  restoreResult.nativeIdentityCount = 1;
+  restoreResult.continuationCount = 1;
+  restoreResult.archiveOnlyCount = 1;
+  restoreResult.manualInterventionCount = 1;
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
+  expect(await screen.findByText('1 original session retained')).toBeInTheDocument();
+  expect(screen.getByText('1 continuation created')).toBeInTheDocument();
+  expect(screen.getByText('1 session available in AgentArk archive only')).toBeInTheDocument();
+  expect(screen.getByText('1 session needs manual intervention')).toBeInTheDocument();
+});
+
+test('transfer uses English plural recovery outcome summaries', async () => {
+  restoreResult.nativeIdentityCount = 2;
+  restoreResult.continuationCount = 2;
+  restoreResult.archiveOnlyCount = 2;
+  restoreResult.manualInterventionCount = 2;
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
+  expect(await screen.findByText('2 original sessions retained')).toBeInTheDocument();
+  expect(screen.getByText('2 continuations created')).toBeInTheDocument();
+  expect(screen.getByText('2 sessions available in AgentArk archive only')).toBeInTheDocument();
+  expect(screen.getByText('2 sessions need manual intervention')).toBeInTheDocument();
 });

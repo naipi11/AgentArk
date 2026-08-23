@@ -5,6 +5,23 @@ import { AgentSelector } from '../components/AgentSelector';
 import { useI18n } from '../i18n';
 
 const bundleDialogFilters = [{ name: 'AgentArk bundle', extensions: ['ahbundle'] }];
+const publicRecoveryReasonCodes = Object.freeze([
+  'native-identity-verified',
+  'target-default-continuation',
+  'continuation-writer-unavailable',
+  'missing-provider',
+  'verification-failed',
+  'target-conflict',
+  'recovery-unavailable',
+  'rollback-required',
+  'manual-intervention-required',
+  'native-payload-unavailable',
+  'target-default-unavailable',
+] as const);
+
+function isPublicRecoveryReasonCode(value: string): boolean {
+  return (publicRecoveryReasonCodes as readonly string[]).includes(value);
+}
 
 export function TransferView({ refreshToken }: { refreshToken: number }) {
   const { t } = useI18n();
@@ -20,9 +37,13 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const [busyAction, setBusyAction] = useState<'export' | 'import' | 'restore' | null>(null);
 
   function safeRecoveryDiagnostic(value: string | undefined) {
-    return value && /^[a-z0-9][a-z0-9-]{0,127}$/.test(value)
+    return value && isPublicRecoveryReasonCode(value)
       ? value
       : t('transfer.recoveryDiagnosticsUnavailable');
+  }
+
+  function recoveryOutcomeSummary(count: number, singular: Parameters<typeof t>[0], plural: Parameters<typeof t>[0]) {
+    return t(count === 1 ? singular : plural).replace('{count}', String(count));
   }
 
   useEffect(() => {
@@ -113,10 +134,10 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
       {message && <p className="muted" role="status">{message}</p>}
       {restoreReport && <div className="transfer-preview" role="status">
         <strong>{t('transfer.outcomeSummary')}</strong>
-        <span>{t('transfer.nativeIdentitySummary').replace('{count}', String(restoreReport.nativeIdentityCount))}</span>
-        <span>{t('transfer.continuationSummary').replace('{count}', String(restoreReport.continuationCount))}</span>
-        <span>{t('transfer.archiveOnlySummary').replace('{count}', String(restoreReport.archiveOnlyCount))}</span>
-        {restoreReport.manualInterventionCount > 0 && <span>{t('transfer.manualInterventionSummary').replace('{count}', String(restoreReport.manualInterventionCount))}</span>}
+        <span>{recoveryOutcomeSummary(restoreReport.nativeIdentityCount, 'transfer.nativeIdentitySummaryOne', 'transfer.nativeIdentitySummaryMany')}</span>
+        <span>{recoveryOutcomeSummary(restoreReport.continuationCount, 'transfer.continuationSummaryOne', 'transfer.continuationSummaryMany')}</span>
+        <span>{recoveryOutcomeSummary(restoreReport.archiveOnlyCount, 'transfer.archiveOnlySummaryOne', 'transfer.archiveOnlySummaryMany')}</span>
+        {restoreReport.manualInterventionCount > 0 && <span>{recoveryOutcomeSummary(restoreReport.manualInterventionCount, 'transfer.manualInterventionSummaryOne', 'transfer.manualInterventionSummaryMany')}</span>}
         {restoreReport.recoveryError && <details><summary>{t('transfer.recoveryDiagnostics')}</summary><span className="muted">{safeRecoveryDiagnostic(restoreReport.recoveryError)}</span></details>}
       </div>}
     </section>
