@@ -959,8 +959,9 @@ impl<'a, T: JsonRpcTransport> NativeAppServerClient<'a, T> {
                 "capabilities": {"experimentalApi": true}
             }),
         )?;
+        let deadline = Instant::now() + self.request_timeout;
         self.transport
-            .send_value(&json!({"method":"initialized","params":{}}))
+            .send_value_until(&json!({"method":"initialized","params":{}}), deadline)
             .map_err(map_codex_error)
     }
 
@@ -969,8 +970,11 @@ impl<'a, T: JsonRpcTransport> NativeAppServerClient<'a, T> {
         self.next_id += 1;
         let deadline = Instant::now() + self.request_timeout;
         self.transport
-            .send_value(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .map_err(map_codex_error)?;
+            .send_value_until(
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+                deadline,
+            )
+            .map_err(|error| map_request_error(method, error))?;
         let response = receive_response_until(self.transport, id, deadline)
             .map_err(|error| map_request_error(method, error))?;
         if let Some(error) = response.value.get("error") {
@@ -994,12 +998,16 @@ fn map_codex_error(error: CodexError) -> NativeImportError {
 }
 
 fn map_request_error(method: &str, error: CodexError) -> NativeImportError {
-    if matches!(error, CodexError::AppServerRequestTimeout)
-        && matches!(
-            method,
-            "thread/fork" | "thread/name/set" | "thread/resume" | "thread/delete"
-        )
-    {
+    if matches!(
+        method,
+        "thread/fork" | "thread/name/set" | "thread/resume" | "thread/delete"
+    ) && matches!(
+        error,
+        CodexError::AppServerRequestTimeout
+            | CodexError::Io(_)
+            | CodexError::EndOfStream
+            | CodexError::MalformedJson
+    ) {
         NativeImportError::MutationOutcomeUnknown
     } else {
         map_codex_error(error)

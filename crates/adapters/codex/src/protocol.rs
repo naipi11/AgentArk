@@ -18,6 +18,13 @@ pub trait JsonRpcTransport {
     fn send_value(&mut self, value: &Value) -> Result<(), CodexError>;
     fn receive_value(&mut self) -> Result<RawJsonRpc, CodexError>;
 
+    fn send_value_until(&mut self, value: &Value, deadline: Instant) -> Result<(), CodexError> {
+        if Instant::now() >= deadline {
+            return Err(CodexError::AppServerRequestTimeout);
+        }
+        self.send_value(value)
+    }
+
     fn receive_value_until(&mut self, deadline: Instant) -> Result<RawJsonRpc, CodexError> {
         if Instant::now() >= deadline {
             return Err(CodexError::AppServerRequestTimeout);
@@ -51,6 +58,7 @@ impl<'a, T: JsonRpcTransport> ReadOnlyAppServerClient<'a, T> {
     }
 
     pub fn initialize(&mut self) -> Result<RawJsonRpc, CodexError> {
+        let deadline = Instant::now() + self.request_timeout;
         let response = self.request(
             "initialize",
             json!({
@@ -60,9 +68,10 @@ impl<'a, T: JsonRpcTransport> ReadOnlyAppServerClient<'a, T> {
                     "version": AGENTARK_APP_SERVER_CLIENT_VERSION
                 }
             }),
+            deadline,
         )?;
         self.transport
-            .send_value(&json!({"method":"initialized","params":{}}))?;
+            .send_value_until(&json!({"method":"initialized","params":{}}), deadline)?;
         Ok(response)
     }
 
@@ -84,7 +93,8 @@ impl<'a, T: JsonRpcTransport> ReadOnlyAppServerClient<'a, T> {
             if let Some(cursor) = cursor.clone() {
                 params["cursor"] = cursor;
             }
-            let response = self.request("thread/list", params)?;
+            let deadline = Instant::now() + self.request_timeout;
+            let response = self.request("thread/list", params, deadline)?;
             let next_cursor = response
                 .value
                 .get("result")
@@ -101,22 +111,31 @@ impl<'a, T: JsonRpcTransport> ReadOnlyAppServerClient<'a, T> {
     }
 
     pub fn read_thread(&mut self, thread_id: &str) -> Result<RawJsonRpc, CodexError> {
+        let deadline = Instant::now() + self.request_timeout;
         self.request(
             "thread/read",
             json!({"threadId": thread_id, "includeTurns": true}),
+            deadline,
         )
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<RawJsonRpc, CodexError> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<RawJsonRpc, CodexError> {
         let id = self.next_id;
         self.next_id += 1;
-        let deadline = Instant::now() + self.request_timeout;
-        self.transport.send_value(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        }))?;
+        self.transport.send_value_until(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }),
+            deadline,
+        )?;
         let response = receive_response_until(self.transport, id, deadline)?;
         if response.value.get("error").is_some() {
             return Err(CodexError::Protocol);

@@ -29,6 +29,9 @@ struct ScriptedTransport {
 enum FaultedResponse {
     Value(Value),
     Timeout,
+    EndOfStream,
+    Io,
+    Malformed,
 }
 
 struct FaultingTransport {
@@ -62,6 +65,9 @@ impl JsonRpcTransport for FaultingTransport {
                 value,
             }),
             FaultedResponse::Timeout => Err(CodexError::AppServerRequestTimeout),
+            FaultedResponse::EndOfStream => Err(CodexError::EndOfStream),
+            FaultedResponse::Io => Err(CodexError::Io(std::io::Error::other("broken pipe"))),
+            FaultedResponse::Malformed => Err(CodexError::MalformedJson),
         }
     }
 }
@@ -223,6 +229,99 @@ fn delete_timeout_is_unknown_and_never_retried() {
         sent.iter()
             .all(|request| request["method"] != "thread/list")
     );
+}
+
+#[test]
+fn fork_eof_after_send_is_unknown_and_never_retried() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_cwd = root.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    let (mut transport, sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::EndOfStream,
+    ]);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
+    };
+
+    let error = fork_rollout_with_target_provider_transport(&mut transport, root.path(), &request)
+        .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::MutationOutcomeUnknown));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request["method"] == "thread/fork")
+            .count(),
+        1
+    );
+    assert!(
+        sent.iter()
+            .all(|request| request["method"] != "thread/delete")
+    );
+}
+
+#[test]
+fn delete_io_after_send_is_unknown_and_never_confirmed() {
+    let (mut transport, sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::Io,
+    ]);
+
+    let error =
+        delete_thread_with_app_server_transport(&mut transport, "target-thread").unwrap_err();
+
+    assert!(matches!(error, NativeImportError::MutationOutcomeUnknown));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request["method"] == "thread/delete")
+            .count(),
+        1
+    );
+    assert!(
+        sent.iter()
+            .all(|request| request["method"] != "thread/list")
+    );
+}
+
+#[test]
+fn fork_malformed_response_after_send_is_unknown() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_cwd = root.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    let (mut transport, _sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::Malformed,
+    ]);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
+    };
+
+    let error = fork_rollout_with_target_provider_transport(&mut transport, root.path(), &request)
+        .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::MutationOutcomeUnknown));
 }
 
 #[test]

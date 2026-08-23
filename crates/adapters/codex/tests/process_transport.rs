@@ -3,7 +3,10 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
-use agentark_adapter_codex::{CodexError, ProcessTransport, ReadOnlyAppServerClient};
+use agentark_adapter_codex::{
+    CodexError, JsonRpcTransport, ProcessTransport, ReadOnlyAppServerClient,
+};
+use serde_json::json;
 use tempfile::tempdir;
 
 fn pipe_holding_cmd() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -40,5 +43,21 @@ fn drop_terminates_cmd_descendant_that_holds_stdout_before_joining_reader() {
 
     drop(transport);
 
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn blocked_stdin_write_times_out_and_terminates_tree() {
+    let (_root, shim) = pipe_holding_cmd();
+    let mut transport = ProcessTransport::spawn(&shim).unwrap();
+    let started = Instant::now();
+    let payload = json!({"data": "x".repeat(1_000_000)});
+
+    let error = transport
+        .send_value_until(&payload, Instant::now() + Duration::from_millis(150))
+        .unwrap_err();
+
+    assert!(matches!(error, CodexError::AppServerRequestTimeout));
+    assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(5));
 }
