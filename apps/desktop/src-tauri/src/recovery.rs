@@ -159,7 +159,7 @@ pub fn recover_one_codex_session(
                     target_default: Some(source_provider),
                 },
             );
-            return AutomaticRecoveryReport {
+            AutomaticRecoveryReport {
                 outcome: decision.outcome,
                 source_native_id,
                 target_native_id,
@@ -173,7 +173,7 @@ pub fn recover_one_codex_session(
                 native_conflict_count: native.conflict_count,
                 native_backup_path: native.backup_path,
                 requires_manual_intervention: false,
-            };
+            }
         }
         Err(native_error @ (RecoveryError::Rollback | RecoveryError::ManualIntervention)) => {
             let mut report = archive_only_recovery_report(input, native_error.reason_code());
