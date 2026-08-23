@@ -17,7 +17,10 @@ use agentark_app::{
     AppError, AppServices, LockedIndexQueryService, QueryUseCase, ScanReport, ScanRequest,
     ScanService, ScanUseCase, VerifyUseCase,
 };
-use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
+use agentark_audit::{
+    AuditEvent, AuditVerification, VendorRecoveryAudit, VendorRecoveryStatus, append_event,
+    verify_chain,
+};
 use agentark_bundle::{
     NativeBundleEntry, ProjectSelection, WorkspaceFileEntry, read_bundle,
     write_selected_sessions_with_native,
@@ -899,6 +902,14 @@ impl AppState {
             let mut native_conflict_count = 0u64;
             let mut native_backup_path = None;
             let mut manual_intervention_count = 0u64;
+            let mut audit_native_identity_count = 0u64;
+            let mut audit_continuation_count = 0u64;
+            let mut audit_archive_only_count = 0u64;
+            let mut audit_manual_intervention_count = 0u64;
+            let mut audit_source_hashes = Vec::new();
+            let mut audit_target_hashes = Vec::new();
+            let mut vendor_provider_labels =
+                provider_labels.iter().cloned().collect::<BTreeSet<_>>();
             let bundle_target_agent = target_agent_kind(bundle.manifest.agent.as_deref());
             let bundle_is_codex = match bundle.manifest.agent.as_deref() {
                 Some("codex") => true,
@@ -927,6 +938,12 @@ impl AppState {
                     executable: executable.clone(),
                     backup_root: backup_root.clone(),
                 };
+                let audit_source_hash = recovery_source_hash(&input).unwrap_or_else(|_| {
+                    agentark_canonical::Sha256Digest::from_bytes(
+                        &serde_json::to_vec(&input.session).unwrap_or_default(),
+                    )
+                });
+                audit_source_hashes.push(audit_source_hash);
                 let target_agent = bundle_target_agent
                     .clone()
                     .or_else(|| source_agent_kind(&session.source_kind));
@@ -934,6 +951,7 @@ impl AppState {
                     Ok(mappings) => mappings,
                     Err(_) => {
                         manual_intervention_count += 1;
+                        audit_manual_intervention_count += 1;
                         recovery_error = Some("restore-mapping-conflict".into());
                         continue;
                     }
@@ -959,6 +977,7 @@ impl AppState {
                     .collect::<Vec<_>>();
                 if durable_mappings.len() > 1 {
                     manual_intervention_count += 1;
+                    audit_manual_intervention_count += 1;
                     recovery_error = Some("restore-mapping-conflict".into());
                     continue;
                 }
@@ -989,10 +1008,24 @@ impl AppState {
                             .is_some_and(|payload| mapping.source_hash == payload.source_hash);
                     if !target_is_exact || !source_hash_matches {
                         manual_intervention_count += 1;
+                        audit_manual_intervention_count += 1;
                         recovery_error = Some("restore-mapping-conflict".into());
                         continue;
                     }
                     restore_mapping_count += 1;
+                    match mapping.outcome {
+                        RestoreOutcome::NativeIdentity => audit_native_identity_count += 1,
+                        RestoreOutcome::Continuation => audit_continuation_count += 1,
+                        RestoreOutcome::ArchiveOnly => audit_archive_only_count += 1,
+                    }
+                    if let Some(target_hash) = &mapping.target_hash {
+                        audit_target_hashes.push(target_hash.clone());
+                    }
+                    extend_safe_provider_labels(
+                        &mut vendor_provider_labels,
+                        mapping.target_provider.as_deref(),
+                        &scanner,
+                    );
                     continue;
                 }
                 let has_archive_mapping = target_mappings
@@ -1010,6 +1043,19 @@ impl AppState {
                         },
                     )
                 };
+                extend_safe_provider_labels(
+                    &mut vendor_provider_labels,
+                    recovery.source_provider.provider.as_deref(),
+                    &scanner,
+                );
+                extend_safe_provider_labels(
+                    &mut vendor_provider_labels,
+                    recovery
+                        .target_provider
+                        .as_ref()
+                        .and_then(|identity| identity.provider.as_deref()),
+                    &scanner,
+                );
                 native_skipped_count += recovery.native_skipped_count;
                 native_conflict_count += recovery.native_conflict_count;
                 if native_backup_path.is_none() {
@@ -1020,11 +1066,16 @@ impl AppState {
                 }
                 if recovery.requires_manual_intervention {
                     manual_intervention_count += 1;
+                    audit_manual_intervention_count += 1;
+                    if let Some(target_hash) = &recovery.target_hash {
+                        audit_target_hashes.push(target_hash.clone());
+                    }
                     recovery_error = Some("manual-intervention-required".into());
                     continue;
                 }
                 if recovery.outcome == RestoreOutcome::ArchiveOnly && has_archive_mapping {
                     archive_only_count += 1;
+                    audit_archive_only_count += 1;
                     restore_mapping_count += 1;
                     if recovery_error.is_none() {
                         recovery_error = Some(recovery.reason_code.clone());
@@ -1033,6 +1084,7 @@ impl AppState {
                 }
                 let Some(target_agent) = target_agent else {
                     archive_only_count += 1;
+                    audit_archive_only_count += 1;
                     if recovery_error.is_none() {
                         recovery_error = Some("target-agent-unavailable".into());
                     }
@@ -1058,19 +1110,34 @@ impl AppState {
                     Ok(()) => {
                         restore_mapping_count += 1;
                         match recovery.outcome {
-                            RestoreOutcome::NativeIdentity => native_identity_count += 1,
-                            RestoreOutcome::Continuation => continuation_count += 1,
+                            RestoreOutcome::NativeIdentity => {
+                                native_identity_count += 1;
+                                audit_native_identity_count += 1;
+                            }
+                            RestoreOutcome::Continuation => {
+                                continuation_count += 1;
+                                audit_continuation_count += 1;
+                            }
                             RestoreOutcome::ArchiveOnly => {
                                 archive_only_count += 1;
+                                audit_archive_only_count += 1;
                                 if recovery_error.is_none() {
                                     recovery_error = Some(recovery.reason_code.clone());
                                 }
                             }
                         }
+                        if matches!(
+                            recovery.outcome,
+                            RestoreOutcome::NativeIdentity | RestoreOutcome::Continuation
+                        ) && let Some(target_hash) = &recovery.target_hash
+                        {
+                            audit_target_hashes.push(target_hash.clone());
+                        }
                     }
                     Err(_) => match executor.rollback(&input, &recovery) {
                         Ok(()) => {
                             archive_only_count += 1;
+                            audit_archive_only_count += 1;
                             if has_archive_mapping {
                                 restore_mapping_count += 1;
                             }
@@ -1080,6 +1147,10 @@ impl AppState {
                         }
                         Err(_) => {
                             manual_intervention_count += 1;
+                            audit_manual_intervention_count += 1;
+                            if let Some(target_hash) = &recovery.target_hash {
+                                audit_target_hashes.push(target_hash.clone());
+                            }
                             recovery_error = Some("manual-intervention-required".into());
                         }
                     },
@@ -1087,7 +1158,16 @@ impl AppState {
             }
             let native_imported_count = native_identity_count + continuation_count;
             let native_restart_required = native_imported_count > 0;
-            Ok(BundleReport {
+            let vendor_recovery = VendorRecoveryAudit::from_hashes(
+                audit_native_identity_count,
+                audit_continuation_count,
+                audit_archive_only_count,
+                audit_manual_intervention_count,
+                audit_source_hashes,
+                audit_target_hashes,
+            );
+            let provider_labels = vendor_provider_labels.into_iter().collect::<Vec<_>>();
+            let mut report = BundleReport {
                 format: bundle.manifest.format.clone(),
                 agent: bundle.manifest.agent.clone(),
                 session_count: bundle.manifest.session_count,
@@ -1111,8 +1191,20 @@ impl AppState {
                 restore_mapping_count,
                 recovery_error,
                 manual_intervention_count,
-                provider_labels,
-            })
+                provider_labels: provider_labels.clone(),
+            };
+            if append_vendor_recovery_audit_event(
+                &self.data_root,
+                &provider_labels,
+                vendor_recovery,
+            )
+            .is_err()
+            {
+                let diagnostic = Some("audit-persistence-failed".into());
+                report.native_error = diagnostic.clone();
+                report.recovery_error = diagnostic;
+            }
+            Ok(report)
         })();
         let _ = self.refresh_query_index();
         result
@@ -1297,12 +1389,52 @@ fn append_audit_event(
         plan_hash: None,
         result: "success".into(),
         provider_labels: provider_labels.to_vec(),
+        vendor_recovery: None,
         previous_hash: None,
         event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
     };
     append_event(&root.join("audit.jsonl"), event)
         .map(|_| ())
         .map_err(|_| "无法写入审计账本".to_owned())
+}
+
+fn append_vendor_recovery_audit_event(
+    root: &Path,
+    provider_labels: &[String],
+    vendor_recovery: VendorRecoveryAudit,
+) -> Result<(), String> {
+    let result = match vendor_recovery.status {
+        VendorRecoveryStatus::Complete => "complete",
+        VendorRecoveryStatus::Partial => "partial",
+        VendorRecoveryStatus::ManualIntervention => "manualIntervention",
+    };
+    let event = AuditEvent {
+        event_id: Uuid::new_v4(),
+        event_type: "vendor.recovery.completed".into(),
+        timestamp: "now".into(),
+        actor: "agentark-desktop".into(),
+        source: None,
+        target: None,
+        before_hash: None,
+        after_hash: None,
+        plan_hash: None,
+        result: result.into(),
+        provider_labels: provider_labels.to_vec(),
+        vendor_recovery: Some(vendor_recovery),
+        previous_hash: None,
+        event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
+    };
+    append_event(&root.join("audit.jsonl"), event)
+        .map(|_| ())
+        .map_err(|_| "audit-persistence-failed".to_owned())
+}
+
+fn extend_safe_provider_labels(
+    labels: &mut BTreeSet<String>,
+    value: Option<&str>,
+    scanner: &SecretScanner,
+) {
+    labels.extend(safe_provider_labels(value, scanner));
 }
 
 fn safe_provider_labels<'a>(

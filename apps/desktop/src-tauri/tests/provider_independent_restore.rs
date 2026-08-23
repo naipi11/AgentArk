@@ -10,6 +10,7 @@ use agentark_adapter_codex::{
     JsonRpcTransport, NativeRestoreReport, RawJsonRpc, fork_rollout_with_target_provider_transport,
     probe_target_default_transport,
 };
+use agentark_audit::{AuditEvent, VendorRecoveryAudit, VendorRecoveryStatus};
 use agentark_bundle::{NativeBundleEntry, read_bundle, write_selected_sessions_with_native};
 use agentark_canonical::{
     AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession, Completeness,
@@ -77,6 +78,8 @@ struct FakeExecutor {
     native_summary: Mutex<NativeAttemptSummary>,
     restore_lock_probe: Option<AppState>,
     restore_lock_checks: AtomicUsize,
+    audit_path_to_block: Option<PathBuf>,
+    audit_blocked: AtomicUsize,
 }
 
 impl FakeExecutor {
@@ -185,6 +188,22 @@ impl FakeExecutor {
     fn rollback_call_count(&self) -> usize {
         self.rollback_calls.load(Ordering::SeqCst)
     }
+
+    fn block_final_audit(mut self, audit_path: PathBuf) -> Self {
+        self.audit_path_to_block = Some(audit_path);
+        self
+    }
+
+    fn block_audit_once(&self) {
+        let Some(path) = &self.audit_path_to_block else {
+            return;
+        };
+        if self.audit_blocked.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
 }
 
 impl CodexRecoveryExecutor for FakeExecutor {
@@ -206,6 +225,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
         match self.native.lock().unwrap().pop_front().unwrap() {
             NativeScript::Success => {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
+                self.block_audit_once();
                 Ok(NativeRestoreReport {
                     imported_count: 1,
                     skipped_count: 2,
@@ -248,6 +268,7 @@ impl CodexRecoveryExecutor for FakeExecutor {
                     input.session.source_session_id
                 ));
                 fs::write(&rollout_path, b"verified fake continuation").unwrap();
+                self.block_audit_once();
                 Ok(CodexContinuationReport {
                     source_thread_id: input.session.source_session_id.clone(),
                     target_thread_id,
@@ -317,6 +338,8 @@ fn fake_executor() -> FakeExecutor {
         native_summary: Mutex::new(NativeAttemptSummary::default()),
         restore_lock_probe: None,
         restore_lock_checks: AtomicUsize::new(0),
+        audit_path_to_block: None,
+        audit_blocked: AtomicUsize::new(0),
     }
 }
 
@@ -717,6 +740,23 @@ fn restore_fixture_with_writer(
         bundle_path,
         codex_home,
     })
+}
+
+fn audit_events(fixture: &RestoredFixture) -> Vec<AuditEvent> {
+    fs::read_to_string(fixture._root.path().join("data/audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn vendor_summary(fixture: &RestoredFixture) -> VendorRecoveryAudit {
+    audit_events(fixture)
+        .last()
+        .unwrap()
+        .vendor_recovery
+        .clone()
+        .unwrap()
 }
 
 fn write_legacy_codex_bundle(path: &Path, session: &CanonicalSession, agent: Option<&str>) {
@@ -1674,4 +1714,239 @@ fn failed_continuation_rollback_reports_manual_intervention() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn native_recovery_appends_archive_then_complete_vendor_audit() {
+    let executor = fake_executor().native_success();
+    let fixture =
+        restore_fixture(&executor, vec![session(50, "native-audit")], "codex", true).unwrap();
+    let events = audit_events(&fixture);
+
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bundle.restored", "vendor.recovery.completed"]
+    );
+    let summary = events[1].vendor_recovery.as_ref().unwrap();
+    assert_eq!(summary.native_identity_count, 1);
+    assert_eq!(summary.continuation_count, 0);
+    assert_eq!(summary.archive_only_count, 0);
+    assert_eq!(summary.manual_intervention_count, 0);
+    assert_eq!(summary.status, VendorRecoveryStatus::Complete);
+    assert_eq!(events[1].result, "complete");
+    assert_eq!(events[1].source, None);
+    assert_eq!(events[1].target, None);
+    assert!(fixture.state.audit_verify().unwrap().valid);
+}
+
+#[test]
+fn continuation_and_archive_only_audits_report_truthful_partial_counts() {
+    let continuation_executor = fake_executor().continuation_success();
+    continuation_executor.set_target_default("target-provider", "target-model");
+    let continuation = restore_fixture(
+        &continuation_executor,
+        vec![session(51, "continuation-audit")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let continuation_summary = vendor_summary(&continuation);
+    assert_eq!(continuation_summary.continuation_count, 1);
+    assert_eq!(continuation_summary.status, VendorRecoveryStatus::Complete);
+    assert_eq!(
+        audit_events(&continuation)[1].provider_labels,
+        vec!["source-provider", "target-provider"]
+    );
+
+    let archive_executor = fake_executor().continuation_unavailable();
+    let archive = restore_fixture(
+        &archive_executor,
+        vec![session(52, "archive-audit")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let archive_summary = vendor_summary(&archive);
+    assert_eq!(archive_summary.archive_only_count, 1);
+    assert_eq!(archive_summary.status, VendorRecoveryStatus::Partial);
+    assert_eq!(audit_events(&archive)[1].result, "partial");
+}
+
+#[test]
+fn mixed_and_manual_fixtures_append_final_truthful_vendor_audits() {
+    let mixed_executor = fake_executor()
+        .native_success()
+        .native_missing_provider()
+        .native_missing_provider()
+        .continuation_success()
+        .continuation_unavailable();
+    let mixed = restore_fixture(
+        &mixed_executor,
+        vec![
+            session(53, "native-mixed"),
+            session(54, "continuation-mixed"),
+            session(55, "archive-mixed"),
+        ],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let mixed_summary = vendor_summary(&mixed);
+    assert_eq!(mixed_summary.native_identity_count, 1);
+    assert_eq!(mixed_summary.continuation_count, 1);
+    assert_eq!(mixed_summary.archive_only_count, 1);
+    assert_eq!(mixed_summary.manual_intervention_count, 0);
+    assert_eq!(mixed_summary.status, VendorRecoveryStatus::Partial);
+    assert!(mixed.state.audit_verify().unwrap().valid);
+
+    let manual_executor = fake_executor().native_manual_intervention();
+    let manual = restore_fixture(
+        &manual_executor,
+        vec![session(56, "manual-audit")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let manual_summary = vendor_summary(&manual);
+    assert_eq!(manual_summary.manual_intervention_count, 1);
+    assert_eq!(
+        manual_summary.status,
+        VendorRecoveryStatus::ManualIntervention
+    );
+    assert_eq!(audit_events(&manual)[1].result, "manualIntervention");
+}
+
+#[test]
+fn recovery_audit_hashes_are_deterministic_across_session_order() {
+    let first_executor = fake_executor()
+        .continuation_success()
+        .continuation_success();
+    let first = restore_fixture(
+        &first_executor,
+        vec![session(57, "hash-a"), session(58, "hash-b")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let second_executor = fake_executor()
+        .continuation_success()
+        .continuation_success();
+    let second = restore_fixture(
+        &second_executor,
+        vec![session(58, "hash-b"), session(57, "hash-a")],
+        "codex",
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(vendor_summary(&first), vendor_summary(&second));
+}
+
+#[test]
+fn verified_mapping_reuse_is_included_in_final_vendor_audit() {
+    let executor = fake_executor().continuation_success();
+    let fixture =
+        restore_fixture(&executor, vec![session(59, "reuse-audit")], "codex", false).unwrap();
+    let first_summary = vendor_summary(&fixture);
+
+    let second_report = restore_again(&fixture, &executor);
+    let events = audit_events(&fixture);
+    let reused = events.last().unwrap().vendor_recovery.as_ref().unwrap();
+
+    assert_eq!(second_report.continuation_count, 0);
+    assert_eq!(reused.continuation_count, 1);
+    assert_eq!(
+        reused.source_hashes_digest,
+        first_summary.source_hashes_digest
+    );
+    assert_eq!(
+        reused.target_hashes_digest,
+        first_summary.target_hashes_digest
+    );
+    assert_eq!(reused.status, VendorRecoveryStatus::Complete);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "bundle.restored",
+            "vendor.recovery.completed",
+            "bundle.restored",
+            "vendor.recovery.completed",
+        ]
+    );
+}
+
+#[test]
+fn final_audit_failure_preserves_archive_target_and_mapping_with_safe_diagnostic() {
+    let root = TempRoot::new("final-audit-failure");
+    let data_root = root.path().join("data");
+    let audit_path = data_root.join("audit.jsonl");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("fixture.ahbundle");
+    let restored_session = session(60, "audit-failure");
+    write_selected_sessions_with_native(
+        &bundle_path,
+        "codex",
+        std::slice::from_ref(&restored_session),
+        &[],
+        &[],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor()
+        .continuation_success()
+        .block_final_audit(audit_path.clone());
+
+    let report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            &executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("audit-persistence-failed")
+    );
+    assert_eq!(
+        report.native_error.as_deref(),
+        Some("audit-persistence-failed")
+    );
+    assert_eq!(executor.rollback_call_count(), 0);
+    assert!(
+        codex_home
+            .join("sessions/fake-continuation-audit-failure.jsonl")
+            .is_file()
+    );
+    assert_eq!(
+        state
+            .restore_mappings_for(restored_session.id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut permissions = fs::metadata(&audit_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(&audit_path, permissions).unwrap();
+    assert!(state.audit_verify().unwrap().valid);
 }
