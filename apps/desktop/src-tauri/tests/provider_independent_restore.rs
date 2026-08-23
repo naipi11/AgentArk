@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use agentark_adapter_codex::{
     CodexContinuationReport, CodexContinuationRequest, CodexError, CodexTargetDefault,
@@ -75,33 +75,14 @@ struct FakeExecutor {
     rollback_calls: AtomicUsize,
     rollback_fails: bool,
     native_summary: Mutex<NativeAttemptSummary>,
-    concurrent_fork_gate: Option<Arc<ConcurrentForkGate>>,
 }
 
-struct ConcurrentForkGate {
-    arrivals: Mutex<usize>,
-    wake: Condvar,
-}
-
-impl ConcurrentForkGate {
-    fn new() -> Self {
-        Self {
-            arrivals: Mutex::new(0),
-            wake: Condvar::new(),
-        }
-    }
-
-    fn wait_for_competing_fork(&self) {
-        let mut arrivals = self.arrivals.lock().unwrap();
-        *arrivals += 1;
-        self.wake.notify_all();
-        if *arrivals == 1 {
-            let _ = self
-                .wake
-                .wait_timeout_while(arrivals, Duration::from_millis(500), |count| *count < 2)
-                .unwrap();
-        }
-    }
+#[derive(Default)]
+struct RestoreAttemptState {
+    attempted: bool,
+    allow_attempt: bool,
+    hook_released: bool,
+    completed: bool,
 }
 
 impl FakeExecutor {
@@ -114,11 +95,6 @@ impl FakeExecutor {
 
     fn target_probe_call_count(&self) -> usize {
         self.target_probe_calls.load(Ordering::SeqCst)
-    }
-
-    fn with_concurrent_fork_gate(mut self, gate: Arc<ConcurrentForkGate>) -> Self {
-        self.concurrent_fork_gate = Some(gate);
-        self
     }
 
     fn existing_target_conflict(self) -> Self {
@@ -247,9 +223,6 @@ impl CodexRecoveryExecutor for FakeExecutor {
         target_default: &CodexTargetDefault,
     ) -> Result<CodexContinuationReport, RecoveryError> {
         self.continuation_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(gate) = &self.concurrent_fork_gate {
-            gate.wait_for_competing_fork();
-        }
         match self.continuation.lock().unwrap().pop_front().unwrap() {
             ContinuationScript::Success => {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
@@ -315,7 +288,6 @@ fn fake_executor() -> FakeExecutor {
         rollback_calls: AtomicUsize::new(0),
         rollback_fails: false,
         native_summary: Mutex::new(NativeAttemptSummary::default()),
-        concurrent_fork_gate: None,
     }
 }
 
@@ -726,8 +698,8 @@ fn restore_again_with_writer(
 }
 
 #[test]
-fn concurrent_restores_share_one_fork_and_one_persistent_mapping() {
-    let root = TempRoot::new("concurrent-provider-restore");
+fn shared_restore_lock_serializes_restore_and_repeat_reuse() {
+    let root = TempRoot::new("shared-restore-lock");
     let data_root = root.path().join("data");
     let codex_home = root.path().join("codex-home");
     fs::create_dir_all(codex_home.join("sessions")).unwrap();
@@ -743,45 +715,79 @@ fn concurrent_restores_share_one_fork_and_one_persistent_mapping() {
     )
     .unwrap();
     let state = AppState::for_data_root(data_root);
-    let gate = Arc::new(ConcurrentForkGate::new());
+    let attempt = Arc::new((Mutex::new(RestoreAttemptState::default()), Condvar::new()));
+    let hook_attempt = Arc::clone(&attempt);
+    state
+        .set_restore_lock_attempt_hook_for_test(Arc::new(move || {
+            let (attempt, wake) = &*hook_attempt;
+            let mut observed = attempt.lock().unwrap();
+            observed.attempted = true;
+            wake.notify_all();
+            while !observed.allow_attempt {
+                observed = wake.wait(observed).unwrap();
+            }
+            observed.hook_released = true;
+            wake.notify_all();
+        }))
+        .unwrap();
+    let held_guard = state.hold_restore_lock_for_test().unwrap();
+    assert!(!state.clone().try_restore_lock_for_test().unwrap());
     let executor = Arc::new(
         fake_executor()
             .native_missing_provider()
-            .native_missing_provider()
-            .continuation_success()
-            .continuation_success()
-            .with_concurrent_fork_gate(gate),
+            .continuation_success(),
     );
 
     let first_state = state.clone();
     let first_executor = Arc::clone(&executor);
     let first_bundle = bundle_path.clone();
     let first_home = codex_home.clone();
+    let completion = Arc::clone(&attempt);
     let first = thread::spawn(move || {
-        first_state.bundle_restore_with_executor(
-            first_bundle,
-            first_executor.as_ref(),
-            first_home.clone(),
-            PathBuf::from("fake-codex"),
-            first_home.join("agentark-backups"),
-        )
-    });
-    let second_state = state.clone();
-    let second_executor = Arc::clone(&executor);
-    let second_bundle = bundle_path.clone();
-    let second_home = codex_home.clone();
-    let second = thread::spawn(move || {
-        second_state.bundle_restore_with_executor(
-            second_bundle,
-            second_executor.as_ref(),
-            second_home.clone(),
-            PathBuf::from("fake-codex"),
-            second_home.join("agentark-backups"),
-        )
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            first_state.bundle_restore_with_executor(
+                first_bundle,
+                first_executor.as_ref(),
+                first_home.clone(),
+                PathBuf::from("fake-codex"),
+                first_home.join("agentark-backups"),
+            )
+        }));
+        let (attempt, wake) = &*completion;
+        attempt.lock().unwrap().completed = true;
+        wake.notify_all();
+        outcome
     });
 
-    let first_report = first.join().unwrap().unwrap();
-    let second_report = second.join().unwrap().unwrap();
+    let (attempt_state, wake) = &*attempt;
+    let mut observed = attempt_state.lock().unwrap();
+    while !observed.attempted && !observed.completed {
+        observed = wake.wait(observed).unwrap();
+    }
+    assert!(
+        observed.attempted,
+        "restore completed without using the shared outer restore lock"
+    );
+    observed.allow_attempt = true;
+    wake.notify_all();
+    while !observed.hook_released {
+        observed = wake.wait(observed).unwrap();
+    }
+    drop(observed);
+    assert!(!state.clone().try_restore_lock_for_test().unwrap());
+    drop(held_guard);
+
+    let first_report = first.join().unwrap().unwrap().unwrap();
+    assert!(state.clone().try_restore_lock_for_test().unwrap());
+    let second_report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            executor.as_ref(),
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
     let mappings = state.restore_mappings_for(restored_session.id).unwrap();
 
     assert_eq!(executor.continuation_call_count(), 1);
@@ -791,10 +797,11 @@ fn concurrent_restores_share_one_fork_and_one_persistent_mapping() {
         mappings[0].target_native_id.as_deref(),
         Some("continued-native-concurrent")
     );
-    assert_eq!(
-        first_report.restore_mapping_count + second_report.restore_mapping_count,
-        2
-    );
+    assert_eq!(first_report.restore_mapping_count, 1);
+    assert_eq!(second_report.restore_mapping_count, 1);
+    assert_eq!(first_report.continuation_count, 1);
+    assert_eq!(second_report.continuation_count, 0);
+    assert!(!second_report.native_restart_required);
 }
 
 #[test]

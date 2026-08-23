@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -74,9 +74,12 @@ pub struct AppState {
     data_root: PathBuf,
     scan_lock: Arc<Mutex<()>>,
     restore_lock: Arc<Mutex<()>>,
+    restore_lock_attempt_hook: Arc<Mutex<Option<RestoreLockAttemptHook>>>,
     watch_roots: Arc<Mutex<Vec<WatchRoot>>>,
     watcher_started: Arc<AtomicBool>,
 }
+
+type RestoreLockAttemptHook = Arc<dyn Fn() + Send + Sync>;
 
 #[doc(hidden)]
 pub trait RestoreMappingWriter {
@@ -158,6 +161,7 @@ impl AppState {
             data_root: default_data_dir(),
             scan_lock: Arc::new(Mutex::new(())),
             restore_lock: Arc::new(Mutex::new(())),
+            restore_lock_attempt_hook: Arc::new(Mutex::new(None)),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -177,6 +181,7 @@ impl AppState {
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
             restore_lock: Arc::new(Mutex::new(())),
+            restore_lock_attempt_hook: Arc::new(Mutex::new(None)),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -195,9 +200,48 @@ impl AppState {
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
             restore_lock: Arc::new(Mutex::new(())),
+            restore_lock_attempt_hook: Arc::new(Mutex::new(None)),
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_restore_lock_attempt_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        *self
+            .restore_lock_attempt_hook
+            .lock()
+            .map_err(|_| "恢复操作锁不可用".to_owned())? = Some(hook);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn hold_restore_lock_for_test(&self) -> Result<MutexGuard<'_, ()>, String> {
+        acquire_restore_lock(&self.restore_lock)
+    }
+
+    #[doc(hidden)]
+    pub fn try_restore_lock_for_test(&self) -> Result<bool, String> {
+        match self.restore_lock.try_lock() {
+            Ok(_guard) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Poisoned(_)) => Err("恢复操作锁不可用".to_owned()),
+        }
+    }
+
+    fn acquire_bundle_restore_lock(&self) -> Result<MutexGuard<'_, ()>, String> {
+        let hook = self
+            .restore_lock_attempt_hook
+            .lock()
+            .map_err(|_| "恢复操作锁不可用".to_owned())?
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        acquire_restore_lock(&self.restore_lock)
     }
 
     pub fn scan_codex(&self, source_root: PathBuf) -> Result<ScanReport, String> {
@@ -768,7 +812,7 @@ impl AppState {
         executable: PathBuf,
         backup_root: PathBuf,
     ) -> Result<BundleReport, String> {
-        let _restore_guard = acquire_restore_lock(&self.restore_lock)?;
+        let _restore_guard = self.acquire_bundle_restore_lock()?;
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
