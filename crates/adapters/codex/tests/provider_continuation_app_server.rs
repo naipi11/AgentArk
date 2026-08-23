@@ -26,7 +26,7 @@ fn fixture_contexts() -> &'static Mutex<HashMap<String, FixtureContext>> {
 }
 
 #[test]
-#[ignore = "requires compatible Codex, source rollout, and target provider"]
+#[ignore = "non-billed; requires compatible Codex, source rollout, and target provider; uses only a temporary CODEX_HOME"]
 fn fork_rebases_visible_history_to_target_provider() {
     let report = fork_fixture_with_target_provider("openai", None).unwrap();
     assert_ne!(report.source_thread_id, report.target_thread_id);
@@ -36,7 +36,7 @@ fn fork_rebases_visible_history_to_target_provider() {
 }
 
 #[test]
-#[ignore = "starts a billed target-provider turn only when explicitly enabled"]
+#[ignore = "billed target-provider turn requires AGENTARK_RUN_PROVIDER_CONTINUATION and uses only a temporary CODEX_HOME"]
 fn forked_thread_accepts_a_target_provider_turn() {
     if std::env::var_os("AGENTARK_RUN_PROVIDER_CONTINUATION").is_none() {
         return;
@@ -182,7 +182,7 @@ fn initialize<T: JsonRpcTransport>(transport: &mut T) -> Result<(), Box<dyn Erro
             "clientInfo": {
                 "name": "agentark-provider-continuation-test",
                 "title": "AgentArk",
-                "version": "0.5.0"
+                "version": "0.6.0"
             },
             "capabilities": {"experimentalApi": true}
         }

@@ -2,14 +2,21 @@
 
 ## 执行摘要
 
-## 当前实现增量（AgentArk 0.5.0）
+## 当前实现增量（AgentArk 0.6.0）
 
-在保留本规划书 L0/L1/L2 分层合同的前提下，当前桌面迁移页已加入 Codex
-原生 payload 恢复路径：导出 Codex 时把源 `CODEX_HOME/sessions` 中与已索引
-会话匹配的 rollout JSONL 脱敏后放入 `.ahbundle`；目标恢复时检查 Codex
-版本和运行状态，原子写入目标 `CODEX_HOME`，用 App Server 重新列出/读取
-thread，失败则回滚本次新增文件。Codex 以外的 Agent 仍保持 AgentArk 索引
-和语义迁移边界，不伪造供应商原生会话。Codex 原生恢复完成后需要重启 Codex
+在保留本规划书 L0/L1/L2 分层合同的前提下，当前桌面迁移页对 Codex 提供自动
+的同 provider 原生身份恢复和 provider-independent continuation：导出 Codex
+时把源 `CODEX_HOME/sessions` 中与已索引会话匹配的 rollout JSONL 脱敏后放入
+`.ahbundle`；兼容同 provider 会话保留原生 ID，provider 不可用或变化时，使用
+目标 Codex 已配置的默认 provider/model 新建 continuation。流程必须通过 Codex
+版本、进程和 App Server 验证；用户不选择内部恢复模式。恢复只会写入目标
+`CODEX_HOME`，只改写 workspace path，失败会回滚；credentials、endpoints 和
+hidden reasoning 不可迁移。rollback/manual-intervention 结果单独报告，绝不冒充
+archive-only 成功；live subsequent-turn 验证为 opt-in，正常打包不执行。
+
+能力状态：Codex 为上述已验证边界内的自动原生恢复/continuation；Claude Code、
+Hermes、OpenClaw、OpenCode 与 Grok Build 均为 AgentArk archive-only，直到各自
+native continuation writer 完成独立验证。Codex 原生恢复完成后需要重启 Codex
 客户端刷新会话列表。
 
 本项目建议暂定名为 **Agent History Hub（AHH）**：一个面向 Claude Code、Codex、Hermes、Grok Build、OpenClaw 的 **local-first、跨平台、可审计的 Agent 会话与项目历史管理层**。其核心价值不是再做一个聊天客户端，而是建立一个位于各 Agent 之上的“**Agent 数据控制平面**”：自动发现本机 Agent 与工作区，持续索引会话、消息、工具调用、附件、文件快照、instructions/memory/skills/MCP 等资源，在统一 UI/CLI 中查询，并通过统一中间模型实现 Agent 间、设备间和 Windows/Linux/macOS 间迁移。
