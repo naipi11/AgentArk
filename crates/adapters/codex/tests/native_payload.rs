@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use agentark_adapter_codex::{
-    NativeRolloutPayload, collect_native_rollouts, restore_native_rollouts,
+    NativeRolloutPayload, build_canonical_continuation_source, canonical_visible_history,
+    collect_native_rollouts, native_thread_expectation, restore_native_rollouts,
     rewrite_native_workspace_paths, sanitize_rollout_bytes,
 };
 use agentark_canonical::{
-    CanonicalSchemaVersion, CanonicalSession, Completeness, Sha256Digest, Workspace,
+    Attachment, CanonicalMessage, CanonicalRole, CanonicalSchemaVersion, CanonicalSession,
+    Completeness, ContentPart, ContentPartKind, Sha256Digest, ToolEvent, Workspace,
 };
 use agentark_security::SecretScanner;
 use serde_json::json;
@@ -38,6 +41,269 @@ fn fixture_session() -> CanonicalSession {
         attachments: Vec::new(),
         raw_extra: BTreeMap::new(),
     }
+}
+
+fn visible_message(ordinal: u64, role: CanonicalRole, text: &str) -> CanonicalMessage {
+    CanonicalMessage {
+        id: Uuid::from_u128(300 + ordinal as u128),
+        source_record_id: Some(format!("visible-{ordinal}")),
+        ordinal,
+        role,
+        raw_role: None,
+        created_at_raw: None,
+        content: vec![ContentPart {
+            kind: ContentPartKind::Text,
+            text: Some(text.into()),
+            attachment_id: None,
+            raw_extra: BTreeMap::new(),
+        }],
+        raw_ref: Sha256Digest::from_bytes(text.as_bytes()),
+    }
+}
+
+#[test]
+fn canonical_builder_preserves_exact_visible_order_without_native_payload() {
+    let mut session = fixture_session();
+    session.messages = vec![
+        visible_message(2, CanonicalRole::Assistant, "assistant exact\ntext"),
+        visible_message(1, CanonicalRole::User, "user exact text"),
+        visible_message(3, CanonicalRole::User, "second user"),
+    ];
+    session.title = Some("Sanitized continuation title".into());
+    let target_cwd = PathBuf::from(r"C:\restored\project");
+
+    let first =
+        build_canonical_continuation_source(&session, &target_cwd, "openai", "gpt-5").unwrap();
+    let second =
+        build_canonical_continuation_source(&session, &target_cwd, "openai", "gpt-5").unwrap();
+
+    assert_eq!(first.thread_id, second.thread_id);
+    assert_eq!(first.bytes, second.bytes);
+    assert_eq!(first.visible_history.message_count, 3);
+    assert_eq!(first.title.as_deref(), Some("Sanitized continuation title"));
+    let records = first
+        .bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 7);
+    assert_eq!(records[0]["type"], "session_meta");
+    assert_eq!(records[0]["payload"]["id"], first.thread_id);
+    assert_eq!(
+        records[0]["payload"]["cwd"],
+        target_cwd.to_string_lossy().as_ref()
+    );
+    assert_eq!(records[0]["payload"]["model_provider"], "openai");
+    assert_eq!(records[0]["payload"]["model"], "gpt-5");
+    assert_eq!(
+        records[0]["payload"]["agentark"]["title"],
+        "Sanitized continuation title"
+    );
+    let response_items = records[1..]
+        .iter()
+        .step_by(2)
+        .map(|record| {
+            (
+                record["payload"]["role"].as_str().unwrap(),
+                record["payload"]["content"][0]["type"].as_str().unwrap(),
+                record["payload"]["content"][0]["text"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_items,
+        [
+            ("user", "input_text", "user exact text"),
+            ("assistant", "output_text", "assistant exact\ntext"),
+            ("user", "input_text", "second user"),
+        ]
+    );
+    assert!(
+        records[1..]
+            .iter()
+            .step_by(2)
+            .all(|record| record["type"] == "response_item"
+                && record["payload"]["type"] == "message")
+    );
+    let visible_events = records[2..]
+        .iter()
+        .step_by(2)
+        .map(|record| {
+            (
+                record["payload"]["type"].as_str().unwrap(),
+                record["payload"]["message"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visible_events,
+        [
+            ("user_message", "user exact text"),
+            ("agent_message", "assistant exact\ntext"),
+            ("user_message", "second user"),
+        ]
+    );
+    assert!(
+        records[2..]
+            .iter()
+            .step_by(2)
+            .all(|record| record["type"] == "event_msg")
+    );
+}
+
+#[test]
+fn canonical_builder_excludes_every_private_or_non_visible_canary() {
+    let canaries = [
+        "NATIVE_BYTE_CANARY",
+        "sk-proj-builder-token-canary-123456789",
+        "https://private-endpoint.invalid/v1",
+        "REASONING_CANARY",
+        "DEVELOPER_SYSTEM_CANARY",
+        "TOOL_CANARY",
+        "ATTACHMENT_CANARY",
+        "RAW_EXTRA_CANARY",
+    ];
+    let mut session = fixture_session();
+    session.messages = vec![visible_message(1, CanonicalRole::User, "only visible text")];
+    session.messages[0].content[0].raw_extra = BTreeMap::from([(
+        "private".into(),
+        json!([
+            canaries[0],
+            canaries[1],
+            canaries[2],
+            canaries[3],
+            canaries[4],
+            canaries[7]
+        ]),
+    )]);
+    session.messages[0].content.push(ContentPart {
+        kind: ContentPartKind::File,
+        text: Some(canaries[6].into()),
+        attachment_id: Some(Uuid::from_u128(999)),
+        raw_extra: BTreeMap::new(),
+    });
+    session.tool_events = vec![ToolEvent {
+        id: "tool-event".into(),
+        ordinal: 2,
+        tool_name: canaries[5].into(),
+        status: "completed".into(),
+        visible_input: Some(canaries[5].into()),
+        visible_output: Some(canaries[3].into()),
+        raw_ref: Sha256Digest::from_bytes(canaries[5].as_bytes()),
+    }];
+    session.attachments = vec![Attachment {
+        id: Uuid::from_u128(999),
+        source_locator: canaries[6].into(),
+        media_type: Some("application/private".into()),
+        size: 7,
+        sha256: Sha256Digest::from_bytes(canaries[6].as_bytes()),
+        raw_ref: Sha256Digest::from_bytes(canaries[6].as_bytes()),
+    }];
+    session.raw_extra = BTreeMap::from([(
+        "private".into(),
+        json!({"native": canaries[0], "token": canaries[1], "endpoint": canaries[2], "raw": canaries[7]}),
+    )]);
+
+    let source = build_canonical_continuation_source(
+        &session,
+        Path::new(r"C:\restored\project"),
+        "openai",
+        "gpt-5",
+    )
+    .unwrap();
+    let encoded = String::from_utf8(source.bytes).unwrap();
+
+    assert!(encoded.contains("only visible text"));
+    assert_eq!(encoded.matches("only visible text").count(), 2);
+    for canary in canaries {
+        assert!(!encoded.contains(canary), "leaked canary: {canary}");
+    }
+}
+
+#[test]
+fn canonical_visible_history_hash_changes_for_each_sequence_mutation() {
+    let mut session = fixture_session();
+    session.messages = vec![
+        visible_message(1, CanonicalRole::User, "one"),
+        visible_message(2, CanonicalRole::Assistant, "two"),
+    ];
+    let baseline = canonical_visible_history(&session).unwrap();
+
+    let mut changed = session.clone();
+    changed.messages[1].content[0].text = Some("changed".into());
+    let mut reordered = session.clone();
+    reordered.messages[0].ordinal = 2;
+    reordered.messages[1].ordinal = 1;
+    let mut added = session.clone();
+    added
+        .messages
+        .push(visible_message(3, CanonicalRole::User, "three"));
+    let mut removed = session.clone();
+    removed.messages.pop();
+
+    for mutated in [&changed, &reordered, &added, &removed] {
+        assert_ne!(
+            canonical_visible_history(mutated).unwrap(),
+            baseline,
+            "visible-history mutation must change count or hash"
+        );
+    }
+}
+
+#[test]
+fn canonical_visible_history_rejects_nonempty_unsupported_roles() {
+    for role in [
+        CanonicalRole::System,
+        CanonicalRole::Tool,
+        CanonicalRole::Unknown,
+    ] {
+        let mut session = fixture_session();
+        session.messages = vec![visible_message(1, role, "must not be silently dropped")];
+
+        assert!(canonical_visible_history(&session).is_err());
+        assert!(
+            build_canonical_continuation_source(
+                &session,
+                Path::new(r"C:\restored\project"),
+                "openai",
+                "gpt-5",
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn generated_source_native_expectation_carries_exact_provider_history_and_rollout_hash() {
+    let mut session = fixture_session();
+    session.messages = vec![
+        visible_message(1, CanonicalRole::User, "one"),
+        visible_message(2, CanonicalRole::Assistant, "two"),
+    ];
+    session.title = Some("Exact title".into());
+    let source = build_canonical_continuation_source(
+        &session,
+        Path::new(r"C:\restored\project"),
+        "openai",
+        "gpt-5",
+    )
+    .unwrap();
+
+    let expected = native_thread_expectation(&source.bytes).unwrap();
+
+    assert_eq!(expected.thread_id, source.thread_id);
+    assert_eq!(expected.cwd, r"C:\restored\project");
+    assert_eq!(expected.title.as_deref(), Some("Exact title"));
+    assert_eq!(expected.model_provider, "openai");
+    assert_eq!(
+        expected.rollout_hash,
+        Sha256Digest::from_bytes(&source.bytes)
+    );
+    assert_eq!(
+        expected.visible_history,
+        source.visible_history.expectation()
+    );
 }
 
 #[test]

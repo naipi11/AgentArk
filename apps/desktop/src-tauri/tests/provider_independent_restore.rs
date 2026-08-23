@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -249,6 +250,14 @@ impl CodexRecoveryExecutor for FakeExecutor {
                     model_provider: target_default.model_provider.clone(),
                     model: target_default.model.clone(),
                     visible_turns: input.session.messages.len(),
+                    rollout_hash: agentark_canonical::Sha256Digest::from_bytes(
+                        b"verified fake continuation",
+                    ),
+                    visible_history: agentark_adapter_codex::canonical_visible_history(
+                        &input.session,
+                    )
+                    .unwrap()
+                    .expectation(),
                 })
             }
             ContinuationScript::Unavailable => Err(RecoveryError::Unavailable),
@@ -427,10 +436,16 @@ impl CodexRecoveryExecutor for ScriptedProviderRuntimeExecutor {
             json!({
                 "jsonrpc": "2.0",
                 "id": 3,
+                "result": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
                 "result": {
                     "data": [{
                         "id": target_thread_id,
                         "cwd": target_cwd,
+                        "name": input.session.title,
                         "path": target_rollout,
                         "modelProvider": SAFE_PROVIDER_LABEL
                     }],
@@ -439,13 +454,16 @@ impl CodexRecoveryExecutor for ScriptedProviderRuntimeExecutor {
             }),
             json!({
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 5,
                 "result": {
                     "thread": {
                         "id": target_thread_id,
                         "cwd": target_cwd,
+                        "name": input.session.title,
                         "modelProvider": SAFE_PROVIDER_LABEL,
-                        "turns": [{"id": "turn-1"}]
+                        "turns": [{"id": "turn-1", "items": [
+                            {"type": "agentMessage", "text": "sanitized fixture"}
+                        ]}]
                     }
                 }
             }),
@@ -457,6 +475,10 @@ impl CodexRecoveryExecutor for ScriptedProviderRuntimeExecutor {
             target_cwd,
             target_provider: Some(target_default.model_provider.clone()),
             target_model: Some(target_default.model.clone()),
+            title: input.session.title.clone(),
+            visible_history: agentark_adapter_codex::canonical_visible_history(&input.session)
+                .unwrap()
+                .expectation(),
         };
         let report = fork_rollout_with_target_provider_transport(
             &mut transport,
@@ -522,7 +544,12 @@ fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> Stri
             "jsonrpc": "2.0",
             "id": 3,
             "result": {
-                "data": [{"id": target_thread_id, "cwd": target_cwd}],
+                "data": [{
+                    "id": target_thread_id,
+                    "cwd": target_cwd,
+                    "path": target_rollout,
+                    "modelProvider": SAFE_PROVIDER_LABEL
+                }],
                 "nextCursor": null
             }
         }),
@@ -533,7 +560,8 @@ fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> Stri
                 "thread": {
                     "id": target_thread_id,
                     "cwd": target_cwd,
-                    "turns": [{"id": "turn-1"}]
+                    "modelProvider": SAFE_PROVIDER_LABEL,
+                    "turns": [{"id": "turn-1", "items": []}]
                 }
             }
         }),
@@ -545,6 +573,14 @@ fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> Stri
         target_cwd,
         target_provider: Some(SAFE_PROVIDER_LABEL.into()),
         target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: agentark_adapter_codex::CodexVisibleHistoryExpectation {
+            message_count: 0,
+            content_hash: agentark_canonical::Sha256Digest::parse(
+                "sha256:9d8b77fbc3e8a7bfa6757b47b9419947b07c1599f91de8aceb4ab2b863635a6b",
+            )
+            .unwrap(),
+        },
     };
 
     fork_rollout_with_target_provider_transport(&mut transport, &codex_home, &request).unwrap();
@@ -673,6 +709,63 @@ fn restore_fixture_with_writer(
         bundle_path,
         codex_home,
     })
+}
+
+fn write_legacy_codex_bundle(path: &Path, session: &CanonicalSession, agent: Option<&str>) {
+    let mut session_bytes = serde_json::to_vec(session).unwrap();
+    session_bytes.push(b'\n');
+    let session_path = format!("sessions/{}.ndjson", session.id);
+    let manifest = json!({
+        "format": "1.1",
+        "agent": agent,
+        "createdAt": "2026-08-23T00:00:00Z",
+        "sessionCount": 1,
+        "workspaceCount": 0,
+        "fileCount": 0,
+        "redacted": false,
+        "redactionCount": 0,
+        "entries": [{
+            "path": session_path,
+            "size": session_bytes.len(),
+            "sha256": sha256_hex(&session_bytes)
+        }]
+    });
+    let entries = [
+        (
+            "manifest.json".to_owned(),
+            serde_json::to_vec(&manifest).unwrap(),
+        ),
+        (session_path, session_bytes),
+    ];
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(b"AHBUNDLE1").unwrap();
+    file.write_all(&(entries.len() as u32).to_le_bytes())
+        .unwrap();
+    for (entry_path, bytes) in entries {
+        file.write_all(&(entry_path.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(entry_path.as_bytes()).unwrap();
+        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&sha256_bytes(&bytes)).unwrap();
+        file.write_all(&bytes).unwrap();
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    agentark_canonical::Sha256Digest::from_bytes(bytes)
+        .as_str()
+        .strip_prefix("sha256:")
+        .unwrap()
+        .to_owned()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let hex = sha256_hex(bytes);
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    digest
 }
 
 fn restore_again(
@@ -830,6 +923,136 @@ fn missing_source_provider_falls_back_to_target_default_continuation() {
 }
 
 #[test]
+fn codex_session_without_native_payload_continues_from_canonical_history() {
+    let executor = fake_executor().continuation_success();
+
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(40, "canonical-only-source")],
+        "codex",
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.continuation_count, 1);
+    assert_eq!(fixture.report.archive_only_count, 0);
+    assert_eq!(executor.native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.continuation_call_count(), 1);
+    let mapping = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+    assert_eq!(mapping.len(), 1);
+    assert_eq!(
+        mapping[0].outcome,
+        agentark_migration::RestoreOutcome::Continuation
+    );
+}
+
+#[test]
+fn legacy_v1_1_codex_bundle_without_recovery_or_native_entries_continues() {
+    let root = TempRoot::new("legacy-canonical-continuation");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("legacy.ahbundle");
+    let legacy_session = session(41, "legacy-source");
+    write_legacy_codex_bundle(&bundle_path, &legacy_session, Some("codex"));
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor().continuation_success();
+
+    let report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            &executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(executor.native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(
+        state.restore_mappings_for(legacy_session.id).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn legacy_bundle_with_unambiguous_codex_sessions_continues_without_agent_label() {
+    let root = TempRoot::new("legacy-unambiguous-codex");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("legacy-no-agent.ahbundle");
+    let legacy_session = session(43, "legacy-unambiguous-source");
+    write_legacy_codex_bundle(&bundle_path, &legacy_session, None);
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor().continuation_success();
+
+    let report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            &executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(executor.continuation_call_count(), 1);
+}
+
+#[test]
+fn changed_canonical_history_conflicts_before_repeat_write_without_native_payload() {
+    let executor = fake_executor().continuation_success();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(42, "canonical-history-change")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+    let mut changed = session(42, "canonical-history-change");
+    changed.messages[0].content[0].text = Some("changed sanitized canonical text".into());
+    write_selected_sessions_with_native(
+        &fixture.bundle_path,
+        "codex",
+        std::slice::from_ref(&changed),
+        &[],
+        &[],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.continuation_count, 0);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn production_scripted_target_default_skips_incompatible_native_and_forks_explicitly() {
     let executor = ScriptedProviderRuntimeExecutor::new();
     let mut custom_session = session(8, "native-custom-provider");
@@ -907,7 +1130,7 @@ fn repeating_verified_continuation_reuses_one_target_and_one_mapping() {
 }
 
 #[test]
-fn changed_source_hash_conflicts_before_any_repeat_vendor_write() {
+fn changed_native_bytes_with_same_canonical_history_reuses_without_repeat_write() {
     let executor = fake_executor()
         .native_missing_provider()
         .continuation_success();
@@ -940,11 +1163,9 @@ fn changed_source_hash_conflicts_before_any_repeat_vendor_write() {
     assert_eq!(executor.continuation_call_count(), 1);
     assert_eq!(second.native_identity_count, 0);
     assert_eq!(second.continuation_count, 0);
-    assert_eq!(second.manual_intervention_count, 1);
-    assert_eq!(
-        second.recovery_error.as_deref(),
-        Some("restore-mapping-conflict")
-    );
+    assert_eq!(second.manual_intervention_count, 0);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(second.recovery_error, None);
     assert_eq!(
         fixture
             .state
@@ -1191,6 +1412,44 @@ impl RestoreMappingWriter for FailingMappingWriter {
     fn record(&self, _index: &mut IndexDb, _mapping: &RestoreMapping) -> Result<(), String> {
         Err("fixture-mapping-failure".into())
     }
+}
+
+struct MissingTargetHashMappingWriter;
+
+impl RestoreMappingWriter for MissingTargetHashMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        let mut incomplete = mapping.clone();
+        incomplete.target_hash = None;
+        index
+            .record_restore_mapping(&incomplete)
+            .map_err(|_| "fixture-mapping-failure".into())
+    }
+}
+
+#[test]
+fn existing_mapping_without_target_hash_conflicts_before_repeat_vendor_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![session(44, "missing-target-hash")],
+        "codex",
+        true,
+        Some(&MissingTargetHashMappingWriter),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
 }
 
 #[test]

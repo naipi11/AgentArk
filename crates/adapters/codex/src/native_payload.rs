@@ -1,9 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agentark_canonical::{CanonicalSession, Sha256Digest};
+use agentark_canonical::{
+    CanonicalRole, CanonicalSession, ContentPartKind, Sha256Digest, canonical_hash,
+};
 use agentark_security::SecretScanner;
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -17,6 +20,10 @@ pub enum NativePayloadError {
     InvalidPath,
     #[error("native rollout conflicts with an existing target file")]
     Conflict,
+    #[error("canonical visible history contains an unsupported message role")]
+    UnsupportedVisibleRole,
+    #[error("canonical continuation metadata is invalid")]
+    InvalidMetadata,
     #[error("native rollout import failed")]
     NativeImport(#[from] crate::NativeImportError),
 }
@@ -39,6 +46,190 @@ pub struct NativeRestoreReport {
     pub mappings: Vec<(String, String)>,
     pub written_paths: Vec<PathBuf>,
     pub restart_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexVisibleRole {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CodexVisibleMessage {
+    pub role: CodexVisibleRole,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexVisibleHistory {
+    pub messages: Vec<CodexVisibleMessage>,
+    pub message_count: usize,
+    pub content_hash: Sha256Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexVisibleHistoryExpectation {
+    pub message_count: usize,
+    pub content_hash: Sha256Digest,
+}
+
+impl CodexVisibleHistory {
+    pub fn expectation(&self) -> CodexVisibleHistoryExpectation {
+        CodexVisibleHistoryExpectation {
+            message_count: self.message_count,
+            content_hash: self.content_hash.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalContinuationSource {
+    pub thread_id: String,
+    pub bytes: Vec<u8>,
+    pub title: Option<String>,
+    pub visible_history: CodexVisibleHistory,
+}
+
+pub fn canonical_visible_history(
+    session: &CanonicalSession,
+) -> Result<CodexVisibleHistory, NativePayloadError> {
+    let mut ordered = session.messages.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|message| message.ordinal);
+    let mut messages = Vec::new();
+    for message in ordered {
+        let text = message
+            .content
+            .iter()
+            .filter(|part| part.kind == ContentPartKind::Text)
+            .filter_map(|part| part.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        if text.is_empty() {
+            continue;
+        }
+        let role = match message.role {
+            CanonicalRole::User => CodexVisibleRole::User,
+            CanonicalRole::Assistant => CodexVisibleRole::Assistant,
+            CanonicalRole::System | CanonicalRole::Tool | CanonicalRole::Unknown => {
+                return Err(NativePayloadError::UnsupportedVisibleRole);
+            }
+        };
+        messages.push(CodexVisibleMessage { role, text });
+    }
+    visible_history_from_messages(messages)
+}
+
+pub(crate) fn visible_history_from_messages(
+    messages: Vec<CodexVisibleMessage>,
+) -> Result<CodexVisibleHistory, NativePayloadError> {
+    let content_hash = canonical_hash("codex-visible-history", &messages)
+        .map_err(|_| NativePayloadError::InvalidMetadata)?;
+    Ok(CodexVisibleHistory {
+        message_count: messages.len(),
+        messages,
+        content_hash,
+    })
+}
+
+pub fn build_canonical_continuation_source(
+    session: &CanonicalSession,
+    target_cwd: &Path,
+    target_provider: &str,
+    target_model: &str,
+) -> Result<CanonicalContinuationSource, NativePayloadError> {
+    if target_cwd.as_os_str().is_empty()
+        || !valid_safe_label(target_provider)
+        || !valid_safe_label(target_model)
+    {
+        return Err(NativePayloadError::InvalidMetadata);
+    }
+    let visible_history = canonical_visible_history(session)?;
+    let source_identity = json!({
+        "canonicalSessionId": session.id,
+        "cwd": target_cwd.to_string_lossy(),
+        "provider": target_provider,
+        "model": target_model,
+        "visibleHistoryHash": visible_history.content_hash,
+    });
+    let identity_hash = canonical_hash("codex-continuation-source-id", &source_identity)
+        .map_err(|_| NativePayloadError::InvalidMetadata)?;
+    let thread_id = Uuid::new_v5(&session.id, identity_hash.as_str().as_bytes()).to_string();
+    let timestamp = "1970-01-01T00:00:00.000Z";
+    let mut records = Vec::with_capacity(visible_history.message_count * 2 + 1);
+    records.push(json!({
+        "timestamp": timestamp,
+        "type": "session_meta",
+        "payload": {
+            "id": thread_id,
+            "timestamp": timestamp,
+            "cwd": target_cwd.to_string_lossy(),
+            "originator": "codex_cli_rs",
+            "cli_version": crate::CODEX_VERSION,
+            "source": "cli",
+            "model_provider": target_provider,
+            "model": target_model,
+            "agentark": {
+                "canonical_session_id": session.id,
+                "source_agent": "codex",
+                "title": session.title,
+                "visible_history_hash": visible_history.content_hash,
+                "visible_message_count": visible_history.message_count,
+            }
+        }
+    }));
+    for message in &visible_history.messages {
+        let (role, part_type) = match message.role {
+            CodexVisibleRole::User => ("user", "input_text"),
+            CodexVisibleRole::Assistant => ("assistant", "output_text"),
+        };
+        records.push(json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": role,
+                "content": [{"type": part_type, "text": message.text}],
+            }
+        }));
+        let event_payload = match message.role {
+            CodexVisibleRole::User => json!({
+                "type": "user_message",
+                "message": message.text,
+                "kind": "plain",
+            }),
+            CodexVisibleRole::Assistant => json!({
+                "type": "agent_message",
+                "message": message.text,
+                "phase": null,
+                "memory_citation": null,
+            }),
+        };
+        records.push(json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": event_payload,
+        }));
+    }
+    let mut bytes = Vec::new();
+    for record in records {
+        bytes.extend_from_slice(&serde_json::to_vec(&record)?);
+        bytes.push(b'\n');
+    }
+    Ok(CanonicalContinuationSource {
+        thread_id,
+        bytes,
+        title: session.title.clone(),
+        visible_history,
+    })
+}
+
+fn valid_safe_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 pub fn collect_native_rollouts(
@@ -66,7 +257,8 @@ pub fn collect_native_rollouts(
                         .ok()
                         .and_then(|value| {
                             value
-                                .pointer("/payload/session_id")
+                                .pointer("/payload/id")
+                                .or_else(|| value.pointer("/payload/session_id"))
                                 .and_then(Value::as_str)
                                 .map(|id| id == session.source_session_id)
                         })
@@ -151,6 +343,9 @@ pub fn native_thread_expectation(
 ) -> Result<crate::NativeThreadExpectation, NativePayloadError> {
     let mut thread_id = None;
     let mut cwd = None;
+    let mut title = None;
+    let mut model_provider = None;
+    let mut messages = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -158,24 +353,82 @@ pub fn native_thread_expectation(
         let value: Value = serde_json::from_slice(line)?;
         if value.get("type").and_then(Value::as_str) == Some("session_meta") {
             thread_id = value
-                .pointer("/payload/session_id")
+                .pointer("/payload/id")
+                .or_else(|| value.pointer("/payload/session_id"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             cwd = value
                 .pointer("/payload/cwd")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
+            title = value
+                .pointer("/payload/agentark/title")
+                .or_else(|| value.pointer("/payload/title"))
+                .and_then(Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .map(ToOwned::to_owned);
+            model_provider = value
+                .pointer("/payload/model_provider")
+                .and_then(Value::as_str)
+                .filter(|provider| valid_safe_label(provider))
+                .map(ToOwned::to_owned);
+        } else if value.get("type").and_then(Value::as_str) == Some("response_item")
+            && let Some(message) = native_visible_message(&value)?
+        {
+            messages.push(message);
         }
     }
     let thread_id = thread_id.ok_or(NativePayloadError::InvalidPath)?;
     let cwd = cwd.ok_or(NativePayloadError::InvalidPath)?;
+    let model_provider = model_provider.ok_or(NativePayloadError::InvalidMetadata)?;
+    let visible_history = visible_history_from_messages(messages)?.expectation();
     Ok(crate::NativeThreadExpectation {
         thread_id,
         cwd,
-        title: None,
-        visible_text_hash: Sha256Digest::from_bytes(b""),
-        visible_turns: 1,
+        title,
+        model_provider,
+        rollout_hash: Sha256Digest::from_bytes(bytes),
+        visible_history,
     })
+}
+
+fn native_visible_message(
+    value: &Value,
+) -> Result<Option<CodexVisibleMessage>, NativePayloadError> {
+    let payload = value
+        .get("payload")
+        .filter(|payload| payload.get("type").and_then(Value::as_str) == Some("message"));
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let role = match payload.get("role").and_then(Value::as_str) {
+        Some("user") => CodexVisibleRole::User,
+        Some("assistant") => CodexVisibleRole::Assistant,
+        _ => return Ok(None),
+    };
+    let allowed = match role {
+        CodexVisibleRole::User => ["input_text", "text"],
+        CodexVisibleRole::Assistant => ["output_text", "text"],
+    };
+    let parts = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or(NativePayloadError::InvalidMetadata)?;
+    let mut text = String::new();
+    for part in parts {
+        let part_type = part
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(NativePayloadError::InvalidMetadata)?;
+        if allowed.contains(&part_type) {
+            text.push_str(
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .ok_or(NativePayloadError::InvalidMetadata)?,
+            );
+        }
+    }
+    Ok(Some(CodexVisibleMessage { role, text }))
 }
 
 pub fn restore_native_rollouts(
@@ -334,7 +587,10 @@ fn extract_thread_id(bytes: &[u8]) -> Result<String, NativePayloadError> {
         }
         let value: Value = serde_json::from_slice(line)?;
         if value.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(id) = value.pointer("/payload/session_id").and_then(Value::as_str)
+            && let Some(id) = value
+                .pointer("/payload/id")
+                .or_else(|| value.pointer("/payload/session_id"))
+                .and_then(Value::as_str)
         {
             return Ok(id.to_owned());
         }

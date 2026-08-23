@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
     CodexContinuationRequest, CodexError, CodexTargetDefault, CodexTargetSessionExpectation,
-    JsonRpcTransport, NativeImportError, NativeThreadExpectation, RawJsonRpc, backup_codex_targets,
-    delete_thread_with_app_server_transport, ensure_codex_not_running_from_tasklist,
-    fork_rollout_with_target_provider_transport, probe_target_default_transport,
-    verify_target_session_transport, verify_thread_listing, write_rollout_atomic_with_operations,
-    write_rollout_atomic_with_reader,
+    CodexVisibleHistoryExpectation, JsonRpcTransport, NativeImportError, NativeThreadExpectation,
+    RawJsonRpc, backup_codex_targets, delete_thread_with_app_server_transport,
+    ensure_codex_not_running_from_tasklist, fork_rollout_with_target_provider_transport,
+    probe_target_default_transport, verify_target_session_transport, verify_thread_listing,
+    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
 };
 use agentark_canonical::Sha256Digest;
 use serde_json::{Value, json};
@@ -25,6 +25,8 @@ fn delete_thread_helper_initializes_and_deletes_exact_target() {
     let responses = vec![
         json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
         json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": {"data": [], "nextCursor": null}}),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {"data": [], "nextCursor": null}}),
     ];
     let (mut transport, sent) = ScriptedTransport::new(responses);
 
@@ -105,6 +107,26 @@ impl JsonRpcTransport for ScriptedTransport {
             bytes: serde_json::to_vec(&value).unwrap(),
             value,
         })
+    }
+}
+
+fn empty_history() -> CodexVisibleHistoryExpectation {
+    CodexVisibleHistoryExpectation {
+        message_count: 0,
+        content_hash: Sha256Digest::parse(
+            "sha256:9d8b77fbc3e8a7bfa6757b47b9419947b07c1599f91de8aceb4ab2b863635a6b",
+        )
+        .unwrap(),
+    }
+}
+
+fn one_fixture_message() -> CodexVisibleHistoryExpectation {
+    CodexVisibleHistoryExpectation {
+        message_count: 1,
+        content_hash: Sha256Digest::parse(
+            "sha256:59d55302fadfd18a86ffdf751b4fba88f1384254079bfefef443a739e8278383",
+        )
+        .unwrap(),
     }
 }
 
@@ -206,6 +228,7 @@ fn existing_target_verifier_checks_id_provider_and_rollout_hash_without_mutation
             "result": {"data": [{
                 "id": target_id,
                 "path": rollout,
+                "cwd": "C:/fixture",
                 "modelProvider": "openai"
             }], "nextCursor": null}
         }),
@@ -214,16 +237,22 @@ fn existing_target_verifier_checks_id_provider_and_rollout_hash_without_mutation
             "id": 3,
             "result": {"thread": {
                 "id": target_id,
+                "cwd": "C:/fixture",
                 "modelProvider": "openai",
-                "turns": [{"id": "turn-1"}]
+                "turns": [{"id": "turn-1", "items": [
+                    {"type": "userMessage", "content": [{"type": "input_text", "text": "fixture"}]}
+                ]}]
             }}
         }),
     ];
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let expected = CodexTargetSessionExpectation {
         thread_id: target_id.into(),
+        cwd: "C:/fixture".into(),
+        title: None,
         model_provider: "openai".into(),
         rollout_hash: Sha256Digest::from_bytes(b"existing verified target"),
+        visible_history: one_fixture_message(),
     };
 
     verify_target_session_transport(&mut transport, codex_home.path(), &expected).unwrap();
@@ -257,6 +286,7 @@ fn existing_target_verifier_rejects_changed_rollout_hash() {
             "result": {"data": [{
                 "id": target_id,
                 "path": rollout,
+                "cwd": "C:/fixture",
                 "modelProvider": "openai"
             }], "nextCursor": null}
         }),
@@ -264,8 +294,11 @@ fn existing_target_verifier_rejects_changed_rollout_hash() {
     let (mut transport, _) = ScriptedTransport::new(responses);
     let expected = CodexTargetSessionExpectation {
         thread_id: target_id.into(),
+        cwd: "C:/fixture".into(),
+        title: None,
         model_provider: "openai".into(),
         rollout_hash: Sha256Digest::from_bytes(b"original target"),
+        visible_history: one_fixture_message(),
     };
 
     let error =
@@ -354,10 +387,9 @@ fn rollout_verification_requires_visible_threads() {
         thread_id: "01native-thread".into(),
         cwd: r"C:\restore\project".into(),
         title: Some("Imported fixture".into()),
-        visible_text_hash: Sha256Digest::from_bytes(
-            b"Imported user message\nImported assistant message",
-        ),
-        visible_turns: 2,
+        model_provider: "openai".into(),
+        rollout_hash: Sha256Digest::from_bytes(b"native rollout"),
+        visible_history: one_fixture_message(),
     };
     let result = verify_thread_listing(&json!({"result": {"data": []}}), &expected);
     assert!(matches!(
@@ -415,6 +447,8 @@ fn fork_rollout_sends_selected_provider_without_secrets_and_verifies_visibility(
         target_cwd: target_cwd.clone(),
         target_provider: Some("openai".into()),
         target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
     };
 
     let report =
@@ -474,7 +508,7 @@ fn fork_rollout_sends_selected_provider_without_secrets_and_verifies_visibility(
             .contains("endpoint")
     );
     assert_eq!(report.target_thread_id, target_thread_id);
-    assert_eq!(report.visible_turns, 1);
+    assert_eq!(report.visible_turns, 0);
     assert!(sent.iter().all(|value| value["method"] != "thread/delete"));
 }
 
@@ -497,6 +531,8 @@ fn fork_rollout_omits_optional_target_provider_and_model_keys() {
         target_cwd,
         target_provider: None,
         target_model: None,
+        title: None,
+        visible_history: empty_history(),
     };
 
     fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
@@ -527,6 +563,8 @@ fn fork_rollout_deletes_new_target_when_post_fork_validation_fails() {
     responses[1]["result"]["modelProvider"] = Value::String("unexpected".into());
     responses.truncate(2);
     responses.push(json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    responses.push(json!({"jsonrpc": "2.0", "id": 4, "result": {"data": [], "nextCursor": null}}));
+    responses.push(json!({"jsonrpc": "2.0", "id": 5, "result": {"data": [], "nextCursor": null}}));
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -534,6 +572,8 @@ fn fork_rollout_deletes_new_target_when_post_fork_validation_fails() {
         target_cwd,
         target_provider: Some("openai".into()),
         target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
@@ -581,13 +621,15 @@ fn fork_rollout_reports_manual_intervention_when_validation_rollback_fails() {
         target_cwd,
         target_provider: Some("openai".into()),
         target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
         fork_rollout_with_target_provider_transport(&mut transport, codex_home.path(), &request)
             .unwrap_err();
 
-    assert!(matches!(error, NativeImportError::Rollback));
+    assert!(matches!(error, NativeImportError::ManualIntervention));
 }
 
 #[test]
@@ -615,6 +657,8 @@ fn fork_rollout_missing_target_id_requires_manual_intervention_without_delete() 
         target_cwd,
         target_provider: None,
         target_model: None,
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
@@ -652,6 +696,8 @@ fn fork_rollout_empty_target_id_requires_manual_intervention_without_delete() {
         target_cwd,
         target_provider: None,
         target_model: None,
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
@@ -690,6 +736,8 @@ fn fork_rollout_reused_source_id_requires_manual_intervention_without_source_del
         target_cwd,
         target_provider: None,
         target_model: None,
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
@@ -721,6 +769,8 @@ fn fork_rollout_does_not_retry_archived_when_active_list_is_malformed() {
     responses[2] = json!({"jsonrpc": "2.0", "id": 3, "result": {}});
     responses.truncate(3);
     responses.push(json!({"jsonrpc": "2.0", "id": 4, "result": {}}));
+    responses.push(json!({"jsonrpc": "2.0", "id": 5, "result": {"data": [], "nextCursor": null}}));
+    responses.push(json!({"jsonrpc": "2.0", "id": 6, "result": {"data": [], "nextCursor": null}}));
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -728,6 +778,8 @@ fn fork_rollout_does_not_retry_archived_when_active_list_is_malformed() {
         target_cwd,
         target_provider: Some("openai".into()),
         target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
@@ -740,7 +792,7 @@ fn fork_rollout_does_not_retry_archived_when_active_list_is_malformed() {
         sent.iter()
             .filter(|value| value["method"] == "thread/list")
             .count(),
-        1
+        3
     );
     assert_eq!(
         sent.iter()
@@ -769,6 +821,8 @@ fn fork_rollout_does_not_retry_archived_when_active_target_has_wrong_cwd() {
     responses[2] = wrong_cwd_listing;
     responses.truncate(3);
     responses.push(json!({"jsonrpc": "2.0", "id": 4, "result": {}}));
+    responses.push(json!({"jsonrpc": "2.0", "id": 5, "result": {"data": [], "nextCursor": null}}));
+    responses.push(json!({"jsonrpc": "2.0", "id": 6, "result": {"data": [], "nextCursor": null}}));
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -776,6 +830,8 @@ fn fork_rollout_does_not_retry_archived_when_active_target_has_wrong_cwd() {
         target_cwd,
         target_provider: Some("openai".into()),
         target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
     };
 
     let error =
@@ -785,14 +841,14 @@ fn fork_rollout_does_not_retry_archived_when_active_target_has_wrong_cwd() {
     assert!(
         error
             .to_string()
-            .contains("forked thread cwd does not match")
+            .contains("mapped target cwd does not match")
     );
     let sent = sent.lock().unwrap();
     assert_eq!(
         sent.iter()
             .filter(|value| value["method"] == "thread/list")
             .count(),
-        1
+        3
     );
     assert_eq!(
         sent.iter()

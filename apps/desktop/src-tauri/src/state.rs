@@ -877,6 +877,16 @@ impl AppState {
             let mut native_backup_path = None;
             let mut manual_intervention_count = 0u64;
             let bundle_target_agent = target_agent_kind(bundle.manifest.agent.as_deref());
+            let bundle_is_codex = match bundle.manifest.agent.as_deref() {
+                Some("codex") => true,
+                Some(_) => false,
+                None => {
+                    !sessions.is_empty()
+                        && sessions.iter().all(|session| {
+                            source_agent_kind(&session.source_kind) == Some(AgentKind::Codex)
+                        })
+                }
+            };
             for session in &sessions {
                 let mut recovery_session = session.clone();
                 if let Some(source) = recovery_sources.get(&session.id) {
@@ -930,7 +940,14 @@ impl AppState {
                     continue;
                 }
                 if let Some(mapping) = durable_mappings.first() {
-                    let current_source_hash = recovery_source_hash(&input);
+                    let current_source_hash = match recovery_source_hash(&input) {
+                        Ok(hash) => hash,
+                        Err(_) => {
+                            manual_intervention_count += 1;
+                            recovery_error = Some("restore-mapping-conflict".into());
+                            continue;
+                        }
+                    };
                     let target = mapping
                         .target_native_id
                         .clone()
@@ -959,7 +976,7 @@ impl AppState {
                 let has_archive_mapping = target_mappings
                     .iter()
                     .any(|mapping| mapping.outcome == RestoreOutcome::ArchiveOnly);
-                let recovery = if bundle.manifest.agent.as_deref() == Some("codex") {
+                let recovery = if bundle_is_codex {
                     recover_one_codex_session(executor, &input)
                 } else {
                     archive_only_recovery_report(

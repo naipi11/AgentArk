@@ -27,9 +27,11 @@ pub use native_import::{
     write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
 };
 pub use native_payload::{
-    NativePayloadError, NativeRestoreReport, NativeRolloutPayload, collect_native_rollouts,
-    native_thread_expectation, restore_native_rollouts, rewrite_native_workspace_paths,
-    sanitize_rollout_bytes,
+    CanonicalContinuationSource, CodexVisibleHistory, CodexVisibleHistoryExpectation,
+    CodexVisibleMessage, CodexVisibleRole, NativePayloadError, NativeRestoreReport,
+    NativeRolloutPayload, build_canonical_continuation_source, canonical_visible_history,
+    collect_native_rollouts, native_thread_expectation, restore_native_rollouts,
+    rewrite_native_workspace_paths, sanitize_rollout_bytes,
 };
 pub use normalize::{
     normalize_thread_read, normalize_thread_read_bytes, normalize_thread_read_bytes_for_install,

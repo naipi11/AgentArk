@@ -1,238 +1,134 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
-use std::error::Error;
 use std::fs;
-use std::io;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 
 use agentark_adapter_codex::{
-    CodexContinuationReport, CodexContinuationRequest, JsonRpcTransport, ProcessTransport,
-    RawJsonRpc, fork_rollout_with_target_provider, native_thread_expectation,
+    CodexContinuationRequest, build_canonical_continuation_source, delete_thread_with_app_server,
+    fork_rollout_with_target_provider, probe_target_default,
 };
-use serde_json::{Value, json};
-use tempfile::{TempDir, tempdir};
-
-struct FixtureContext {
-    _root: TempDir,
-    codex_home: PathBuf,
-    executable: PathBuf,
-    rollout_path: PathBuf,
-    initial_visible_turns: usize,
-}
-
-fn fixture_contexts() -> &'static Mutex<HashMap<String, FixtureContext>> {
-    static CONTEXTS: OnceLock<Mutex<HashMap<String, FixtureContext>>> = OnceLock::new();
-    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+use agentark_canonical::{
+    CanonicalMessage, CanonicalRole, CanonicalSchemaVersion, CanonicalSession, Completeness,
+    ContentPart, ContentPartKind, Sha256Digest, Workspace,
+};
+use tempfile::tempdir;
+use uuid::Uuid;
 
 #[test]
-#[ignore = "non-billed; requires compatible Codex, source rollout, and target provider; uses only a temporary CODEX_HOME"]
-fn fork_rebases_visible_history_to_target_provider() {
-    let report = fork_fixture_with_target_provider("openai", None).unwrap();
-    assert_ne!(report.source_thread_id, report.target_thread_id);
-    assert!(report.visible_turns > 0);
-    assert_eq!(report.model_provider, "openai");
-    cleanup_fixture(&report.target_thread_id);
-}
-
-#[test]
-#[ignore = "billed target-provider turn requires AGENTARK_RUN_PROVIDER_CONTINUATION and uses only a temporary CODEX_HOME"]
-fn forked_thread_accepts_a_target_provider_turn() {
-    if std::env::var_os("AGENTARK_RUN_PROVIDER_CONTINUATION").is_none() {
-        return;
-    }
-    let report = fork_fixture_with_target_provider("openai", None).unwrap();
-    start_and_wait_for_turn(
-        &report.target_thread_id,
-        "Reply only: continuation verified.",
+#[ignore = "non-billed; requires compatible Codex and uses only generated data in a temporary CODEX_HOME"]
+fn generated_canonical_history_forks_survives_restart_and_deletes_exact_target() {
+    let executable = env::var_os("AGENTARK_CODEX_BIN")
+        .map(PathBuf::from)
+        .expect("AGENTARK_CODEX_BIN");
+    let root = tempdir().unwrap();
+    let codex_home = root.path().join("codex");
+    let sessions = codex_home.join("sessions").join("2026/08/23");
+    let target_cwd = root.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    let target_default = probe_target_default(&executable, &codex_home).unwrap();
+    let session = canonical_fixture(&target_cwd);
+    let source = build_canonical_continuation_source(
+        &session,
+        &target_cwd,
+        &target_default.model_provider,
+        &target_default.model,
     )
     .unwrap();
-    assert_target_turn_is_visible(&report.target_thread_id).unwrap();
-    cleanup_fixture(&report.target_thread_id);
+    let source_rollout = sessions.join(format!("rollout-{}.jsonl", source.thread_id));
+    fs::write(&source_rollout, &source.bytes).unwrap();
+    let request = CodexContinuationRequest {
+        source_rollout: source_rollout.clone(),
+        source_thread_id: source.thread_id,
+        target_cwd: target_cwd.clone(),
+        target_provider: Some(target_default.model_provider.clone()),
+        target_model: Some(target_default.model.clone()),
+        title: source.title.clone(),
+        visible_history: source.visible_history.expectation(),
+    };
+
+    let report = fork_rollout_with_target_provider(&executable, &codex_home, &request).unwrap();
+
+    assert_ne!(report.source_thread_id, report.target_thread_id);
+    assert_eq!(report.model_provider, target_default.model_provider);
+    assert_eq!(report.model, target_default.model);
+    assert_eq!(report.visible_history, request.visible_history);
+    assert_eq!(
+        report.rollout_hash,
+        Sha256Digest::from_bytes(&fs::read(&report.rollout_path).unwrap())
+    );
+    assert!(source_rollout.is_file());
+
+    delete_thread_with_app_server(&executable, &codex_home, &report.target_thread_id).unwrap();
+
+    assert!(source_rollout.is_file());
+    assert!(!report.rollout_path.exists());
 }
 
 #[test]
 fn continuation_target_cwd_is_scoped_to_fixture_tempdir() {
     let root = tempdir().unwrap();
-    let target_cwd = create_fixture_target_cwd(&root).unwrap();
+    let target_cwd = root.path().join("project");
+    fs::create_dir(&target_cwd).unwrap();
     assert!(target_cwd.starts_with(root.path()));
     assert!(target_cwd.is_dir());
 }
 
-fn fork_fixture_with_target_provider(
-    provider: &str,
-    model: Option<&str>,
-) -> Result<CodexContinuationReport, Box<dyn Error>> {
-    let executable = env::var_os("AGENTARK_CODEX_BIN")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "AGENTARK_CODEX_BIN"))?;
-    let fixture = env::var_os("AGENTARK_CODEX_ROLLOUT_FIXTURE")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "AGENTARK_CODEX_ROLLOUT_FIXTURE"))?;
-    let root = tempdir()?;
-    let codex_home = root.path().join("codex");
-    let source_rollout = codex_home
-        .join("sessions")
-        .join("2026")
-        .join("08")
-        .join("23")
-        .join(
-            fixture
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fixture filename"))?,
-        );
-    fs::create_dir_all(source_rollout.parent().unwrap())?;
-    fs::copy(&fixture, &source_rollout)?;
-    let source = fs::read(&source_rollout)?;
-    let expected = native_thread_expectation(&source)?;
-    let target_cwd = create_fixture_target_cwd(&root)?;
-    let request = CodexContinuationRequest {
-        source_rollout,
-        source_thread_id: expected.thread_id,
-        target_cwd,
-        target_provider: Some(provider.to_owned()),
-        target_model: model.map(str::to_owned),
-    };
-    let report = fork_rollout_with_target_provider(&executable, &codex_home, &request)?;
-    fixture_contexts().lock().unwrap().insert(
-        report.target_thread_id.clone(),
-        FixtureContext {
-            _root: root,
-            codex_home,
-            executable,
-            rollout_path: report.rollout_path.clone(),
-            initial_visible_turns: report.visible_turns,
-        },
-    );
-    Ok(report)
-}
-
-fn start_and_wait_for_turn(thread_id: &str, prompt: &str) -> Result<(), Box<dyn Error>> {
-    let contexts = fixture_contexts().lock().unwrap();
-    let context = contexts
-        .get(thread_id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "fixture context"))?;
-    let mut transport =
-        ProcessTransport::spawn_with_codex_home(&context.executable, Some(&context.codex_home))?;
-    initialize(&mut transport)?;
-    transport.send_value(&json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "thread/resume",
-        "params": {
-            "threadId": thread_id,
-            "path": context.rollout_path
-        }
-    }))?;
-    let resumed = receive_response(&mut transport, 2)?;
-    if resumed
-        .value
-        .pointer("/result/thread/id")
-        .and_then(Value::as_str)
-        != Some(thread_id)
-    {
-        return Err(io::Error::other("thread/resume returned a different thread").into());
-    }
-    transport.send_value(&json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "turn/start",
-        "params": {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}]
-        }
-    }))?;
-    let mut started = false;
-    let mut completed = false;
-    while !started || !completed {
-        let response = transport.receive_value()?;
-        if response.value.get("id") == Some(&Value::from(3)) {
-            if let Some(error) = response.value.get("error") {
-                return Err(io::Error::other(format!("turn/start failed: {error}")).into());
-            }
-            started = true;
-        }
-        if response.value.get("method").and_then(Value::as_str) == Some("turn/completed")
-            && response
-                .value
-                .pointer("/params/threadId")
-                .and_then(Value::as_str)
-                == Some(thread_id)
-        {
-            completed = true;
-        }
-    }
-    Ok(())
-}
-
-fn assert_target_turn_is_visible(thread_id: &str) -> Result<(), Box<dyn Error>> {
-    let contexts = fixture_contexts().lock().unwrap();
-    let context = contexts
-        .get(thread_id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "fixture context"))?;
-    let mut transport =
-        ProcessTransport::spawn_with_codex_home(&context.executable, Some(&context.codex_home))?;
-    initialize(&mut transport)?;
-    transport.send_value(&json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "thread/read",
-        "params": {"threadId": thread_id, "includeTurns": true}
-    }))?;
-    let response = receive_response(&mut transport, 2)?;
-    let visible_turns = response
-        .value
-        .pointer("/result/thread/turns")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "thread/read turns"))?;
-    if visible_turns <= context.initial_visible_turns {
-        return Err(io::Error::other("target provider turn is not visible").into());
-    }
-    Ok(())
-}
-
-fn initialize<T: JsonRpcTransport>(transport: &mut T) -> Result<(), Box<dyn Error>> {
-    transport.send_value(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {
-                "name": "agentark-provider-continuation-test",
-                "title": "AgentArk",
-                "version": "0.6.0"
-            },
-            "capabilities": {"experimentalApi": true}
-        }
-    }))?;
-    receive_response(transport, 1)?;
-    transport.send_value(&json!({"method": "initialized", "params": {}}))?;
-    Ok(())
-}
-
-fn receive_response<T: JsonRpcTransport>(
-    transport: &mut T,
-    id: u64,
-) -> Result<RawJsonRpc, Box<dyn Error>> {
-    loop {
-        let response = transport.receive_value()?;
-        if response.value.get("id") == Some(&Value::from(id)) {
-            if let Some(error) = response.value.get("error") {
-                return Err(io::Error::other(format!("App Server request failed: {error}")).into());
-            }
-            return Ok(response);
-        }
+fn canonical_fixture(target_cwd: &std::path::Path) -> CanonicalSession {
+    let session_id = Uuid::from_u128(0x9001);
+    CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: session_id,
+        install_id: Uuid::from_u128(0x9002),
+        source_session_id: "synthetic-source".into(),
+        source_kind: "codex".into(),
+        workspace: Some(Workspace {
+            id: Uuid::from_u128(0x9003),
+            path_native: target_cwd.to_string_lossy().into_owned(),
+            canonical_uri: format!("file://{}", target_cwd.to_string_lossy().replace('\\', "/")),
+            git_commit: None,
+        }),
+        title: Some("Synthetic canonical continuation".into()),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: Some("legacy-provider".into()),
+        model_name: Some("legacy-model".into()),
+        completeness: Completeness::Complete,
+        messages: vec![
+            visible_message(session_id, 1, CanonicalRole::User, "synthetic user message"),
+            visible_message(
+                session_id,
+                2,
+                CanonicalRole::Assistant,
+                "synthetic assistant message",
+            ),
+        ],
+        tool_events: Vec::new(),
+        attachments: Vec::new(),
+        raw_extra: BTreeMap::new(),
     }
 }
 
-fn cleanup_fixture(thread_id: &str) {
-    fixture_contexts().lock().unwrap().remove(thread_id);
-}
-
-fn create_fixture_target_cwd(root: &TempDir) -> io::Result<PathBuf> {
-    let target_cwd = root.path().join("project");
-    fs::create_dir(&target_cwd)?;
-    Ok(target_cwd)
+fn visible_message(
+    session_id: Uuid,
+    ordinal: u64,
+    role: CanonicalRole,
+    text: &str,
+) -> CanonicalMessage {
+    CanonicalMessage {
+        id: Uuid::new_v5(&session_id, format!("message-{ordinal}").as_bytes()),
+        source_record_id: Some(format!("synthetic-{ordinal}")),
+        ordinal,
+        role,
+        raw_role: None,
+        created_at_raw: None,
+        content: vec![ContentPart {
+            kind: ContentPartKind::Text,
+            text: Some(text.into()),
+            attachment_id: None,
+            raw_extra: BTreeMap::new(),
+        }],
+        raw_ref: Sha256Digest::from_bytes(text.as_bytes()),
+    }
 }

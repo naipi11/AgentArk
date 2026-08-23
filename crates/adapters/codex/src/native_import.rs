@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{CODEX_VERSION, CodexError, JsonRpcTransport, ProcessTransport, RawJsonRpc};
+use crate::{
+    CODEX_VERSION, CodexError, CodexVisibleHistoryExpectation, CodexVisibleMessage,
+    CodexVisibleRole, JsonRpcTransport, ProcessTransport, RawJsonRpc,
+};
 
 #[derive(Debug, Error)]
 pub enum NativeImportError {
@@ -41,8 +44,9 @@ pub struct NativeThreadExpectation {
     pub thread_id: String,
     pub cwd: String,
     pub title: Option<String>,
-    pub visible_text_hash: Sha256Digest,
-    pub visible_turns: usize,
+    pub model_provider: String,
+    pub rollout_hash: Sha256Digest,
+    pub visible_history: CodexVisibleHistoryExpectation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +56,8 @@ pub struct CodexContinuationRequest {
     pub target_cwd: PathBuf,
     pub target_provider: Option<String>,
     pub target_model: Option<String>,
+    pub title: Option<String>,
+    pub visible_history: CodexVisibleHistoryExpectation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +68,8 @@ pub struct CodexContinuationReport {
     pub model_provider: String,
     pub model: String,
     pub visible_turns: usize,
+    pub rollout_hash: Sha256Digest,
+    pub visible_history: CodexVisibleHistoryExpectation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -73,8 +81,11 @@ pub struct CodexTargetDefault {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexTargetSessionExpectation {
     pub thread_id: String,
+    pub cwd: String,
+    pub title: Option<String>,
     pub model_provider: String,
     pub rollout_hash: Sha256Digest,
+    pub visible_history: CodexVisibleHistoryExpectation,
 }
 
 pub fn ensure_codex_not_running_from_tasklist(output: &str) -> Result<(), NativeImportError> {
@@ -165,50 +176,75 @@ pub fn verify_rollouts_with_app_server(
     codex_home: &Path,
     rollouts: &[(PathBuf, NativeThreadExpectation)],
 ) -> Result<(), NativeImportError> {
-    let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
-        .map_err(map_codex_error)?;
-    let mut client = NativeAppServerClient::new(&mut transport);
-    client.initialize()?;
-    for (rollout, expected) in rollouts {
-        let resume_request_id = Uuid::now_v7().to_string();
-        let resumed = client.request(
-            "thread/resume",
-            json!({"threadId": resume_request_id, "path": rollout.to_string_lossy()}),
-        )?;
-        let thread = resumed.value.pointer("/result/thread").ok_or_else(|| {
-            NativeImportError::Verification("thread/resume returned no thread".into())
-        })?;
-        if thread.get("id").and_then(Value::as_str) != Some(expected.thread_id.as_str()) {
-            return Err(NativeImportError::Verification(
-                "thread/resume returned a different thread id".into(),
-            ));
+    for resume in [true, false] {
+        let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
+            .map_err(map_codex_error)?;
+        let mut client = NativeAppServerClient::new(&mut transport);
+        client.initialize()?;
+        for (rollout, expected) in rollouts {
+            verify_native_rollout_hash(codex_home, rollout, expected)?;
+            if resume {
+                let resume_request_id = Uuid::now_v7().to_string();
+                let resumed = client.request(
+                    "thread/resume",
+                    json!({"threadId": resume_request_id, "path": rollout.to_string_lossy()}),
+                )?;
+                let thread = resumed.value.pointer("/result/thread").ok_or_else(|| {
+                    NativeImportError::Verification("thread/resume returned no thread".into())
+                })?;
+                if thread.get("id").and_then(Value::as_str) != Some(expected.thread_id.as_str()) {
+                    return Err(NativeImportError::Verification(
+                        "thread/resume returned a different thread id".into(),
+                    ));
+                }
+            }
+            verify_native_list_and_read(&mut client, expected)?;
         }
-        let listed = client.request(
-            "thread/list",
-            json!({
-                "archived": false,
-                "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
-                "limit": 1000
-            }),
-        )?;
-        if verify_thread_listing(&listed.value, expected).is_err() {
-            let archived = client.request(
-                "thread/list",
-                json!({
-                    "archived": true,
-                    "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
-                    "limit": 1000
-                }),
-            )?;
-            verify_thread_listing(&archived.value, expected)?;
-        }
-        let read = client.request(
-            "thread/read",
-            json!({"threadId": expected.thread_id, "includeTurns": true}),
-        )?;
-        verify_thread_read(&read.value, expected)?;
     }
     Ok(())
+}
+
+fn verify_native_rollout_hash(
+    codex_home: &Path,
+    rollout: &Path,
+    expected: &NativeThreadExpectation,
+) -> Result<(), NativeImportError> {
+    let rollout = verified_session_rollout_path(codex_home, rollout)?;
+    let bytes = fs::read(rollout).map_err(|_| {
+        NativeImportError::Verification("native target rollout cannot be read".into())
+    })?;
+    if Sha256Digest::from_bytes(&bytes) != expected.rollout_hash {
+        return Err(NativeImportError::Verification(
+            "native target rollout hash does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_native_list_and_read<T: JsonRpcTransport>(
+    client: &mut NativeAppServerClient<'_, T>,
+    expected: &NativeThreadExpectation,
+) -> Result<(), NativeImportError> {
+    let active = client.request("thread/list", continuation_list_params(false))?;
+    let active_threads = active
+        .value
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
+    if active_threads
+        .iter()
+        .any(|thread| thread.get("id").and_then(Value::as_str) == Some(expected.thread_id.as_str()))
+    {
+        verify_thread_listing(&active.value, expected)?;
+    } else {
+        let archived = client.request("thread/list", continuation_list_params(true))?;
+        verify_thread_listing(&archived.value, expected)?;
+    }
+    let read = client.request(
+        "thread/read",
+        json!({"threadId": expected.thread_id, "includeTurns": true}),
+    )?;
+    verify_thread_read(&read.value, expected)
 }
 
 pub fn probe_target_default(
@@ -315,24 +351,7 @@ pub fn verify_target_session_transport<T: JsonRpcTransport>(
         .value
         .pointer("/result/thread")
         .ok_or_else(|| NativeImportError::Verification("mapped target cannot be read".into()))?;
-    if thread.get("id").and_then(Value::as_str) != Some(expected.thread_id.as_str())
-        || thread.get("modelProvider").and_then(Value::as_str)
-            != Some(expected.model_provider.as_str())
-    {
-        return Err(NativeImportError::Verification(
-            "mapped target identity does not match".into(),
-        ));
-    }
-    if thread
-        .get("turns")
-        .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty)
-    {
-        return Err(NativeImportError::Verification(
-            "mapped target has no visible turns".into(),
-        ));
-    }
-    Ok(())
+    verify_target_thread_read(thread, expected)
 }
 
 pub fn fork_rollout_with_target_provider(
@@ -340,9 +359,25 @@ pub fn fork_rollout_with_target_provider(
     codex_home: &Path,
     request: &CodexContinuationRequest,
 ) -> Result<CodexContinuationReport, NativeImportError> {
-    let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
-        .map_err(map_codex_error)?;
-    fork_rollout_with_target_provider_transport(&mut transport, codex_home, request)
+    let report = {
+        let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
+            .map_err(map_codex_error)?;
+        fork_rollout_with_target_provider_transport(&mut transport, codex_home, request)?
+    };
+    let expected = CodexTargetSessionExpectation {
+        thread_id: report.target_thread_id.clone(),
+        cwd: request.target_cwd.to_string_lossy().into_owned(),
+        title: request.title.clone(),
+        model_provider: report.model_provider.clone(),
+        rollout_hash: report.rollout_hash.clone(),
+        visible_history: report.visible_history.clone(),
+    };
+    if let Err(error) = verify_target_session(executable, codex_home, &expected) {
+        delete_thread_with_app_server(executable, codex_home, &report.target_thread_id)
+            .map_err(|_| NativeImportError::ManualIntervention)?;
+        return Err(error);
+    }
+    Ok(report)
 }
 
 pub fn delete_thread_with_app_server(
@@ -363,8 +398,7 @@ pub fn delete_thread_with_app_server_transport<T: JsonRpcTransport>(
 ) -> Result<(), NativeImportError> {
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
-    client.request("thread/delete", json!({"threadId": thread_id}))?;
-    Ok(())
+    delete_and_confirm(&mut client, thread_id).map_err(|_| NativeImportError::ManualIntervention)
 }
 
 /// Transport-injected form of [`fork_rollout_with_target_provider`].
@@ -436,26 +470,42 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
             ));
         }
 
-        let target_cwd = request.target_cwd.to_string_lossy();
+        if let Some(title) = &request.title {
+            client.request(
+                "thread/name/set",
+                json!({"threadId": target_thread_id, "name": title}),
+            )?;
+        }
+
+        let rollout_bytes = fs::read(&rollout_path)
+            .map_err(|_| NativeImportError::Verification("forked rollout cannot be read".into()))?;
+        let rollout_hash = Sha256Digest::from_bytes(&rollout_bytes);
+        let target_cwd = request.target_cwd.to_string_lossy().into_owned();
+        let expected = CodexTargetSessionExpectation {
+            thread_id: target_thread_id.clone(),
+            cwd: target_cwd,
+            title: request.title.clone(),
+            model_provider: model_provider.clone(),
+            rollout_hash: rollout_hash.clone(),
+            visible_history: request.visible_history.clone(),
+        };
+
         let active = client.request("thread/list", continuation_list_params(false))?;
-        match verify_continuation_listing(&active.value, &target_thread_id, &target_cwd)? {
-            ContinuationListing::Found => {}
-            ContinuationListing::Missing => {
+        match existing_target_rollout(&active.value, codex_home, &expected)? {
+            Some(_) => {}
+            None => {
                 let archived = client.request("thread/list", continuation_list_params(true))?;
-                if verify_continuation_listing(&archived.value, &target_thread_id, &target_cwd)?
-                    == ContinuationListing::Missing
-                {
-                    return Err(NativeImportError::Verification(
-                        "forked thread is not listed".into(),
-                    ));
-                }
+                let _ = existing_target_rollout(&archived.value, codex_home, &expected)?;
             }
         }
         let read = client.request(
             "thread/read",
             json!({"threadId": target_thread_id, "includeTurns": true}),
         )?;
-        let visible_turns = verify_continuation_read(&read.value, &target_thread_id, &target_cwd)?;
+        let thread = read.value.pointer("/result/thread").ok_or_else(|| {
+            NativeImportError::Verification("thread/read returned no thread".into())
+        })?;
+        verify_target_thread_read(thread, &expected)?;
 
         Ok(CodexContinuationReport {
             source_thread_id: request.source_thread_id.clone(),
@@ -463,19 +513,41 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
             rollout_path,
             model_provider,
             model,
-            visible_turns,
+            visible_turns: request.visible_history.message_count,
+            rollout_hash,
+            visible_history: request.visible_history.clone(),
         })
     })();
 
     match outcome {
         Ok(report) => Ok(report),
-        Err(error) => {
-            match client.request("thread/delete", json!({"threadId": target_thread_id})) {
-                Ok(_) => Err(error),
-                Err(_) => Err(NativeImportError::Rollback),
-            }
+        Err(error) => match delete_and_confirm(&mut client, &target_thread_id) {
+            Ok(()) => Err(error),
+            Err(_) => Err(NativeImportError::ManualIntervention),
+        },
+    }
+}
+
+fn delete_and_confirm<T: JsonRpcTransport>(
+    client: &mut NativeAppServerClient<'_, T>,
+    thread_id: &str,
+) -> Result<(), NativeImportError> {
+    client.request("thread/delete", json!({"threadId": thread_id}))?;
+    for archived in [false, true] {
+        let listed = client.request("thread/list", continuation_list_params(archived))?;
+        let threads = listed
+            .value
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
+        if threads
+            .iter()
+            .any(|thread| thread.get("id").and_then(Value::as_str) == Some(thread_id))
+        {
+            return Err(NativeImportError::ManualIntervention);
         }
     }
+    Ok(())
 }
 
 fn target_probe_failure() -> NativeImportError {
@@ -517,6 +589,18 @@ fn existing_target_rollout(
             "mapped target provider does not match".into(),
         ));
     }
+    if thread.get("cwd").and_then(Value::as_str) != Some(expected.cwd.as_str()) {
+        return Err(NativeImportError::Verification(
+            "mapped target cwd does not match".into(),
+        ));
+    }
+    if let Some(title) = &expected.title
+        && thread.get("name").and_then(Value::as_str) != Some(title.as_str())
+    {
+        return Err(NativeImportError::Verification(
+            "mapped target title does not match".into(),
+        ));
+    }
     let path = thread
         .get("path")
         .and_then(Value::as_str)
@@ -526,6 +610,83 @@ fn existing_target_rollout(
         codex_home,
         Path::new(path),
     )?))
+}
+
+fn verify_target_thread_read(
+    thread: &Value,
+    expected: &CodexTargetSessionExpectation,
+) -> Result<(), NativeImportError> {
+    if thread.get("id").and_then(Value::as_str) != Some(expected.thread_id.as_str())
+        || thread.get("cwd").and_then(Value::as_str) != Some(expected.cwd.as_str())
+        || thread.get("modelProvider").and_then(Value::as_str)
+            != Some(expected.model_provider.as_str())
+    {
+        return Err(NativeImportError::Verification(
+            "mapped target identity does not match".into(),
+        ));
+    }
+    if let Some(title) = &expected.title
+        && thread.get("name").and_then(Value::as_str) != Some(title.as_str())
+    {
+        return Err(NativeImportError::Verification(
+            "mapped target title does not match".into(),
+        ));
+    }
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| NativeImportError::Verification("mapped target turns are missing".into()))?;
+    let mut messages = Vec::new();
+    for turn in turns {
+        let items = turn.get("items").and_then(Value::as_array).ok_or_else(|| {
+            NativeImportError::Verification("mapped target items are missing".into())
+        })?;
+        for item in items {
+            let role = match item.get("type").and_then(Value::as_str) {
+                Some("userMessage") => CodexVisibleRole::User,
+                Some("agentMessage") => CodexVisibleRole::Assistant,
+                _ => continue,
+            };
+            let text = app_server_message_text(item, role).ok_or_else(|| {
+                NativeImportError::Verification("mapped target visible message is invalid".into())
+            })?;
+            messages.push(CodexVisibleMessage { role, text });
+        }
+    }
+    let actual = crate::native_payload::visible_history_from_messages(messages)
+        .map_err(|_| NativeImportError::Verification("mapped target history is invalid".into()))?;
+    if actual.message_count != expected.visible_history.message_count {
+        return Err(NativeImportError::Verification(format!(
+            "mapped target visible history count does not match (expected {}, actual {})",
+            expected.visible_history.message_count, actual.message_count
+        )));
+    }
+    if actual.content_hash != expected.visible_history.content_hash {
+        return Err(NativeImportError::Verification(
+            "mapped target visible history content does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn app_server_message_text(item: &Value, role: CodexVisibleRole) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    let allowed = match role {
+        CodexVisibleRole::User => ["input_text", "text"],
+        CodexVisibleRole::Assistant => ["output_text", "text"],
+    };
+    let parts = item.get("content")?.as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        let part_type = part.get("type").and_then(Value::as_str)?;
+        if !allowed.contains(&part_type) {
+            continue;
+        }
+        text.push_str(part.get("text").and_then(Value::as_str)?);
+    }
+    Some(text)
 }
 
 fn required_nonempty_label(
@@ -572,64 +733,6 @@ fn continuation_list_params(archived: bool) -> Value {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContinuationListing {
-    Found,
-    Missing,
-}
-
-fn verify_continuation_listing(
-    response: &Value,
-    target_thread_id: &str,
-    target_cwd: &str,
-) -> Result<ContinuationListing, NativeImportError> {
-    let threads = response
-        .pointer("/result/data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
-    let Some(thread) = threads
-        .iter()
-        .find(|thread| thread.get("id").and_then(Value::as_str) == Some(target_thread_id))
-    else {
-        return Ok(ContinuationListing::Missing);
-    };
-    if thread.get("cwd").and_then(Value::as_str) != Some(target_cwd) {
-        return Err(NativeImportError::Verification(
-            "forked thread cwd does not match".into(),
-        ));
-    }
-    Ok(ContinuationListing::Found)
-}
-
-fn verify_continuation_read(
-    response: &Value,
-    target_thread_id: &str,
-    target_cwd: &str,
-) -> Result<usize, NativeImportError> {
-    let thread = response
-        .pointer("/result/thread")
-        .ok_or_else(|| NativeImportError::Verification("thread/read returned no thread".into()))?;
-    if thread.get("id").and_then(Value::as_str) != Some(target_thread_id) {
-        return Err(NativeImportError::Verification(
-            "thread/read returned a different thread id".into(),
-        ));
-    }
-    if thread.get("cwd").and_then(Value::as_str) != Some(target_cwd) {
-        return Err(NativeImportError::Verification(
-            "thread/read cwd does not match".into(),
-        ));
-    }
-    let visible_turns = thread
-        .get("turns")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .filter(|turns| *turns > 0)
-        .ok_or_else(|| {
-            NativeImportError::Verification("thread/read returned no visible turns".into())
-        })?;
-    Ok(visible_turns)
-}
-
 fn verify_thread_read(
     response: &Value,
     expected: &NativeThreadExpectation,
@@ -637,21 +740,17 @@ fn verify_thread_read(
     let thread = response
         .pointer("/result/thread")
         .ok_or_else(|| NativeImportError::Verification("thread/read returned no thread".into()))?;
-    if thread.get("cwd").and_then(Value::as_str) != Some(expected.cwd.as_str()) {
-        return Err(NativeImportError::Verification(
-            "thread/read cwd does not match".into(),
-        ));
-    }
-    let turns = thread
-        .get("turns")
-        .and_then(Value::as_array)
-        .ok_or_else(|| NativeImportError::Verification("thread/read returned no turns".into()))?;
-    if turns.len() < expected.visible_turns {
-        return Err(NativeImportError::Verification(
-            "thread/read returned too few visible turns".into(),
-        ));
-    }
-    Ok(())
+    verify_target_thread_read(
+        thread,
+        &CodexTargetSessionExpectation {
+            thread_id: expected.thread_id.clone(),
+            cwd: expected.cwd.clone(),
+            title: expected.title.clone(),
+            model_provider: expected.model_provider.clone(),
+            rollout_hash: expected.rollout_hash.clone(),
+            visible_history: expected.visible_history.clone(),
+        },
+    )
 }
 
 struct NativeAppServerClient<'a, T: JsonRpcTransport> {
@@ -737,6 +836,12 @@ pub fn verify_thread_listing(
     if thread.get("cwd").and_then(Value::as_str) != Some(expected.cwd.as_str()) {
         return Err(NativeImportError::Verification(
             "imported thread cwd does not match".into(),
+        ));
+    }
+    if thread.get("modelProvider").and_then(Value::as_str) != Some(expected.model_provider.as_str())
+    {
+        return Err(NativeImportError::Verification(
+            "imported thread provider does not match".into(),
         ));
     }
     if let Some(title) = &expected.title

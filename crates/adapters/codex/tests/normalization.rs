@@ -60,3 +60,22 @@ fn extracts_workspace_from_thread_metadata() {
     assert_eq!(workspace.git_commit.as_deref(), Some("abc123"));
     assert_eq!(session.title.as_deref(), Some("AgentArk"));
 }
+
+#[test]
+fn maps_assistant_output_text_parts_as_visible_history() {
+    let value = json!({
+        "result": {"thread": {
+            "id": "thread-output-text",
+            "turns": [{"items": [{
+                "type": "agentMessage",
+                "content": [{"type": "output_text", "text": "assistant exact"}]
+            }]}]
+        }}
+    });
+
+    let session = normalize_thread_read(&value.to_string()).unwrap();
+
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].role, CanonicalRole::Assistant);
+    assert_eq!(session.messages[0].visible_text(), "assistant exact");
+}

@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use agentark_adapter_codex::{
     CodexContinuationReport, CodexContinuationRequest, CodexProbe, CodexTargetDefault,
     CodexTargetSessionExpectation, NativeImportError, NativePayloadError, NativeRestoreReport,
-    NativeRolloutPayload, delete_thread_with_app_server, ensure_codex_not_running,
-    fork_rollout_with_target_provider, native_thread_expectation, probe_target_default,
-    restore_native_rollouts, rewrite_native_workspace_paths, verify_rollouts_with_app_server,
-    verify_target_session, write_rollout_atomic,
+    NativeRolloutPayload, build_canonical_continuation_source, canonical_visible_history,
+    delete_thread_with_app_server, ensure_codex_not_running, fork_rollout_with_target_provider,
+    native_thread_expectation, probe_target_default, restore_native_rollouts,
+    rewrite_native_workspace_paths, verify_rollouts_with_app_server, verify_target_session,
+    write_rollout_atomic,
 };
 use agentark_canonical::{CanonicalSession, Sha256Digest};
 use agentark_migration::{
@@ -116,14 +117,10 @@ pub struct AutomaticRecoveryReport {
     pub requires_manual_intervention: bool,
 }
 
-pub fn recovery_source_hash(input: &RecoveryInput) -> Sha256Digest {
-    input
-        .native_payload
-        .as_ref()
-        .map(|payload| payload.source_hash.clone())
-        .unwrap_or_else(|| {
-            Sha256Digest::from_bytes(&serde_json::to_vec(&input.session).unwrap_or_default())
-        })
+pub fn recovery_source_hash(input: &RecoveryInput) -> Result<Sha256Digest, RecoveryError> {
+    canonical_visible_history(&input.session)
+        .map(|history| history.content_hash)
+        .map_err(|_| RecoveryError::Verification)
 }
 
 pub fn recover_one_codex_session(
@@ -134,34 +131,15 @@ pub fn recover_one_codex_session(
         input.session.model_provider.clone(),
         input.session.model_name.clone(),
     );
-    let source_hash = recovery_source_hash(input);
-    let source_native_id = Some(input.session.source_session_id.clone());
-
-    let Some(payload) = input.native_payload.as_ref() else {
-        let decision = decide_recovery(
-            source_provider,
-            TargetRecoveryCapabilities {
-                native_identity_verified: false,
-                continuation_writer_verified: false,
-                target_default: None,
-            },
-        );
-        return AutomaticRecoveryReport {
-            outcome: decision.outcome,
-            source_native_id,
-            target_native_id: None,
-            source_provider: decision.source_provider,
-            target_provider: decision.target_provider,
-            source_hash,
-            target_hash: None,
-            reason_code: "native-payload-unavailable".into(),
-            rollback_paths: Vec::new(),
-            native_skipped_count: 0,
-            native_conflict_count: 0,
-            native_backup_path: None,
-            requires_manual_intervention: false,
-        };
+    let source_hash = match recovery_source_hash(input) {
+        Ok(source_hash) => source_hash,
+        Err(error) => {
+            let mut report = archive_only_recovery_report(input, error.reason_code());
+            report.requires_manual_intervention = true;
+            return report;
+        }
     };
+    let source_native_id = Some(input.session.source_session_id.clone());
 
     let target_default = match executor.probe_target_default(input) {
         Ok(target_default) => target_default,
@@ -185,7 +163,8 @@ pub fn recover_one_codex_session(
             return report;
         }
     };
-    let native_compatible = provider_is_compatible(&source_provider, &target_default);
+    let native_compatible =
+        input.native_payload.is_some() && provider_is_compatible(&source_provider, &target_default);
     let native_result = if native_compatible {
         executor.try_native_identity(input, &target_default)
     } else {
@@ -204,10 +183,11 @@ pub fn recover_one_codex_session(
                 .find(|(canonical_id, _)| canonical_id == &input.session.id.to_string())
                 .map(|(_, native_id)| native_id.clone())
                 .or_else(|| source_native_id.clone());
-            let target_hash =
+            let target_hash = input.native_payload.as_ref().and_then(|payload| {
                 rewrite_native_workspace_paths(&payload.bytes, &input.workspace_mappings)
                     .ok()
-                    .map(|bytes| Sha256Digest::from_bytes(&bytes));
+                    .map(|bytes| Sha256Digest::from_bytes(&bytes))
+            });
             let decision = decide_recovery(
                 source_provider.clone(),
                 TargetRecoveryCapabilities {
@@ -262,9 +242,6 @@ pub fn recover_one_codex_session(
                         target_default: Some(target_provider),
                     },
                 );
-                let target_hash = fs::read(&continuation.rollout_path)
-                    .ok()
-                    .map(|bytes| Sha256Digest::from_bytes(&bytes));
                 AutomaticRecoveryReport {
                     outcome: decision.outcome,
                     source_native_id,
@@ -272,7 +249,7 @@ pub fn recover_one_codex_session(
                     source_provider: decision.source_provider,
                     target_provider: decision.target_provider,
                     source_hash,
-                    target_hash,
+                    target_hash: Some(continuation.rollout_hash),
                     reason_code: decision.reason_code,
                     rollback_paths: vec![continuation.rollout_path],
                     native_skipped_count: native_summary.skipped_count,
@@ -340,7 +317,9 @@ pub fn archive_only_recovery_report(
         input.session.model_provider.clone(),
         input.session.model_name.clone(),
     );
-    let source_hash = recovery_source_hash(input);
+    let source_hash = recovery_source_hash(input).unwrap_or_else(|_| {
+        Sha256Digest::from_bytes(&serde_json::to_vec(&input.session).unwrap_or_default())
+    });
     AutomaticRecoveryReport {
         outcome: RestoreOutcome::ArchiveOnly,
         source_native_id: Some(input.session.source_session_id.clone()),
@@ -367,6 +346,43 @@ fn target_provider_identity(target: &CodexTargetDefault) -> ProviderIdentity {
 
 fn provider_is_compatible(source: &ProviderIdentity, target: &CodexTargetDefault) -> bool {
     source.provider.as_deref() == Some(target.model_provider.as_str())
+}
+
+fn continuation_target_cwd(input: &RecoveryInput) -> PathBuf {
+    input
+        .session
+        .workspace
+        .as_ref()
+        .map(|workspace| PathBuf::from(&workspace.path_native))
+        .or_else(|| {
+            input.native_payload.as_ref().and_then(|payload| {
+                rewrite_native_workspace_paths(&payload.bytes, &input.workspace_mappings)
+                    .ok()
+                    .and_then(|bytes| native_thread_expectation(&bytes).ok())
+                    .map(|expectation| PathBuf::from(expectation.cwd))
+            })
+        })
+        .unwrap_or_else(|| input.codex_home.clone())
+}
+
+fn existing_target_expectation(
+    input: &RecoveryInput,
+    target: &ExistingRestoreTarget,
+) -> Result<CodexTargetSessionExpectation, RecoveryError> {
+    Ok(CodexTargetSessionExpectation {
+        thread_id: target.target_native_id.clone(),
+        cwd: continuation_target_cwd(input)
+            .to_string_lossy()
+            .into_owned(),
+        title: (target.outcome == RestoreOutcome::Continuation)
+            .then(|| input.session.title.clone())
+            .flatten(),
+        model_provider: target.model_provider.clone(),
+        rollout_hash: target.rollout_hash.clone(),
+        visible_history: canonical_visible_history(&input.session)
+            .map_err(|_| RecoveryError::Verification)?
+            .expectation(),
+    })
 }
 
 pub struct ProductionCodexRecoveryExecutor {
@@ -417,11 +433,7 @@ impl CodexExistingTargetVerifier for SystemCodexExistingTargetVerifier {
         verify_target_session(
             &input.executable,
             &input.codex_home,
-            &CodexTargetSessionExpectation {
-                thread_id: target.target_native_id.clone(),
-                model_provider: target.model_provider.clone(),
-                rollout_hash: target.rollout_hash.clone(),
-            },
+            &existing_target_expectation(input, target)?,
         )
         .map_err(|_| RecoveryError::Conflict)
     }
@@ -661,33 +673,30 @@ where
     C: FnOnce(&Path) -> Result<(), RecoveryError>,
     R: FnOnce(&CodexContinuationReport) -> Result<(), RecoveryError>,
 {
-    let payload = input
-        .native_payload
-        .as_ref()
-        .ok_or(RecoveryError::Unavailable)?;
-    let rewritten = rewrite_native_workspace_paths(&payload.bytes, &input.workspace_mappings)
-        .map_err(map_native_payload_error)?;
-    let expectation = native_thread_expectation(&rewritten).map_err(map_native_payload_error)?;
     let staging_directory = input
         .codex_home
         .join("sessions")
         .join(format!(".agentark-staging-{}", Uuid::new_v4()));
     let staged_source = staging_directory.join("source.jsonl");
     let operation = (|| {
-        write_rollout_atomic(&staged_source, std::slice::from_ref(&rewritten))
+        let target_cwd = continuation_target_cwd(input);
+        let source = build_canonical_continuation_source(
+            &input.session,
+            &target_cwd,
+            &target_default.model_provider,
+            &target_default.model,
+        )
+        .map_err(map_native_payload_error)?;
+        write_rollout_atomic(&staged_source, std::slice::from_ref(&source.bytes))
             .map_err(map_native_import_error)?;
-        let target_cwd = input
-            .session
-            .workspace
-            .as_ref()
-            .map(|workspace| PathBuf::from(&workspace.path_native))
-            .unwrap_or_else(|| PathBuf::from(&expectation.cwd));
         let request = CodexContinuationRequest {
             source_rollout: staged_source.clone(),
-            source_thread_id: expectation.thread_id,
+            source_thread_id: source.thread_id,
             target_cwd,
             target_provider: Some(target_default.model_provider.clone()),
             target_model: Some(target_default.model.clone()),
+            title: source.title,
+            visible_history: source.visible_history.expectation(),
         };
         fork(&staged_source, &request)
     })();
@@ -742,9 +751,10 @@ where
 fn map_native_payload_error(error: NativePayloadError) -> RecoveryError {
     match error {
         NativePayloadError::Conflict => RecoveryError::Conflict,
-        NativePayloadError::Json(_) | NativePayloadError::InvalidPath => {
-            RecoveryError::Verification
-        }
+        NativePayloadError::Json(_)
+        | NativePayloadError::InvalidPath
+        | NativePayloadError::UnsupportedVisibleRole
+        | NativePayloadError::InvalidMetadata => RecoveryError::Verification,
         NativePayloadError::Io(_) => RecoveryError::Unavailable,
         NativePayloadError::NativeImport(error) => map_native_import_error(error),
     }
@@ -797,7 +807,8 @@ mod tests {
         let session_id = Uuid::from_u128(1);
         let native_id = "source-native-id";
         let bytes = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{native_id}\",\"cwd\":\"C:/fixture\"}}}}\n"
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{native_id}\",\"cwd\":\"C:/fixture\",\"model_provider\":\"source-provider\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"sanitized\"}}]}}}}\n"
         )
         .into_bytes();
         RecoveryInput {
@@ -940,6 +951,42 @@ mod tests {
     }
 
     #[test]
+    fn canonical_only_target_cwd_falls_back_to_temporary_codex_home() {
+        let root = TempRoot::new();
+        let mut input = input(&root.0);
+        input.native_payload = None;
+        input.session.workspace = None;
+
+        assert_eq!(continuation_target_cwd(&input), root.0);
+    }
+
+    #[test]
+    fn existing_target_title_is_required_only_for_continuations() {
+        let root = TempRoot::new();
+        let input = input(&root.0);
+        let mut target = ExistingRestoreTarget {
+            outcome: RestoreOutcome::NativeIdentity,
+            target_native_id: "target".into(),
+            model_provider: "source-provider".into(),
+            rollout_hash: Sha256Digest::from_bytes(b"target"),
+        };
+
+        assert_eq!(
+            existing_target_expectation(&input, &target).unwrap().title,
+            None
+        );
+
+        target.outcome = RestoreOutcome::Continuation;
+        assert_eq!(
+            existing_target_expectation(&input, &target)
+                .unwrap()
+                .title
+                .as_deref(),
+            input.session.title.as_deref()
+        );
+    }
+
+    #[test]
     fn continuation_staging_source_is_removed_after_fork_success() {
         let root = TempRoot::new();
         let staged = Mutex::new(None::<PathBuf>);
@@ -956,6 +1003,10 @@ mod tests {
                     model_provider: "target-provider".into(),
                     model: "target-model".into(),
                     visible_turns: 1,
+                    rollout_hash: Sha256Digest::from_bytes(b"target rollout"),
+                    visible_history: canonical_visible_history(&input(&root.0).session)
+                        .unwrap()
+                        .expectation(),
                 })
             });
         assert!(result.is_ok());
@@ -990,6 +1041,10 @@ mod tests {
                     model_provider: "target-provider".into(),
                     model: "target-model".into(),
                     visible_turns: 1,
+                    rollout_hash: Sha256Digest::from_bytes(b"target rollout"),
+                    visible_history: canonical_visible_history(&input(&root.0).session)
+                        .unwrap()
+                        .expectation(),
                 })
             },
             |_path| Err(RecoveryError::Rollback),
