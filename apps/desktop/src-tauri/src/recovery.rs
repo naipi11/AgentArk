@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use agentark_adapter_codex::{
-    CodexContinuationReport, CodexContinuationRequest, CodexProbe, NativeImportError,
-    NativePayloadError, NativeRestoreReport, NativeRolloutPayload, delete_thread_with_app_server,
-    ensure_codex_not_running, fork_rollout_with_target_provider, native_thread_expectation,
+    CodexContinuationReport, CodexContinuationRequest, CodexProbe, CodexTargetDefault,
+    CodexTargetSessionExpectation, NativeImportError, NativePayloadError, NativeRestoreReport,
+    NativeRolloutPayload, delete_thread_with_app_server, ensure_codex_not_running,
+    fork_rollout_with_target_provider, native_thread_expectation, probe_target_default,
     restore_native_rollouts, rewrite_native_workspace_paths, verify_rollouts_with_app_server,
-    write_rollout_atomic,
+    verify_target_session, write_rollout_atomic,
 };
 use agentark_canonical::{CanonicalSession, Sha256Digest};
 use agentark_migration::{
@@ -49,15 +50,28 @@ impl RecoveryError {
 }
 
 pub trait CodexRecoveryExecutor {
+    fn probe_target_default(
+        &self,
+        input: &RecoveryInput,
+    ) -> Result<CodexTargetDefault, RecoveryError>;
+
     fn try_native_identity(
         &self,
         input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
     ) -> Result<NativeRestoreReport, RecoveryError>;
 
     fn create_continuation(
         &self,
         input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
     ) -> Result<CodexContinuationReport, RecoveryError>;
+
+    fn verify_existing_target(
+        &self,
+        input: &RecoveryInput,
+        target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError>;
 
     fn rollback(
         &self,
@@ -68,6 +82,14 @@ pub trait CodexRecoveryExecutor {
     fn native_attempt_summary(&self) -> NativeAttemptSummary {
         NativeAttemptSummary::default()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingRestoreTarget {
+    pub outcome: RestoreOutcome,
+    pub target_native_id: String,
+    pub model_provider: String,
+    pub rollout_hash: Sha256Digest,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,6 +116,16 @@ pub struct AutomaticRecoveryReport {
     pub requires_manual_intervention: bool,
 }
 
+pub fn recovery_source_hash(input: &RecoveryInput) -> Sha256Digest {
+    input
+        .native_payload
+        .as_ref()
+        .map(|payload| payload.source_hash.clone())
+        .unwrap_or_else(|| {
+            Sha256Digest::from_bytes(&serde_json::to_vec(&input.session).unwrap_or_default())
+        })
+}
+
 pub fn recover_one_codex_session(
     executor: &dyn CodexRecoveryExecutor,
     input: &RecoveryInput,
@@ -102,13 +134,7 @@ pub fn recover_one_codex_session(
         input.session.model_provider.clone(),
         input.session.model_name.clone(),
     );
-    let source_hash = input
-        .native_payload
-        .as_ref()
-        .map(|payload| payload.source_hash.clone())
-        .unwrap_or_else(|| {
-            Sha256Digest::from_bytes(&serde_json::to_vec(&input.session).unwrap_or_default())
-        });
+    let source_hash = recovery_source_hash(input);
     let source_native_id = Some(input.session.source_session_id.clone());
 
     let Some(payload) = input.native_payload.as_ref() else {
@@ -137,8 +163,39 @@ pub fn recover_one_codex_session(
         };
     };
 
-    let native_result = executor.try_native_identity(input);
-    let native_summary = executor.native_attempt_summary();
+    let target_default = match executor.probe_target_default(input) {
+        Ok(target_default) => target_default,
+        Err(error) => {
+            let mut report = archive_only_recovery_report(
+                input,
+                if matches!(
+                    error,
+                    RecoveryError::Rollback | RecoveryError::ManualIntervention
+                ) {
+                    "manual-intervention-required"
+                } else {
+                    "target-default-unavailable"
+                },
+            );
+            report.source_provider = source_provider;
+            report.requires_manual_intervention = matches!(
+                error,
+                RecoveryError::Rollback | RecoveryError::ManualIntervention
+            );
+            return report;
+        }
+    };
+    let native_compatible = provider_is_compatible(&source_provider, &target_default);
+    let native_result = if native_compatible {
+        executor.try_native_identity(input, &target_default)
+    } else {
+        Err(RecoveryError::MissingProvider)
+    };
+    let native_summary = if native_compatible {
+        executor.native_attempt_summary()
+    } else {
+        NativeAttemptSummary::default()
+    };
     match native_result {
         Ok(native) => {
             let target_native_id = native
@@ -156,7 +213,7 @@ pub fn recover_one_codex_session(
                 TargetRecoveryCapabilities {
                     native_identity_verified: true,
                     continuation_writer_verified: false,
-                    target_default: Some(source_provider),
+                    target_default: Some(target_provider_identity(&target_default)),
                 },
             );
             AutomaticRecoveryReport {
@@ -184,12 +241,19 @@ pub fn recover_one_codex_session(
             report.requires_manual_intervention = true;
             report
         }
-        Err(native_error) => match executor.create_continuation(input) {
+        Err(native_error) => match executor
+            .create_continuation(input, &target_default)
+            .and_then(|continuation| {
+                if continuation.model_provider == target_default.model_provider
+                    && continuation.model == target_default.model
+                {
+                    Ok(continuation)
+                } else {
+                    Err(RecoveryError::Verification)
+                }
+            }) {
             Ok(continuation) => {
-                let target_provider = ProviderIdentity::new(
-                    Some(continuation.model_provider.clone()),
-                    Some(continuation.model.clone()),
-                );
+                let target_provider = target_provider_identity(&target_default);
                 let decision = decide_recovery(
                     source_provider,
                     TargetRecoveryCapabilities {
@@ -276,13 +340,7 @@ pub fn archive_only_recovery_report(
         input.session.model_provider.clone(),
         input.session.model_name.clone(),
     );
-    let source_hash = input
-        .native_payload
-        .as_ref()
-        .map(|payload| payload.source_hash.clone())
-        .unwrap_or_else(|| {
-            Sha256Digest::from_bytes(&serde_json::to_vec(&input.session).unwrap_or_default())
-        });
+    let source_hash = recovery_source_hash(input);
     AutomaticRecoveryReport {
         outcome: RestoreOutcome::ArchiveOnly,
         source_native_id: Some(input.session.source_session_id.clone()),
@@ -300,8 +358,20 @@ pub fn archive_only_recovery_report(
     }
 }
 
+fn target_provider_identity(target: &CodexTargetDefault) -> ProviderIdentity {
+    ProviderIdentity::new(
+        Some(target.model_provider.clone()),
+        Some(target.model.clone()),
+    )
+}
+
+fn provider_is_compatible(source: &ProviderIdentity, target: &CodexTargetDefault) -> bool {
+    source.provider.as_deref() == Some(target.model_provider.as_str())
+}
+
 pub struct ProductionCodexRecoveryExecutor {
     write_guard: OnceLock<Result<(), RecoveryError>>,
+    target_default: OnceLock<Result<CodexTargetDefault, RecoveryError>>,
     preflight: Arc<dyn CodexRecoveryPreflight>,
     native_summary: Mutex<NativeAttemptSummary>,
 }
@@ -332,6 +402,7 @@ impl ProductionCodexRecoveryExecutor {
     pub fn new() -> Self {
         Self {
             write_guard: OnceLock::new(),
+            target_default: OnceLock::new(),
             preflight: Arc::new(SystemCodexRecoveryPreflight),
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
@@ -341,6 +412,7 @@ impl ProductionCodexRecoveryExecutor {
     pub fn with_preflight(preflight: Arc<dyn CodexRecoveryPreflight>) -> Self {
         Self {
             write_guard: OnceLock::new(),
+            target_default: OnceLock::new(),
             preflight,
             native_summary: Mutex::new(NativeAttemptSummary::default()),
         }
@@ -361,9 +433,23 @@ impl Default for ProductionCodexRecoveryExecutor {
 }
 
 impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
+    fn probe_target_default(
+        &self,
+        input: &RecoveryInput,
+    ) -> Result<CodexTargetDefault, RecoveryError> {
+        self.ensure_vendor_write_allowed(&input.executable)?;
+        self.target_default
+            .get_or_init(|| {
+                probe_target_default(&input.executable, &input.codex_home)
+                    .map_err(map_native_import_error)
+            })
+            .clone()
+    }
+
     fn try_native_identity(
         &self,
         input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
     ) -> Result<NativeRestoreReport, RecoveryError> {
         *self
             .native_summary
@@ -376,6 +462,13 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
             .native_payload
             .as_ref()
             .ok_or(RecoveryError::Unavailable)?;
+        let source_provider = ProviderIdentity::new(
+            input.session.model_provider.clone(),
+            input.session.model_name.clone(),
+        );
+        if !provider_is_compatible(&source_provider, target_default) {
+            return Err(RecoveryError::MissingProvider);
+        }
         let rewritten = rewrite_native_workspace_paths(&payload.bytes, &input.workspace_mappings)
             .map_err(map_native_payload_error)?;
         let expectation =
@@ -424,6 +517,7 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
     fn create_continuation(
         &self,
         input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
     ) -> Result<CodexContinuationReport, RecoveryError> {
         if input.codex_home.as_os_str().is_empty() || !input.codex_home.is_dir() {
             return Err(RecoveryError::Unavailable);
@@ -431,6 +525,7 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
         self.ensure_vendor_write_allowed(&input.executable)?;
         create_continuation_with_operations(
             input,
+            target_default,
             |_staged, request| {
                 fork_rollout_with_target_provider(&input.executable, &input.codex_home, request)
                     .map_err(map_native_import_error)
@@ -445,6 +540,30 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
                 .map_err(|_| RecoveryError::ManualIntervention)
             },
         )
+    }
+
+    fn verify_existing_target(
+        &self,
+        input: &RecoveryInput,
+        target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError> {
+        if input.codex_home.as_os_str().is_empty() || !input.codex_home.is_dir() {
+            return Err(RecoveryError::Unavailable);
+        }
+        let current = self.probe_target_default(input)?;
+        if current.model_provider != target.model_provider {
+            return Err(RecoveryError::Conflict);
+        }
+        verify_target_session(
+            &input.executable,
+            &input.codex_home,
+            &CodexTargetSessionExpectation {
+                thread_id: target.target_native_id.clone(),
+                model_provider: target.model_provider.clone(),
+                rollout_hash: target.rollout_hash.clone(),
+            },
+        )
+        .map_err(|_| RecoveryError::Conflict)
     }
 
     fn rollback(
@@ -483,16 +602,24 @@ impl CodexRecoveryExecutor for ProductionCodexRecoveryExecutor {
 #[cfg(test)]
 fn create_continuation_with<F>(
     input: &RecoveryInput,
+    target_default: &CodexTargetDefault,
     fork: F,
 ) -> Result<CodexContinuationReport, RecoveryError>
 where
     F: FnOnce(&Path, &CodexContinuationRequest) -> Result<CodexContinuationReport, RecoveryError>,
 {
-    create_continuation_with_operations(input, fork, remove_staged_source, |_report| Ok(()))
+    create_continuation_with_operations(
+        input,
+        target_default,
+        fork,
+        remove_staged_source,
+        |_report| Ok(()),
+    )
 }
 
 fn create_continuation_with_operations<F, C, R>(
     input: &RecoveryInput,
+    target_default: &CodexTargetDefault,
     fork: F,
     cleanup: C,
     rollback: R,
@@ -527,8 +654,8 @@ where
             source_rollout: staged_source.clone(),
             source_thread_id: expectation.thread_id,
             target_cwd,
-            target_provider: None,
-            target_model: None,
+            target_provider: Some(target_default.model_provider.clone()),
+            target_model: Some(target_default.model.clone()),
         };
         fork(&staged_source, &request)
     })();
@@ -675,6 +802,13 @@ mod tests {
         }
     }
 
+    fn target_default() -> CodexTargetDefault {
+        CodexTargetDefault {
+            model_provider: "source-provider".into(),
+            model: "source-model".into(),
+        }
+    }
+
     struct RejectingProbe {
         events: Arc<Mutex<Vec<&'static str>>>,
     }
@@ -701,11 +835,15 @@ mod tests {
         let input = input(&root.0);
 
         assert_eq!(
-            executor.try_native_identity(&input).unwrap_err(),
+            executor
+                .try_native_identity(&input, &target_default())
+                .unwrap_err(),
             RecoveryError::Unavailable
         );
         assert_eq!(
-            executor.try_native_identity(&input).unwrap_err(),
+            executor
+                .try_native_identity(&input, &target_default())
+                .unwrap_err(),
             RecoveryError::Unavailable
         );
         assert_eq!(*events.lock().unwrap(), ["process-check", "version-probe"]);
@@ -730,18 +868,21 @@ mod tests {
     fn continuation_staging_source_is_removed_after_fork_success() {
         let root = TempRoot::new();
         let staged = Mutex::new(None::<PathBuf>);
-        let result = create_continuation_with(&input(&root.0), |path, request| {
-            assert!(path.is_file());
-            *staged.lock().unwrap() = Some(path.to_path_buf());
-            Ok(CodexContinuationReport {
-                source_thread_id: request.source_thread_id.clone(),
-                target_thread_id: "target-native-id".into(),
-                rollout_path: root.0.join("sessions/target.jsonl"),
-                model_provider: "target-provider".into(),
-                model: "target-model".into(),
-                visible_turns: 1,
-            })
-        });
+        let result =
+            create_continuation_with(&input(&root.0), &target_default(), |path, request| {
+                assert!(path.is_file());
+                assert_eq!(request.target_provider.as_deref(), Some("source-provider"));
+                assert_eq!(request.target_model.as_deref(), Some("source-model"));
+                *staged.lock().unwrap() = Some(path.to_path_buf());
+                Ok(CodexContinuationReport {
+                    source_thread_id: request.source_thread_id.clone(),
+                    target_thread_id: "target-native-id".into(),
+                    rollout_path: root.0.join("sessions/target.jsonl"),
+                    model_provider: "target-provider".into(),
+                    model: "target-model".into(),
+                    visible_turns: 1,
+                })
+            });
         assert!(result.is_ok());
         assert!(!staged.lock().unwrap().as_ref().unwrap().exists());
     }
@@ -750,7 +891,7 @@ mod tests {
     fn continuation_staging_source_is_removed_after_fork_error() {
         let root = TempRoot::new();
         let staged = Mutex::new(None::<PathBuf>);
-        let result = create_continuation_with(&input(&root.0), |path, _| {
+        let result = create_continuation_with(&input(&root.0), &target_default(), |path, _| {
             assert!(path.is_file());
             *staged.lock().unwrap() = Some(path.to_path_buf());
             Err(RecoveryError::Verification)
@@ -765,6 +906,7 @@ mod tests {
         let rollback_calls = AtomicUsize::new(0);
         let result = create_continuation_with_operations(
             &input(&root.0),
+            &target_default(),
             |_path, request| {
                 Ok(CodexContinuationReport {
                     source_thread_id: request.source_thread_id.clone(),

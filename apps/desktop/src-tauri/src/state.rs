@@ -35,8 +35,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::recovery::{
-    CodexRecoveryExecutor, ProductionCodexRecoveryExecutor, RecoveryInput,
-    archive_only_recovery_report, recover_one_codex_session,
+    CodexRecoveryExecutor, ExistingRestoreTarget, ProductionCodexRecoveryExecutor, RecoveryInput,
+    archive_only_recovery_report, recover_one_codex_session, recovery_source_hash,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -879,6 +879,73 @@ impl AppState {
                 let target_agent = bundle_target_agent
                     .clone()
                     .or_else(|| source_agent_kind(&session.source_kind));
+                let existing_mappings = match index.restore_mappings_for(session.id) {
+                    Ok(mappings) => mappings,
+                    Err(_) => {
+                        manual_intervention_count += 1;
+                        recovery_error = Some("restore-mapping-conflict".into());
+                        continue;
+                    }
+                };
+                let target_mappings = target_agent
+                    .as_ref()
+                    .map(|target_agent| {
+                        existing_mappings
+                            .iter()
+                            .filter(|mapping| &mapping.target_agent == target_agent)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let durable_mappings = target_mappings
+                    .iter()
+                    .copied()
+                    .filter(|mapping| {
+                        matches!(
+                            mapping.outcome,
+                            RestoreOutcome::NativeIdentity | RestoreOutcome::Continuation
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if durable_mappings.len() > 1 {
+                    manual_intervention_count += 1;
+                    recovery_error = Some("restore-mapping-conflict".into());
+                    continue;
+                }
+                if let Some(mapping) = durable_mappings.first() {
+                    let current_source_hash = recovery_source_hash(&input);
+                    let target = mapping
+                        .target_native_id
+                        .clone()
+                        .zip(mapping.target_provider.clone())
+                        .zip(mapping.target_hash.clone())
+                        .map(|((target_native_id, model_provider), rollout_hash)| {
+                            ExistingRestoreTarget {
+                                outcome: mapping.outcome,
+                                target_native_id,
+                                model_provider,
+                                rollout_hash,
+                            }
+                        });
+                    if mapping.source_hash != current_source_hash
+                        || target.as_ref().is_none_or(|target| {
+                            executor.verify_existing_target(&input, target).is_err()
+                        })
+                    {
+                        manual_intervention_count += 1;
+                        recovery_error = Some("restore-mapping-conflict".into());
+                        continue;
+                    }
+                    restore_mapping_count += 1;
+                    match mapping.outcome {
+                        RestoreOutcome::NativeIdentity => native_identity_count += 1,
+                        RestoreOutcome::Continuation => continuation_count += 1,
+                        RestoreOutcome::ArchiveOnly => unreachable!(),
+                    }
+                    continue;
+                }
+                let has_archive_mapping = target_mappings
+                    .iter()
+                    .any(|mapping| mapping.outcome == RestoreOutcome::ArchiveOnly);
                 let recovery = if bundle.manifest.agent.as_deref() == Some("codex") {
                     recover_one_codex_session(executor, &input)
                 } else {
@@ -902,6 +969,14 @@ impl AppState {
                 if recovery.requires_manual_intervention {
                     manual_intervention_count += 1;
                     recovery_error = Some("manual-intervention-required".into());
+                    continue;
+                }
+                if recovery.outcome == RestoreOutcome::ArchiveOnly && has_archive_mapping {
+                    archive_only_count += 1;
+                    restore_mapping_count += 1;
+                    if recovery_error.is_none() {
+                        recovery_error = Some(recovery.reason_code.clone());
+                    }
                     continue;
                 }
                 let Some(target_agent) = target_agent else {

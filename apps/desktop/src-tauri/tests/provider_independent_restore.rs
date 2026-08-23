@@ -5,15 +5,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
-    CodexContinuationReport, CodexContinuationRequest, CodexError, JsonRpcTransport,
-    NativeRestoreReport, RawJsonRpc, fork_rollout_with_target_provider_transport,
+    CodexContinuationReport, CodexContinuationRequest, CodexError, CodexTargetDefault,
+    JsonRpcTransport, NativeRestoreReport, RawJsonRpc, fork_rollout_with_target_provider_transport,
+    probe_target_default_transport,
 };
 use agentark_bundle::{NativeBundleEntry, read_bundle, write_selected_sessions_with_native};
 use agentark_canonical::{
     AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession, Completeness,
 };
 use agentark_desktop_lib::recovery::{
-    CodexRecoveryExecutor, NativeAttemptSummary, RecoveryError, RecoveryInput,
+    CodexRecoveryExecutor, ExistingRestoreTarget, NativeAttemptSummary, RecoveryError,
+    RecoveryInput,
 };
 use agentark_desktop_lib::{AppState, RestoreMappingWriter};
 use agentark_index::{IndexDb, RestoreMapping};
@@ -62,7 +64,10 @@ enum ContinuationScript {
 struct FakeExecutor {
     native: Mutex<VecDeque<NativeScript>>,
     continuation: Mutex<VecDeque<ContinuationScript>>,
+    target_default: Mutex<CodexTargetDefault>,
+    existing_verification: Mutex<Result<(), RecoveryError>>,
     vendor_writes: AtomicUsize,
+    native_calls: AtomicUsize,
     continuation_calls: AtomicUsize,
     rollback_calls: AtomicUsize,
     rollback_fails: bool,
@@ -70,6 +75,11 @@ struct FakeExecutor {
 }
 
 impl FakeExecutor {
+    fn existing_target_conflict(self) -> Self {
+        *self.existing_verification.lock().unwrap() = Err(RecoveryError::Conflict);
+        self
+    }
+
     fn native_success(self) -> Self {
         self.native.lock().unwrap().push_back(NativeScript::Success);
         self
@@ -142,10 +152,19 @@ impl FakeExecutor {
 }
 
 impl CodexRecoveryExecutor for FakeExecutor {
+    fn probe_target_default(
+        &self,
+        _input: &RecoveryInput,
+    ) -> Result<CodexTargetDefault, RecoveryError> {
+        Ok(self.target_default.lock().unwrap().clone())
+    }
+
     fn try_native_identity(
         &self,
         input: &RecoveryInput,
+        _target_default: &CodexTargetDefault,
     ) -> Result<NativeRestoreReport, RecoveryError> {
+        self.native_calls.fetch_add(1, Ordering::SeqCst);
         match self.native.lock().unwrap().pop_front().unwrap() {
             NativeScript::Success => {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
@@ -178,24 +197,38 @@ impl CodexRecoveryExecutor for FakeExecutor {
     fn create_continuation(
         &self,
         input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
     ) -> Result<CodexContinuationReport, RecoveryError> {
         self.continuation_calls.fetch_add(1, Ordering::SeqCst);
         match self.continuation.lock().unwrap().pop_front().unwrap() {
             ContinuationScript::Success => {
                 self.vendor_writes.fetch_add(1, Ordering::SeqCst);
                 let target_thread_id = format!("continued-{}", input.session.source_session_id);
+                let rollout_path = input.codex_home.join("sessions").join(format!(
+                    "fake-continuation-{}.jsonl",
+                    input.session.source_session_id
+                ));
+                fs::write(&rollout_path, b"verified fake continuation").unwrap();
                 Ok(CodexContinuationReport {
                     source_thread_id: input.session.source_session_id.clone(),
                     target_thread_id,
-                    rollout_path: input.codex_home.join("sessions/fake-continuation.jsonl"),
-                    model_provider: "target-default-provider".into(),
-                    model: "target-default-model".into(),
+                    rollout_path,
+                    model_provider: target_default.model_provider.clone(),
+                    model: target_default.model.clone(),
                     visible_turns: input.session.messages.len(),
                 })
             }
             ContinuationScript::Unavailable => Err(RecoveryError::Unavailable),
             ContinuationScript::ManualIntervention => Err(RecoveryError::ManualIntervention),
         }
+    }
+
+    fn verify_existing_target(
+        &self,
+        _input: &RecoveryInput,
+        _target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError> {
+        *self.existing_verification.lock().unwrap()
     }
 
     fn rollback(
@@ -220,7 +253,13 @@ fn fake_executor() -> FakeExecutor {
     FakeExecutor {
         native: Mutex::new(VecDeque::new()),
         continuation: Mutex::new(VecDeque::new()),
+        target_default: Mutex::new(CodexTargetDefault {
+            model_provider: "source-provider".into(),
+            model: "source-model".into(),
+        }),
+        existing_verification: Mutex::new(Ok(())),
         vendor_writes: AtomicUsize::new(0),
+        native_calls: AtomicUsize::new(0),
         continuation_calls: AtomicUsize::new(0),
         rollback_calls: AtomicUsize::new(0),
         rollback_fails: false,
@@ -261,6 +300,158 @@ impl JsonRpcTransport for ReleaseCanaryTransport {
     }
 }
 
+struct ScriptedProviderRuntimeExecutor {
+    sent: Mutex<Vec<Value>>,
+    native_calls: AtomicUsize,
+    fork_calls: AtomicUsize,
+}
+
+impl ScriptedProviderRuntimeExecutor {
+    fn new() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+            native_calls: AtomicUsize::new(0),
+            fork_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CodexRecoveryExecutor for ScriptedProviderRuntimeExecutor {
+    fn probe_target_default(
+        &self,
+        _input: &RecoveryInput,
+    ) -> Result<CodexTargetDefault, RecoveryError> {
+        let responses = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "config": {
+                        "model_provider": SAFE_PROVIDER_LABEL,
+                        "api_key": PROVIDER_TOKEN_CANARY,
+                        "base_url": "https://provider-config-canary.invalid/v1"
+                    },
+                    "layers": [{"value": PROVIDER_TOKEN_CANARY}]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [{"id": "gpt-5", "model": "gpt-5", "isDefault": true}],
+                    "nextCursor": null
+                }
+            }),
+        ];
+        let (mut transport, sent) = ReleaseCanaryTransport::new(responses);
+        let target = probe_target_default_transport(&mut transport)
+            .map_err(|_| RecoveryError::Unavailable)?;
+        self.sent
+            .lock()
+            .unwrap()
+            .extend(sent.lock().unwrap().iter().cloned());
+        Ok(target)
+    }
+
+    fn try_native_identity(
+        &self,
+        _input: &RecoveryInput,
+        _target_default: &CodexTargetDefault,
+    ) -> Result<NativeRestoreReport, RecoveryError> {
+        self.native_calls.fetch_add(1, Ordering::SeqCst);
+        Err(RecoveryError::Verification)
+    }
+
+    fn create_continuation(
+        &self,
+        input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
+    ) -> Result<CodexContinuationReport, RecoveryError> {
+        self.fork_calls.fetch_add(1, Ordering::SeqCst);
+        let sessions = input.codex_home.join("sessions");
+        let source_rollout = sessions.join("scripted-source.jsonl");
+        let target_rollout = sessions.join("scripted-target.jsonl");
+        let target_cwd = input.codex_home.join("scripted-project");
+        fs::create_dir_all(&target_cwd).unwrap();
+        fs::write(&source_rollout, b"sanitized source").unwrap();
+        fs::write(&target_rollout, b"verified target").unwrap();
+        let target_thread_id = "019scripted-target";
+        let responses = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "modelProvider": SAFE_PROVIDER_LABEL,
+                    "model": "gpt-5",
+                    "thread": {"id": target_thread_id, "path": target_rollout}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [{
+                        "id": target_thread_id,
+                        "cwd": target_cwd,
+                        "path": target_rollout,
+                        "modelProvider": SAFE_PROVIDER_LABEL
+                    }],
+                    "nextCursor": null
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "thread": {
+                        "id": target_thread_id,
+                        "cwd": target_cwd,
+                        "modelProvider": SAFE_PROVIDER_LABEL,
+                        "turns": [{"id": "turn-1"}]
+                    }
+                }
+            }),
+        ];
+        let (mut transport, sent) = ReleaseCanaryTransport::new(responses);
+        let request = CodexContinuationRequest {
+            source_rollout,
+            source_thread_id: input.session.source_session_id.clone(),
+            target_cwd,
+            target_provider: Some(target_default.model_provider.clone()),
+            target_model: Some(target_default.model.clone()),
+        };
+        let report = fork_rollout_with_target_provider_transport(
+            &mut transport,
+            &input.codex_home,
+            &request,
+        )
+        .map_err(|_| RecoveryError::Verification)?;
+        self.sent
+            .lock()
+            .unwrap()
+            .extend(sent.lock().unwrap().iter().cloned());
+        Ok(report)
+    }
+
+    fn verify_existing_target(
+        &self,
+        _input: &RecoveryInput,
+        _target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError> {
+        Ok(())
+    }
+
+    fn rollback(
+        &self,
+        _input: &RecoveryInput,
+        _report: &agentark_desktop_lib::recovery::AutomaticRecoveryReport,
+    ) -> Result<(), RecoveryError> {
+        Ok(())
+    }
+}
+
 fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> String {
     let codex_home = root.path().join("request-codex-home");
     let sessions = codex_home.join("sessions");
@@ -279,11 +470,9 @@ fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> Stri
     let target_thread_id = "019release-canary-target";
     let responses = vec![
         json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
-        json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
-        json!({"jsonrpc": "2.0", "id": 3, "result": {"data": [], "nextCursor": null}}),
         json!({
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": 2,
             "result": {
                 "modelProvider": SAFE_PROVIDER_LABEL,
                 "model": "gpt-5",
@@ -295,7 +484,7 @@ fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> Stri
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 5,
+            "id": 3,
             "result": {
                 "data": [{"id": target_thread_id, "cwd": target_cwd}],
                 "nextCursor": null
@@ -303,7 +492,7 @@ fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> Stri
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 6,
+            "id": 4,
             "result": {
                 "thread": {
                     "id": target_thread_id,
@@ -389,10 +578,12 @@ struct RestoredFixture {
     state: AppState,
     report: agentark_desktop_lib::BundleReport,
     session_ids: Vec<Uuid>,
+    bundle_path: PathBuf,
+    codex_home: PathBuf,
 }
 
 fn restore_fixture(
-    executor: &FakeExecutor,
+    executor: &dyn CodexRecoveryExecutor,
     sessions: Vec<CanonicalSession>,
     agent: &str,
     include_payloads: bool,
@@ -401,7 +592,7 @@ fn restore_fixture(
 }
 
 fn restore_fixture_with_writer(
-    executor: &FakeExecutor,
+    executor: &dyn CodexRecoveryExecutor,
     sessions: Vec<CanonicalSession>,
     agent: &str,
     include_payloads: bool,
@@ -423,7 +614,7 @@ fn restore_fixture_with_writer(
     let state = AppState::for_data_root(data_root);
     let report = match mapping_writer {
         Some(mapping_writer) => state.bundle_restore_with_executor_and_mapping_writer(
-            bundle_path,
+            bundle_path.clone(),
             executor,
             mapping_writer,
             codex_home.clone(),
@@ -431,7 +622,7 @@ fn restore_fixture_with_writer(
             codex_home.join("agentark-backups"),
         )?,
         None => state.bundle_restore_with_executor(
-            bundle_path,
+            bundle_path.clone(),
             executor,
             codex_home.clone(),
             PathBuf::from("fake-codex"),
@@ -443,7 +634,25 @@ fn restore_fixture_with_writer(
         state,
         report,
         session_ids: sessions.iter().map(|session| session.id).collect(),
+        bundle_path,
+        codex_home,
     })
+}
+
+fn restore_again(
+    fixture: &RestoredFixture,
+    executor: &dyn CodexRecoveryExecutor,
+) -> agentark_desktop_lib::BundleReport {
+    fixture
+        .state
+        .bundle_restore_with_executor(
+            fixture.bundle_path.clone(),
+            executor,
+            fixture.codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            fixture.codex_home.join("agentark-backups"),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -473,6 +682,189 @@ fn missing_source_provider_falls_back_to_target_default_continuation() {
     assert_eq!(report.native_identity_count, 0);
     assert_eq!(report.continuation_count, 1);
     assert_eq!(report.archive_only_count, 0);
+}
+
+#[test]
+fn production_scripted_target_default_skips_incompatible_native_and_forks_explicitly() {
+    let executor = ScriptedProviderRuntimeExecutor::new();
+    let mut custom_session = session(8, "native-custom-provider");
+    custom_session.model_provider = Some("custom".into());
+    custom_session.model_name = Some("claude-custom".into());
+
+    let fixture = restore_fixture(&executor, vec![custom_session], "codex", true).unwrap();
+
+    assert_eq!(executor.native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.fork_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.continuation_count, 1);
+    let sent = executor.sent.lock().unwrap();
+    let fork = sent
+        .iter()
+        .find(|request| request["method"] == "thread/fork")
+        .unwrap();
+    assert_eq!(fork["params"]["modelProvider"], SAFE_PROVIDER_LABEL);
+    assert_eq!(fork["params"]["model"], "gpt-5");
+    let mapping = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        mapping.target_provider.as_deref(),
+        Some(SAFE_PROVIDER_LABEL)
+    );
+    let sinks = format!(
+        "{}\n{:?}\n{}\n{}",
+        serde_json::to_string(&fixture.report).unwrap(),
+        mapping,
+        fs::read_to_string(fixture._root.path().join("data/audit.jsonl")).unwrap(),
+        serde_json::to_string(&*sent).unwrap()
+    );
+    assert!(!sinks.contains(PROVIDER_TOKEN_CANARY));
+    assert!(!sinks.contains("https://provider-config-canary.invalid/v1"));
+}
+
+#[test]
+fn repeating_verified_continuation_reuses_one_target_and_one_mapping() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture =
+        restore_fixture(&executor, vec![session(9, "native-repeat")], "codex", true).unwrap();
+    let original = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let second = restore_again(&fixture, &executor);
+    let mappings = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), 1);
+    assert_eq!(second.continuation_count, 1);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].target_native_id, original.target_native_id);
+}
+
+#[test]
+fn changed_source_hash_conflicts_before_any_repeat_vendor_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(10, "native-changed-source")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let changed_session = session(10, "native-changed-source");
+    let mut changed_payload = payload(&changed_session);
+    changed_payload
+        .bytes
+        .extend_from_slice(b"{\"type\":\"changed\"}\n");
+    write_selected_sessions_with_native(
+        &fixture.bundle_path,
+        "codex",
+        std::slice::from_ref(&changed_session),
+        &[],
+        &[changed_payload],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.native_identity_count, 0);
+    assert_eq!(second.continuation_count, 0);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn missing_or_mismatched_mapped_target_conflicts_without_new_vendor_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success()
+        .existing_target_conflict();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(11, "native-missing-target")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn repeated_archive_only_restore_does_not_add_another_archive_mapping() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .native_missing_provider()
+        .continuation_unavailable()
+        .continuation_unavailable();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(12, "native-archive-repeat")],
+        "codex",
+        true,
+    )
+    .unwrap();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(second.archive_only_count, 1);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

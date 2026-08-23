@@ -64,6 +64,19 @@ pub struct CodexContinuationReport {
     pub visible_turns: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CodexTargetDefault {
+    pub model_provider: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexTargetSessionExpectation {
+    pub thread_id: String,
+    pub model_provider: String,
+    pub rollout_hash: Sha256Digest,
+}
+
 pub fn ensure_codex_not_running_from_tasklist(output: &str) -> Result<(), NativeImportError> {
     let names = ["codex.exe", "codex-desktop.exe", "codexdesktop.exe"];
     if output.lines().any(|line| {
@@ -198,6 +211,130 @@ pub fn verify_rollouts_with_app_server(
     Ok(())
 }
 
+pub fn probe_target_default(
+    executable: &Path,
+    codex_home: &Path,
+) -> Result<CodexTargetDefault, NativeImportError> {
+    let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
+        .map_err(map_codex_error)?;
+    probe_target_default_transport(&mut transport)
+}
+
+/// Transport-injected form of [`probe_target_default`].
+#[doc(hidden)]
+pub fn probe_target_default_transport<T: JsonRpcTransport>(
+    transport: &mut T,
+) -> Result<CodexTargetDefault, NativeImportError> {
+    let mut client = NativeAppServerClient::new(transport);
+    client.initialize()?;
+    let response = client
+        .request("config/read", json!({}))
+        .map_err(|_| target_probe_failure())?;
+    let config = response
+        .value
+        .pointer("/result/config")
+        .filter(|value| value.is_object())
+        .ok_or_else(target_probe_failure)?;
+    let model_provider = match config.get("model_provider") {
+        Some(value) if !value.is_null() => validated_label(value, "model provider")?,
+        _ => "openai".to_owned(),
+    };
+    let model = match config.get("model") {
+        Some(value) if !value.is_null() => validated_label(value, "model")?,
+        _ => {
+            let models = client
+                .request("model/list", json!({}))
+                .map_err(|_| target_probe_failure())?;
+            let advertised = models
+                .value
+                .pointer("/result/data")
+                .and_then(Value::as_array)
+                .ok_or_else(target_probe_failure)?;
+            let defaults = advertised
+                .iter()
+                .filter(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .collect::<Vec<_>>();
+            if defaults.len() != 1 {
+                return Err(target_probe_failure());
+            }
+            let value = defaults[0]
+                .get("model")
+                .or_else(|| defaults[0].get("id"))
+                .ok_or_else(target_probe_failure)?;
+            validated_label(value, "model")?
+        }
+    };
+    Ok(CodexTargetDefault {
+        model_provider,
+        model,
+    })
+}
+
+pub fn verify_target_session(
+    executable: &Path,
+    codex_home: &Path,
+    expected: &CodexTargetSessionExpectation,
+) -> Result<(), NativeImportError> {
+    let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
+        .map_err(map_codex_error)?;
+    verify_target_session_transport(&mut transport, codex_home, expected)
+}
+
+/// Transport-injected form of [`verify_target_session`].
+#[doc(hidden)]
+pub fn verify_target_session_transport<T: JsonRpcTransport>(
+    transport: &mut T,
+    codex_home: &Path,
+    expected: &CodexTargetSessionExpectation,
+) -> Result<(), NativeImportError> {
+    let mut client = NativeAppServerClient::new(transport);
+    client.initialize()?;
+    let active = client.request("thread/list", continuation_list_params(false))?;
+    let rollout_path = match existing_target_rollout(&active.value, codex_home, expected)? {
+        Some(path) => path,
+        None => {
+            let archived = client.request("thread/list", continuation_list_params(true))?;
+            existing_target_rollout(&archived.value, codex_home, expected)?.ok_or_else(|| {
+                NativeImportError::Verification("mapped target thread is not listed".into())
+            })?
+        }
+    };
+    let bytes = fs::read(&rollout_path).map_err(|_| {
+        NativeImportError::Verification("mapped target rollout cannot be read".into())
+    })?;
+    if Sha256Digest::from_bytes(&bytes) != expected.rollout_hash {
+        return Err(NativeImportError::Verification(
+            "mapped target rollout hash does not match".into(),
+        ));
+    }
+    let read = client.request(
+        "thread/read",
+        json!({"threadId": expected.thread_id, "includeTurns": true}),
+    )?;
+    let thread = read
+        .value
+        .pointer("/result/thread")
+        .ok_or_else(|| NativeImportError::Verification("mapped target cannot be read".into()))?;
+    if thread.get("id").and_then(Value::as_str) != Some(expected.thread_id.as_str())
+        || thread.get("modelProvider").and_then(Value::as_str)
+            != Some(expected.model_provider.as_str())
+    {
+        return Err(NativeImportError::Verification(
+            "mapped target identity does not match".into(),
+        ));
+    }
+    if thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return Err(NativeImportError::Verification(
+            "mapped target has no visible turns".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn fork_rollout_with_target_provider(
     executable: &Path,
     codex_home: &Path,
@@ -242,8 +379,6 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
 ) -> Result<CodexContinuationReport, NativeImportError> {
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
-    client.request("modelProvider/capabilities/read", json!({}))?;
-    client.request("model/list", json!({}))?;
 
     let mut params = json!({
         "threadId": request.source_thread_id,
@@ -341,6 +476,56 @@ pub fn fork_rollout_with_target_provider_transport<T: JsonRpcTransport>(
             }
         }
     }
+}
+
+fn target_probe_failure() -> NativeImportError {
+    NativeImportError::Verification("Codex target default is unavailable".into())
+}
+
+fn validated_label(value: &Value, kind: &str) -> Result<String, NativeImportError> {
+    let label = value.as_str().map(str::trim).unwrap_or_default();
+    if label.is_empty()
+        || label.len() > 128
+        || !label.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(NativeImportError::Verification(format!(
+            "Codex target {kind} label is invalid"
+        )));
+    }
+    Ok(label.to_owned())
+}
+
+fn existing_target_rollout(
+    response: &Value,
+    codex_home: &Path,
+    expected: &CodexTargetSessionExpectation,
+) -> Result<Option<PathBuf>, NativeImportError> {
+    let threads = response
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| NativeImportError::Verification("thread/list data is missing".into()))?;
+    let Some(thread) = threads.iter().find(|thread| {
+        thread.get("id").and_then(Value::as_str) == Some(expected.thread_id.as_str())
+    }) else {
+        return Ok(None);
+    };
+    if thread.get("modelProvider").and_then(Value::as_str) != Some(expected.model_provider.as_str())
+    {
+        return Err(NativeImportError::Verification(
+            "mapped target provider does not match".into(),
+        ));
+    }
+    let path = thread
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| NativeImportError::Verification("mapped target path is missing".into()))?;
+    Ok(Some(verified_session_rollout_path(
+        codex_home,
+        Path::new(path),
+    )?))
 }
 
 fn required_nonempty_label(

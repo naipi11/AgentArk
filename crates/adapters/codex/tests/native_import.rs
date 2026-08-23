@@ -4,11 +4,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
-    CodexContinuationRequest, CodexError, JsonRpcTransport, NativeImportError,
-    NativeThreadExpectation, RawJsonRpc, backup_codex_targets,
+    CodexContinuationRequest, CodexError, CodexTargetDefault, CodexTargetSessionExpectation,
+    JsonRpcTransport, NativeImportError, NativeThreadExpectation, RawJsonRpc, backup_codex_targets,
     delete_thread_with_app_server_transport, ensure_codex_not_running_from_tasklist,
-    fork_rollout_with_target_provider_transport, verify_thread_listing,
-    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
+    fork_rollout_with_target_provider_transport, probe_target_default_transport,
+    verify_target_session_transport, verify_thread_listing, write_rollout_atomic_with_operations,
+    write_rollout_atomic_with_reader,
 };
 use agentark_canonical::Sha256Digest;
 use serde_json::{Value, json};
@@ -107,6 +108,172 @@ impl JsonRpcTransport for ScriptedTransport {
     }
 }
 
+#[test]
+fn target_default_probe_reads_only_sanitized_effective_config_labels() {
+    let token_canary = "sk-proj-target-default-probe-canary-123456789";
+    let endpoint_canary = "https://provider-canary.invalid/v1";
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "config": {
+                    "model_provider": "openai",
+                    "model": "gpt-5",
+                    "api_key": token_canary,
+                    "base_url": endpoint_canary,
+                    "account_id": "provider-account-canary"
+                },
+                "layers": [{"value": token_canary}],
+                "origins": {"model": endpoint_canary}
+            }
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    let target = probe_target_default_transport(&mut transport).unwrap();
+
+    assert_eq!(
+        target,
+        CodexTargetDefault {
+            model_provider: "openai".into(),
+            model: "gpt-5".into(),
+        }
+    );
+    let serialized = serde_json::to_string(&target).unwrap();
+    assert!(!serialized.contains(token_canary));
+    assert!(!serialized.contains(endpoint_canary));
+    let methods = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.get("method").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(methods, ["initialize", "initialized", "config/read"]);
+}
+
+#[test]
+fn target_default_probe_uses_advertised_default_model_when_config_omits_model() {
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"config": {}}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "data": [
+                    {"id": "gpt-old", "model": "gpt-old", "isDefault": false},
+                    {"id": "gpt-5", "model": "gpt-5", "isDefault": true}
+                ],
+                "nextCursor": null
+            }
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+
+    let target = probe_target_default_transport(&mut transport).unwrap();
+
+    assert_eq!(target.model_provider, "openai");
+    assert_eq!(target.model, "gpt-5");
+    let methods = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.get("method").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        ["initialize", "initialized", "config/read", "model/list"]
+    );
+}
+
+#[test]
+fn existing_target_verifier_checks_id_provider_and_rollout_hash_without_mutation() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let rollout = sessions.join("existing-target.jsonl");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(&rollout, b"existing verified target").unwrap();
+    let target_id = "019existing-target";
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"data": [{
+                "id": target_id,
+                "path": rollout,
+                "modelProvider": "openai"
+            }], "nextCursor": null}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"thread": {
+                "id": target_id,
+                "modelProvider": "openai",
+                "turns": [{"id": "turn-1"}]
+            }}
+        }),
+    ];
+    let (mut transport, sent) = ScriptedTransport::new(responses);
+    let expected = CodexTargetSessionExpectation {
+        thread_id: target_id.into(),
+        model_provider: "openai".into(),
+        rollout_hash: Sha256Digest::from_bytes(b"existing verified target"),
+    };
+
+    verify_target_session_transport(&mut transport, codex_home.path(), &expected).unwrap();
+
+    let methods = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.get("method").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        ["initialize", "initialized", "thread/list", "thread/read"]
+    );
+}
+
+#[test]
+fn existing_target_verifier_rejects_changed_rollout_hash() {
+    let codex_home = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    let rollout = sessions.join("changed-target.jsonl");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(&rollout, b"changed target").unwrap();
+    let target_id = "019changed-target";
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"data": [{
+                "id": target_id,
+                "path": rollout,
+                "modelProvider": "openai"
+            }], "nextCursor": null}
+        }),
+    ];
+    let (mut transport, _) = ScriptedTransport::new(responses);
+    let expected = CodexTargetSessionExpectation {
+        thread_id: target_id.into(),
+        model_provider: "openai".into(),
+        rollout_hash: Sha256Digest::from_bytes(b"original target"),
+    };
+
+    let error =
+        verify_target_session_transport(&mut transport, codex_home.path(), &expected).unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Verification(_)));
+}
+
 fn continuation_responses(
     target_thread_id: &str,
     target_rollout: &Path,
@@ -114,7 +281,7 @@ fn continuation_responses(
 ) -> (Vec<Value>, Value) {
     let fork_response = json!({
         "jsonrpc": "2.0",
-        "id": 4,
+        "id": 2,
         "result": {
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
@@ -172,32 +339,10 @@ fn continuation_responses(
     (
         vec![
             json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "result": {"imageGeneration": true, "namespaceTools": true, "webSearch": true}
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "result": {
-                    "data": [{
-                        "defaultReasoningEffort": "medium",
-                        "description": "fixture model",
-                        "displayName": "GPT-5",
-                        "hidden": false,
-                        "id": "gpt-5",
-                        "isDefault": true,
-                        "model": "gpt-5",
-                        "supportedReasoningEfforts": []
-                    }],
-                    "nextCursor": null
-                }
-            }),
             fork_response.clone(),
-            json!({"jsonrpc": "2.0", "id": 5, "result": {"data": [], "nextCursor": null}}),
-            json!({"jsonrpc": "2.0", "id": 6, "result": {"data": [listed_thread], "nextCursor": null}}),
-            json!({"jsonrpc": "2.0", "id": 7, "result": {"thread": read_thread}}),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {"data": [], "nextCursor": null}}),
+            json!({"jsonrpc": "2.0", "id": 4, "result": {"data": [listed_thread], "nextCursor": null}}),
+            json!({"jsonrpc": "2.0", "id": 5, "result": {"thread": read_thread}}),
         ],
         fork_response,
     )
@@ -286,8 +431,6 @@ fn fork_rollout_sends_selected_provider_without_secrets_and_verifies_visibility(
         [
             "initialize",
             "initialized",
-            "modelProvider/capabilities/read",
-            "model/list",
             "thread/fork",
             "thread/list",
             "thread/list",
@@ -381,9 +524,9 @@ fn fork_rollout_deletes_new_target_when_post_fork_validation_fails() {
     fs::write(&target_rollout, b"target").unwrap();
     let target_thread_id = "019target-thread";
     let (mut responses, _) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
-    responses[3]["result"]["modelProvider"] = Value::String("unexpected".into());
-    responses.truncate(4);
-    responses.push(json!({"jsonrpc": "2.0", "id": 5, "result": {}}));
+    responses[1]["result"]["modelProvider"] = Value::String("unexpected".into());
+    responses.truncate(2);
+    responses.push(json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -424,11 +567,11 @@ fn fork_rollout_reports_manual_intervention_when_validation_rollback_fails() {
     fs::write(&target_rollout, b"target").unwrap();
     let (mut responses, _) =
         continuation_responses("019target-thread", &target_rollout, &target_cwd);
-    responses[3]["result"]["modelProvider"] = Value::String("unexpected".into());
-    responses.truncate(4);
+    responses[1]["result"]["modelProvider"] = Value::String("unexpected".into());
+    responses.truncate(2);
     responses.push(json!({
         "jsonrpc": "2.0",
-        "id": 5,
+        "id": 3,
         "error": {"code": -32603, "message": "fixture delete failure"}
     }));
     let (mut transport, _) = ScriptedTransport::new(responses);
@@ -460,11 +603,11 @@ fn fork_rollout_missing_target_id_requires_manual_intervention_without_delete() 
     fs::write(&target_rollout, b"target").unwrap();
     let (mut responses, _) =
         continuation_responses("019target-thread", &target_rollout, &target_cwd);
-    responses[3]["result"]["thread"]
+    responses[1]["result"]["thread"]
         .as_object_mut()
         .unwrap()
         .remove("id");
-    responses.truncate(4);
+    responses.truncate(2);
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -500,8 +643,8 @@ fn fork_rollout_empty_target_id_requires_manual_intervention_without_delete() {
     fs::write(&target_rollout, b"target").unwrap();
     let (mut responses, _) =
         continuation_responses("019target-thread", &target_rollout, &target_cwd);
-    responses[3]["result"]["thread"]["id"] = Value::String("   ".into());
-    responses.truncate(4);
+    responses[1]["result"]["thread"]["id"] = Value::String("   ".into());
+    responses.truncate(2);
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -538,8 +681,8 @@ fn fork_rollout_reused_source_id_requires_manual_intervention_without_source_del
     let source_thread_id = "019source-thread";
     let (mut responses, _) =
         continuation_responses("019target-thread", &target_rollout, &target_cwd);
-    responses[3]["result"]["thread"]["id"] = Value::String(source_thread_id.into());
-    responses.truncate(4);
+    responses[1]["result"]["thread"]["id"] = Value::String(source_thread_id.into());
+    responses.truncate(2);
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -575,9 +718,9 @@ fn fork_rollout_does_not_retry_archived_when_active_list_is_malformed() {
     fs::write(&target_rollout, b"target").unwrap();
     let target_thread_id = "019target-thread";
     let (mut responses, _) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
-    responses[4] = json!({"jsonrpc": "2.0", "id": 5, "result": {}});
-    responses.truncate(5);
-    responses.push(json!({"jsonrpc": "2.0", "id": 6, "result": {}}));
+    responses[2] = json!({"jsonrpc": "2.0", "id": 3, "result": {}});
+    responses.truncate(3);
+    responses.push(json!({"jsonrpc": "2.0", "id": 4, "result": {}}));
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,
@@ -620,12 +763,12 @@ fn fork_rollout_does_not_retry_archived_when_active_target_has_wrong_cwd() {
     fs::write(&target_rollout, b"target").unwrap();
     let target_thread_id = "019target-thread";
     let (mut responses, _) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
-    let mut wrong_cwd_listing = responses[5].clone();
-    wrong_cwd_listing["id"] = Value::from(5);
+    let mut wrong_cwd_listing = responses[3].clone();
+    wrong_cwd_listing["id"] = Value::from(3);
     wrong_cwd_listing["result"]["data"][0]["cwd"] = Value::String("C:/wrong".into());
-    responses[4] = wrong_cwd_listing;
-    responses.truncate(5);
-    responses.push(json!({"jsonrpc": "2.0", "id": 6, "result": {}}));
+    responses[2] = wrong_cwd_listing;
+    responses.truncate(3);
+    responses.push(json!({"jsonrpc": "2.0", "id": 4, "result": {}}));
     let (mut transport, sent) = ScriptedTransport::new(responses);
     let request = CodexContinuationRequest {
         source_rollout,

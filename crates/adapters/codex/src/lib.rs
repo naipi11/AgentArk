@@ -16,13 +16,15 @@ pub use filesystem::{
     capture_jsonl_file, collect_jsonl_paths, split_complete_jsonl_prefix, tree_digest,
 };
 pub use native_import::{
-    CodexContinuationReport, CodexContinuationRequest, NativeCapability, NativeImportError,
-    NativeThreadExpectation, backup_codex_targets, delete_thread_with_app_server,
-    delete_thread_with_app_server_transport, ensure_codex_not_running,
-    ensure_codex_not_running_from_tasklist, fork_rollout_with_target_provider,
-    fork_rollout_with_target_provider_transport, native_import_capability_from_outputs,
-    verify_rollout_with_app_server, verify_rollouts_with_app_server, verify_thread_listing,
-    write_rollout_atomic, write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
+    CodexContinuationReport, CodexContinuationRequest, CodexTargetDefault,
+    CodexTargetSessionExpectation, NativeCapability, NativeImportError, NativeThreadExpectation,
+    backup_codex_targets, delete_thread_with_app_server, delete_thread_with_app_server_transport,
+    ensure_codex_not_running, ensure_codex_not_running_from_tasklist,
+    fork_rollout_with_target_provider, fork_rollout_with_target_provider_transport,
+    native_import_capability_from_outputs, probe_target_default, probe_target_default_transport,
+    verify_rollout_with_app_server, verify_rollouts_with_app_server, verify_target_session,
+    verify_target_session_transport, verify_thread_listing, write_rollout_atomic,
+    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
 };
 pub use native_payload::{
     NativePayloadError, NativeRestoreReport, NativeRolloutPayload, collect_native_rollouts,
