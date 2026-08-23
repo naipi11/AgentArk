@@ -4,6 +4,8 @@ pub enum CodexError {
     Io(#[from] std::io::Error),
     #[error("Codex probe timed out")]
     Timeout,
+    #[error("Codex App Server request timed out")]
+    AppServerRequestTimeout,
     #[error("Codex executable output is invalid")]
     InvalidOutput,
     #[error("Codex version is unsupported")]

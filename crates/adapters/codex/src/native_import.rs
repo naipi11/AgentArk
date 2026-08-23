@@ -2,16 +2,17 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentark_canonical::Sha256Digest;
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::protocol::{APP_SERVER_REQUEST_TIMEOUT, receive_response_until};
 use crate::{
-    CODEX_VERSION, CodexError, CodexVisibleHistoryExpectation, CodexVisibleMessage,
-    CodexVisibleRole, JsonRpcTransport, ProcessTransport, RawJsonRpc,
+    AGENTARK_APP_SERVER_CLIENT_VERSION, CODEX_VERSION, CodexError, CodexVisibleHistoryExpectation,
+    CodexVisibleMessage, CodexVisibleRole, JsonRpcTransport, ProcessTransport, RawJsonRpc,
 };
 
 #[derive(Debug, Error)]
@@ -32,6 +33,10 @@ pub enum NativeImportError {
     Rollback,
     #[error("Codex recovery requires manual intervention")]
     ManualIntervention,
+    #[error("Codex App Server request timed out")]
+    Timeout,
+    #[error("Codex mutation outcome is unknown; manual intervention is required")]
+    MutationOutcomeUnknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,7 +236,7 @@ pub fn probe_target_default_transport<T: JsonRpcTransport>(
     client.initialize()?;
     let response = client
         .request("config/read", json!({}))
-        .map_err(|_| target_probe_failure())?;
+        .map_err(map_target_probe_error)?;
     let config = response
         .value
         .pointer("/result/config")
@@ -246,7 +251,7 @@ pub fn probe_target_default_transport<T: JsonRpcTransport>(
         _ => {
             let models = client
                 .request("model/list", json!({}))
-                .map_err(|_| target_probe_failure())?;
+                .map_err(map_target_probe_error)?;
             let advertised = models
                 .value
                 .pointer("/result/data")
@@ -340,18 +345,23 @@ pub fn fork_rollout_with_target_provider_guarded<G>(
 where
     G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
 {
-    let report = {
+    let attempt = {
         let mut transport = ProcessTransport::spawn_with_codex_home(executable, Some(codex_home))
             .map_err(map_codex_error)?;
         let excluded_process_ids = [transport.process_id()];
-        fork_rollout_with_target_provider_transport_guarded(
-            &mut transport,
+        let mut client = NativeAppServerClient::new(&mut transport);
+        client.initialize()?;
+        fork_rollout_attempt(
+            &mut client,
             codex_home,
             request,
             guard,
             &excluded_process_ids,
-        )?
+        )
     };
+    let report = resolve_fork_attempt(attempt, |thread_id| {
+        delete_thread_with_app_server_guarded(executable, codex_home, thread_id, guard)
+    })?;
     let expected = CodexTargetSessionExpectation {
         thread_id: report.target_thread_id.clone(),
         cwd: request.target_cwd.to_string_lossy().into_owned(),
@@ -361,14 +371,15 @@ where
         visible_history: report.visible_history.clone(),
     };
     if let Err(error) = verify_target_session(executable, codex_home, &expected) {
-        delete_thread_with_app_server_guarded(
-            executable,
-            codex_home,
-            &report.target_thread_id,
-            guard,
-        )
-        .map_err(|_| NativeImportError::ManualIntervention)?;
-        return Err(error);
+        return resolve_fork_attempt(
+            Err(ForkAttemptError::known(
+                error,
+                report.target_thread_id.clone(),
+            )),
+            |thread_id| {
+                delete_thread_with_app_server_guarded(executable, codex_home, thread_id, guard)
+            },
+        );
     }
     Ok(report)
 }
@@ -429,8 +440,13 @@ where
 {
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
-    delete_and_confirm_guarded(&mut client, thread_id, guard, excluded_process_ids)
-        .map_err(|_| NativeImportError::ManualIntervention)
+    match delete_and_confirm_guarded(&mut client, thread_id, guard, excluded_process_ids) {
+        Ok(()) => Ok(()),
+        Err(NativeImportError::MutationOutcomeUnknown) => {
+            Err(NativeImportError::MutationOutcomeUnknown)
+        }
+        Err(_) => Err(NativeImportError::ManualIntervention),
+    }
 }
 
 /// Transport-injected form of [`fork_rollout_with_target_provider`].
@@ -467,7 +483,29 @@ where
 {
     let mut client = NativeAppServerClient::new(transport);
     client.initialize()?;
+    let attempt = fork_rollout_attempt(
+        &mut client,
+        codex_home,
+        request,
+        guard,
+        excluded_process_ids,
+    );
+    resolve_fork_attempt(attempt, |thread_id| {
+        delete_and_confirm_guarded(&mut client, thread_id, guard, excluded_process_ids)
+    })
+}
 
+fn fork_rollout_attempt<T, G>(
+    client: &mut NativeAppServerClient<'_, T>,
+    codex_home: &Path,
+    request: &CodexContinuationRequest,
+    guard: &G,
+    excluded_process_ids: &[u32],
+) -> Result<CodexContinuationReport, ForkAttemptError>
+where
+    T: JsonRpcTransport,
+    G: Fn(&[u32]) -> Result<(), NativeImportError> + ?Sized,
+{
     let mut params = json!({
         "threadId": request.source_thread_id,
         "path": request.source_rollout.to_string_lossy(),
@@ -481,17 +519,21 @@ where
     if let Some(model) = &request.target_model {
         params["model"] = Value::String(model.clone());
     }
-    guard(excluded_process_ids)?;
-    let response = client.request("thread/fork", params)?;
+    guard(excluded_process_ids).map_err(ForkAttemptError::unknown)?;
+    let response = client
+        .request("thread/fork", params)
+        .map_err(ForkAttemptError::unknown)?;
     let target_thread_id = response
         .value
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .ok_or(NativeImportError::ManualIntervention)?;
+        .ok_or_else(|| ForkAttemptError::unknown(NativeImportError::ManualIntervention))?;
     if target_thread_id == request.source_thread_id {
-        return Err(NativeImportError::ManualIntervention);
+        return Err(ForkAttemptError::unknown(
+            NativeImportError::ManualIntervention,
+        ));
     }
     let outcome = (|| {
         let rollout_path = required_nonempty_label(
@@ -546,13 +588,12 @@ where
             visible_history: request.visible_history.clone(),
         };
 
-        match find_thread_in_listing(&mut client, false, &target_thread_id)? {
+        match find_thread_in_listing(client, false, &target_thread_id)? {
             Some(thread) => {
                 let _ = existing_target_rollout(&thread, codex_home, &expected)?;
             }
             None => {
-                if let Some(thread) = find_thread_in_listing(&mut client, true, &target_thread_id)?
-                {
+                if let Some(thread) = find_thread_in_listing(client, true, &target_thread_id)? {
                     let _ = existing_target_rollout(&thread, codex_home, &expected)?;
                 }
             }
@@ -578,15 +619,51 @@ where
         })
     })();
 
-    match outcome {
+    outcome.map_err(|error| ForkAttemptError::known(error, target_thread_id))
+}
+
+struct ForkAttemptError {
+    error: NativeImportError,
+    target_thread_id: Option<String>,
+}
+
+impl ForkAttemptError {
+    fn unknown(error: NativeImportError) -> Self {
+        Self {
+            error,
+            target_thread_id: None,
+        }
+    }
+
+    fn known(error: NativeImportError, target_thread_id: String) -> Self {
+        Self {
+            error,
+            target_thread_id: Some(target_thread_id),
+        }
+    }
+}
+
+fn resolve_fork_attempt<F>(
+    attempt: Result<CodexContinuationReport, ForkAttemptError>,
+    rollback: F,
+) -> Result<CodexContinuationReport, NativeImportError>
+where
+    F: FnOnce(&str) -> Result<(), NativeImportError>,
+{
+    match attempt {
         Ok(report) => Ok(report),
-        Err(error) => match delete_and_confirm_guarded(
-            &mut client,
-            &target_thread_id,
-            guard,
-            excluded_process_ids,
-        ) {
+        Err(ForkAttemptError {
+            error,
+            target_thread_id: None,
+        }) => Err(error),
+        Err(ForkAttemptError {
+            error,
+            target_thread_id: Some(target_thread_id),
+        }) => match rollback(&target_thread_id) {
             Ok(()) => Err(error),
+            Err(NativeImportError::MutationOutcomeUnknown) => {
+                Err(NativeImportError::MutationOutcomeUnknown)
+            }
             Err(_) => Err(NativeImportError::ManualIntervention),
         },
     }
@@ -614,6 +691,13 @@ where
 
 fn target_probe_failure() -> NativeImportError {
     NativeImportError::Verification("Codex target default is unavailable".into())
+}
+
+fn map_target_probe_error(error: NativeImportError) -> NativeImportError {
+    match error {
+        NativeImportError::Timeout | NativeImportError::MutationOutcomeUnknown => error,
+        _ => target_probe_failure(),
+    }
 }
 
 fn validated_label(value: &Value, kind: &str) -> Result<String, NativeImportError> {
@@ -855,6 +939,7 @@ fn verify_thread_read(
 struct NativeAppServerClient<'a, T: JsonRpcTransport> {
     transport: &'a mut T,
     next_id: u64,
+    request_timeout: Duration,
 }
 
 impl<'a, T: JsonRpcTransport> NativeAppServerClient<'a, T> {
@@ -862,6 +947,7 @@ impl<'a, T: JsonRpcTransport> NativeAppServerClient<'a, T> {
         Self {
             transport,
             next_id: 1,
+            request_timeout: APP_SERVER_REQUEST_TIMEOUT,
         }
     }
 
@@ -869,7 +955,7 @@ impl<'a, T: JsonRpcTransport> NativeAppServerClient<'a, T> {
         self.request(
             "initialize",
             json!({
-                "clientInfo": {"name": "agentark-native-import", "title": "AgentArk", "version": "0.5.0"},
+                "clientInfo": {"name": "agentark-native-import", "title": "AgentArk", "version": AGENTARK_APP_SERVER_CLIENT_VERSION},
                 "capabilities": {"experimentalApi": true}
             }),
         )?;
@@ -881,29 +967,43 @@ impl<'a, T: JsonRpcTransport> NativeAppServerClient<'a, T> {
     fn request(&mut self, method: &str, params: Value) -> Result<RawJsonRpc, NativeImportError> {
         let id = self.next_id;
         self.next_id += 1;
+        let deadline = Instant::now() + self.request_timeout;
         self.transport
             .send_value(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .map_err(map_codex_error)?;
-        loop {
-            let response = self.transport.receive_value().map_err(map_codex_error)?;
-            if response.value.get("id") == Some(&Value::from(id)) {
-                if let Some(error) = response.value.get("error") {
-                    return Err(NativeImportError::Verification(
-                        error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Codex App Server request failed")
-                            .to_owned(),
-                    ));
-                }
-                return Ok(response);
-            }
+        let response = receive_response_until(self.transport, id, deadline)
+            .map_err(|error| map_request_error(method, error))?;
+        if let Some(error) = response.value.get("error") {
+            return Err(NativeImportError::Verification(
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex App Server request failed")
+                    .to_owned(),
+            ));
         }
+        Ok(response)
     }
 }
 
 fn map_codex_error(error: CodexError) -> NativeImportError {
-    NativeImportError::Verification(error.to_string())
+    match error {
+        CodexError::AppServerRequestTimeout => NativeImportError::Timeout,
+        error => NativeImportError::Verification(error.to_string()),
+    }
+}
+
+fn map_request_error(method: &str, error: CodexError) -> NativeImportError {
+    if matches!(error, CodexError::AppServerRequestTimeout)
+        && matches!(
+            method,
+            "thread/fork" | "thread/name/set" | "thread/resume" | "thread/delete"
+        )
+    {
+        NativeImportError::MutationOutcomeUnknown
+    } else {
+        map_codex_error(error)
+    }
 }
 
 pub fn native_import_capability_from_outputs(

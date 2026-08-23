@@ -46,4 +46,7 @@ pub use process_guard::{
     ensure_codex_not_running, ensure_codex_not_running_excluding,
     ensure_codex_not_running_from_snapshot, ensure_codex_not_running_from_snapshot_excluding,
 };
-pub use protocol::{JsonRpcTransport, MAX_JSON_LINE, RawJsonRpc, ReadOnlyAppServerClient};
+pub use protocol::{
+    AGENTARK_APP_SERVER_CLIENT_VERSION, JsonRpcTransport, MAX_JSON_LINE, RawJsonRpc,
+    ReadOnlyAppServerClient,
+};

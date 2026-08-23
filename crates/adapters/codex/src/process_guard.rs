@@ -45,16 +45,21 @@ fn classify_process_snapshot(
     }
     let mut seen = HashSet::new();
     for row in &rows {
-        if row.process_id == 0
-            || row.process_id == row.parent_process_id
-            || row.name.trim().is_empty()
-            || !seen.insert(row.process_id)
-        {
+        if row.name.trim().is_empty() || !seen.insert(row.process_id) {
+            return Err(snapshot_unavailable());
+        }
+        if is_system_idle_process(row) {
+            continue;
+        }
+        if row.process_id == 0 || row.process_id == row.parent_process_id {
             return Err(snapshot_unavailable());
         }
     }
     let mut children = HashMap::<u32, Vec<u32>>::new();
     for row in &rows {
+        if is_system_idle_process(row) {
+            continue;
+        }
         children
             .entry(row.parent_process_id)
             .or_default()
@@ -73,6 +78,9 @@ fn classify_process_snapshot(
         }
     }
     for row in rows {
+        if is_system_idle_process(&row) {
+            continue;
+        }
         if excluded.contains(&row.process_id) {
             continue;
         }
@@ -95,6 +103,13 @@ fn classify_process_snapshot(
         }
     }
     Ok(())
+}
+
+fn is_system_idle_process(row: &ProcessSnapshotRow) -> bool {
+    row.name.eq_ignore_ascii_case("System Idle Process")
+        && row.process_id == 0
+        && row.parent_process_id == 0
+        && row.command_line.is_none()
 }
 
 fn is_direct_codex_executable(name: &str) -> bool {
@@ -1126,7 +1141,11 @@ mod windows {
     const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(3);
     const MAX_STDOUT_BYTES: usize = 1024 * 1024;
     const MAX_STDERR_BYTES: usize = 64 * 1024;
-    const PROCESS_SNAPSHOT_SCRIPT: &str = "$selfPid=$PID; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $selfPid } | Select-Object Name,ProcessId,ParentProcessId,CommandLine); ConvertTo-Json -InputObject @($rows) -Compress -Depth 2";
+    const PROCESS_SNAPSHOT_SCRIPT: &str = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $selfPid=$PID; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $selfPid } | Select-Object Name,ProcessId,ParentProcessId,CommandLine); ConvertTo-Json -InputObject @($rows) -Compress -Depth 2";
+
+    fn decode_process_snapshot(bytes: Vec<u8>) -> Result<String, NativeImportError> {
+        String::from_utf8(bytes).map_err(|_| snapshot_unavailable())
+    }
 
     pub(super) fn ensure_codex_not_running_excluding(
         excluded_process_ids: &[u32],
@@ -1147,7 +1166,7 @@ mod windows {
             MAX_STDOUT_BYTES,
             MAX_STDERR_BYTES,
         )?;
-        let output = String::from_utf8(output.stdout).map_err(|_| snapshot_unavailable())?;
+        let output = decode_process_snapshot(output.stdout)?;
         classify_process_snapshot(&output, excluded_process_ids)
     }
 
@@ -1292,6 +1311,87 @@ mod windows {
         use tempfile::tempdir;
 
         use super::*;
+
+        struct OwnedTestChild(Option<std::process::Child>);
+
+        impl OwnedTestChild {
+            fn spawn(command: &mut Command) -> Self {
+                Self(Some(command.spawn().unwrap()))
+            }
+
+            fn id(&self) -> u32 {
+                self.0.as_ref().unwrap().id()
+            }
+        }
+
+        impl Drop for OwnedTestChild {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        #[test]
+        fn snapshot_runner_emits_bomless_utf8_for_non_ascii_owned_process_metadata() {
+            let command_line_canary = "AgentArk-快照-元数据";
+            let script = format!("$metadata = '{command_line_canary}'; Start-Sleep -Seconds 30");
+            let mut owned_command = powershell_command(&script);
+            owned_command
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let owned = OwnedTestChild::spawn(&mut owned_command);
+            thread::sleep(Duration::from_millis(200));
+
+            let output = run_bounded_command_typed(
+                powershell_command(PROCESS_SNAPSHOT_SCRIPT),
+                SNAPSHOT_DEADLINE,
+                MAX_STDOUT_BYTES,
+                MAX_STDERR_BYTES,
+            )
+            .unwrap();
+            let output = match String::from_utf8(output.stdout) {
+                Ok(output) => output,
+                Err(_) => panic!("snapshot must be UTF-8"),
+            };
+            assert!(!output.starts_with('\u{feff}'));
+            let rows = serde_json::from_str::<Vec<super::super::ProcessSnapshotRow>>(&output)
+                .expect("snapshot must be valid JSON");
+            let owned_row = rows
+                .iter()
+                .find(|row| row.process_id == owned.id())
+                .expect("owned child must appear in snapshot");
+            assert!(
+                owned_row
+                    .command_line
+                    .as_deref()
+                    .unwrap()
+                    .contains(command_line_canary)
+            );
+            let controlled = serde_json::json!([{
+                "Name": owned_row.name,
+                "ProcessId": owned_row.process_id,
+                "ParentProcessId": owned_row.parent_process_id,
+                "CommandLine": owned_row.command_line,
+            }]);
+            super::super::classify_process_snapshot(&controlled.to_string(), &[owned.id()])
+                .unwrap();
+        }
+
+        #[test]
+        fn invalid_snapshot_bytes_fail_closed_without_leaking_raw_metadata() {
+            let command_line_canary = "agentark-sensitive-command-line-canary";
+            let mut bytes = command_line_canary.as_bytes().to_vec();
+            bytes.push(0xff);
+
+            let error = decode_process_snapshot(bytes).unwrap_err();
+
+            assert!(matches!(error, NativeImportError::Verification(_)));
+            assert!(!error.to_string().contains(command_line_canary));
+        }
 
         #[test]
         fn bounded_runner_times_out_and_kills_owned_sleeping_powershell() {

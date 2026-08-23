@@ -4,8 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use agentark_adapter_codex::{
-    CodexContinuationRequest, build_canonical_continuation_source, delete_thread_with_app_server,
-    fork_rollout_with_target_provider, probe_target_default,
+    CodexContinuationRequest, build_canonical_continuation_source,
+    delete_thread_with_app_server_guarded, fork_rollout_with_target_provider_guarded,
+    probe_target_default,
 };
 use agentark_canonical::{
     CanonicalMessage, CanonicalRole, CanonicalSchemaVersion, CanonicalSession, Completeness,
@@ -47,7 +48,17 @@ fn generated_canonical_history_forks_survives_restart_and_deletes_exact_target()
         visible_history: source.visible_history.expectation(),
     };
 
-    let report = fork_rollout_with_target_provider(&executable, &codex_home, &request).unwrap();
+    // This generated-data gate isolates the App Server protocol, deadline,
+    // restart, and deletion proof. Production process guarding is exercised
+    // separately by the Task 11A process-guard suite.
+    let allow_test_owned_app_server = |_excluded_process_ids: &[u32]| Ok(());
+    let report = fork_rollout_with_target_provider_guarded(
+        &executable,
+        &codex_home,
+        &request,
+        &allow_test_owned_app_server,
+    )
+    .unwrap();
 
     assert_ne!(report.source_thread_id, report.target_thread_id);
     assert_eq!(report.model_provider, target_default.model_provider);
@@ -59,7 +70,13 @@ fn generated_canonical_history_forks_survives_restart_and_deletes_exact_target()
     );
     assert!(source_rollout.is_file());
 
-    delete_thread_with_app_server(&executable, &codex_home, &report.target_thread_id).unwrap();
+    delete_thread_with_app_server_guarded(
+        &executable,
+        &codex_home,
+        &report.target_thread_id,
+        &allow_test_owned_app_server,
+    )
+    .unwrap();
 
     assert!(source_rollout.is_file());
     assert!(!report.rollout_path.exists());

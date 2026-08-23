@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentark_adapter_codex::{
-    CodexContinuationRequest, CodexError, CodexTargetDefault, CodexTargetSessionExpectation,
-    CodexVisibleHistoryExpectation, JsonRpcTransport, NativeImportError, NativeThreadExpectation,
-    RawJsonRpc, backup_codex_targets, delete_thread_with_app_server_transport,
-    delete_thread_with_app_server_transport_guarded, ensure_codex_not_running_from_snapshot,
-    ensure_codex_not_running_from_snapshot_excluding, fork_rollout_with_target_provider_transport,
+    AGENTARK_APP_SERVER_CLIENT_VERSION, CodexContinuationRequest, CodexError, CodexTargetDefault,
+    CodexTargetSessionExpectation, CodexVisibleHistoryExpectation, JsonRpcTransport,
+    NativeImportError, NativeThreadExpectation, RawJsonRpc, backup_codex_targets,
+    delete_thread_with_app_server_transport, delete_thread_with_app_server_transport_guarded,
+    ensure_codex_not_running_from_snapshot, ensure_codex_not_running_from_snapshot_excluding,
+    fork_rollout_with_target_provider_transport,
     fork_rollout_with_target_provider_transport_guarded, probe_target_default_transport,
     verify_target_session_transport, verify_thread_listing,
     write_rollout_atomic_with_guarded_operations, write_rollout_atomic_with_operations,
@@ -23,6 +24,46 @@ struct ScriptedTransport {
     sent: Arc<Mutex<Vec<Value>>>,
     responses: VecDeque<Value>,
     mutation_events: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+enum FaultedResponse {
+    Value(Value),
+    Timeout,
+}
+
+struct FaultingTransport {
+    sent: Arc<Mutex<Vec<Value>>>,
+    responses: VecDeque<FaultedResponse>,
+}
+
+impl FaultingTransport {
+    fn new(responses: Vec<FaultedResponse>) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                sent: Arc::clone(&sent),
+                responses: responses.into(),
+            },
+            sent,
+        )
+    }
+}
+
+impl JsonRpcTransport for FaultingTransport {
+    fn send_value(&mut self, value: &Value) -> Result<(), CodexError> {
+        self.sent.lock().unwrap().push(value.clone());
+        Ok(())
+    }
+
+    fn receive_value(&mut self) -> Result<RawJsonRpc, CodexError> {
+        match self.responses.pop_front().ok_or(CodexError::EndOfStream)? {
+            FaultedResponse::Value(value) => Ok(RawJsonRpc {
+                bytes: serde_json::to_vec(&value).unwrap(),
+                value,
+            }),
+            FaultedResponse::Timeout => Err(CodexError::AppServerRequestTimeout),
+        }
+    }
 }
 
 #[test]
@@ -42,6 +83,146 @@ fn delete_thread_helper_initializes_and_deletes_exact_target() {
     assert_eq!(sent[1]["method"], "initialized");
     assert_eq!(sent[2]["method"], "thread/delete");
     assert_eq!(sent[2]["params"], json!({"threadId": "target-thread"}));
+    assert_eq!(AGENTARK_APP_SERVER_CLIENT_VERSION, "0.6.0");
+    assert_eq!(sent[0]["params"]["clientInfo"]["version"], "0.6.0");
+}
+
+#[test]
+fn read_only_timeout_is_typed_and_never_retried_or_mutated() {
+    let (mut transport, sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::Timeout,
+    ]);
+
+    let error = probe_target_default_transport(&mut transport).unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Timeout));
+    let methods = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|request| request.get("method").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(methods, ["initialize", "initialized", "config/read"]);
+}
+
+#[test]
+fn fork_timeout_after_send_is_unknown_and_never_retried() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_cwd = root.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    let (mut transport, sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::Timeout,
+    ]);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
+    };
+
+    let error = fork_rollout_with_target_provider_transport(&mut transport, root.path(), &request)
+        .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::MutationOutcomeUnknown));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request["method"] == "thread/fork")
+            .count(),
+        1
+    );
+    assert!(
+        sent.iter()
+            .all(|request| request["method"] != "thread/delete")
+    );
+}
+
+#[test]
+fn known_target_validation_timeout_is_rolled_back_after_confirmed_delete() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = root.path().join("project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(&source_rollout, b"source").unwrap();
+    fs::write(&target_rollout, b"target").unwrap();
+    let target_thread_id = "019target-thread";
+    let (_, fork_response) = continuation_responses(target_thread_id, &target_rollout, &target_cwd);
+    let (mut transport, sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::Value(fork_response),
+        FaultedResponse::Timeout,
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 4, "result": {}})),
+        FaultedResponse::Value(
+            json!({"jsonrpc": "2.0", "id": 5, "result": {"data": [], "nextCursor": null}}),
+        ),
+        FaultedResponse::Value(
+            json!({"jsonrpc": "2.0", "id": 6, "result": {"data": [], "nextCursor": null}}),
+        ),
+    ]);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019source-thread".into(),
+        target_cwd,
+        target_provider: Some("openai".into()),
+        target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: empty_history(),
+    };
+
+    let error = fork_rollout_with_target_provider_transport(&mut transport, root.path(), &request)
+        .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Timeout));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request["method"] == "thread/delete")
+            .count(),
+        1
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request["method"] == "thread/fork")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn delete_timeout_is_unknown_and_never_retried() {
+    let (mut transport, sent) = FaultingTransport::new(vec![
+        FaultedResponse::Value(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+        FaultedResponse::Timeout,
+    ]);
+
+    let error =
+        delete_thread_with_app_server_transport(&mut transport, "target-thread").unwrap_err();
+
+    assert!(matches!(error, NativeImportError::MutationOutcomeUnknown));
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request["method"] == "thread/delete")
+            .count(),
+        1
+    );
+    assert!(
+        sent.iter()
+            .all(|request| request["method"] != "thread/list")
+    );
 }
 
 #[test]
@@ -954,6 +1135,80 @@ fn process_guard_fails_closed_on_malformed_or_ambiguous_snapshot_without_leaking
         let error = ensure_codex_not_running_from_snapshot(&snapshot).unwrap_err();
         assert!(!error.to_string().contains(canary));
     }
+}
+
+#[test]
+fn process_guard_accepts_only_the_exact_system_idle_process_sentinel() {
+    for sentinel in [
+        json!({
+            "Name": "System Idle Process",
+            "ProcessId": 0,
+            "ParentProcessId": 0,
+            "CommandLine": null,
+        }),
+        json!({
+            "Name": "system idle process",
+            "ProcessId": 0,
+            "ParentProcessId": 0,
+        }),
+    ] {
+        ensure_codex_not_running_from_snapshot(&json!([sentinel]).to_string()).unwrap();
+    }
+}
+
+#[test]
+fn process_guard_rejects_system_idle_near_misses_and_other_invalid_rows() {
+    let near_misses = [
+        json!({
+            "Name": "Not System Idle Process",
+            "ProcessId": 0,
+            "ParentProcessId": 0,
+            "CommandLine": null,
+        }),
+        json!({
+            "Name": "System Idle Process",
+            "ProcessId": 0,
+            "ParentProcessId": 1,
+            "CommandLine": null,
+        }),
+        json!({
+            "Name": "System Idle Process",
+            "ProcessId": 0,
+            "ParentProcessId": 0,
+            "CommandLine": "unexpected",
+        }),
+        json!({
+            "Name": "node.exe",
+            "ProcessId": 3004,
+            "ParentProcessId": 3004,
+            "CommandLine": "node.exe safe.js",
+        }),
+    ];
+
+    for row in near_misses {
+        assert!(
+            ensure_codex_not_running_from_snapshot(&json!([row]).to_string()).is_err(),
+            "near-miss process row must fail closed"
+        );
+    }
+    let duplicate_sentinel = json!([
+        {
+            "Name": "System Idle Process",
+            "ProcessId": 0,
+            "ParentProcessId": 0,
+            "CommandLine": null,
+        },
+        {
+            "Name": "system idle process",
+            "ProcessId": 0,
+            "ParentProcessId": 0,
+            "CommandLine": null,
+        }
+    ]);
+    assert!(
+        ensure_codex_not_running_from_snapshot(&duplicate_sentinel.to_string()).is_err(),
+        "duplicate sentinel rows must fail closed"
+    );
 }
 
 #[test]

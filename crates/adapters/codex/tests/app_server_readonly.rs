@@ -1,6 +1,10 @@
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-use agentark_adapter_codex::{CodexError, JsonRpcTransport, RawJsonRpc, ReadOnlyAppServerClient};
+use agentark_adapter_codex::{
+    AGENTARK_APP_SERVER_CLIENT_VERSION, CodexError, JsonRpcTransport, RawJsonRpc,
+    ReadOnlyAppServerClient,
+};
 use serde_json::{Value, json};
 
 struct ScriptedTransport {
@@ -27,6 +31,31 @@ impl JsonRpcTransport for ScriptedTransport {
         let bytes = self.incoming.pop_front().ok_or(CodexError::EndOfStream)?;
         let value = serde_json::from_slice(&bytes).map_err(|_| CodexError::MalformedJson)?;
         Ok(RawJsonRpc { bytes, value })
+    }
+}
+
+struct NotificationTransport {
+    sent: Vec<Value>,
+    notifications: usize,
+}
+
+impl JsonRpcTransport for NotificationTransport {
+    fn send_value(&mut self, value: &Value) -> Result<(), CodexError> {
+        self.sent.push(value.clone());
+        Ok(())
+    }
+
+    fn receive_value(&mut self) -> Result<RawJsonRpc, CodexError> {
+        self.notifications += 1;
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "thread/status/changed",
+            "params": {"sequence": self.notifications}
+        });
+        Ok(RawJsonRpc {
+            bytes: serde_json::to_vec(&value).unwrap(),
+            value,
+        })
     }
 }
 
@@ -94,4 +123,29 @@ fn client_uses_only_read_methods_and_preserves_raw_responses() {
     assert_eq!(list_params["limit"], json!(100));
     assert_eq!(list_params["sortKey"], json!("created_at"));
     assert_eq!(list_params["sortDirection"], json!("asc"));
+    assert_eq!(AGENTARK_APP_SERVER_CLIENT_VERSION, "0.6.0");
+    assert_eq!(
+        transport.sent[0]["params"]["clientInfo"]["version"],
+        "0.6.0"
+    );
+}
+
+#[test]
+fn notifications_cannot_extend_the_original_request_deadline() {
+    let mut transport = NotificationTransport {
+        sent: Vec::new(),
+        notifications: 0,
+    };
+    let started = Instant::now();
+    let mut client =
+        ReadOnlyAppServerClient::with_request_timeout(&mut transport, Duration::from_millis(25));
+
+    let error = client.initialize().unwrap_err();
+
+    assert!(matches!(error, CodexError::AppServerRequestTimeout));
+    assert!(started.elapsed() >= Duration::from_millis(10));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(transport.notifications > 1);
+    assert_eq!(transport.sent.len(), 1);
+    assert_eq!(transport.sent[0]["method"], "initialize");
 }

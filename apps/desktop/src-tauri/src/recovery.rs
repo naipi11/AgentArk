@@ -872,9 +872,12 @@ fn map_native_import_error(error: NativeImportError) -> RecoveryError {
         NativeImportError::Io(_)
         | NativeImportError::Json(_)
         | NativeImportError::UnsupportedVersion
-        | NativeImportError::CodexRunning => RecoveryError::Unavailable,
+        | NativeImportError::CodexRunning
+        | NativeImportError::Timeout => RecoveryError::Unavailable,
         NativeImportError::Rollback => RecoveryError::ManualIntervention,
-        NativeImportError::ManualIntervention => RecoveryError::ManualIntervention,
+        NativeImportError::ManualIntervention | NativeImportError::MutationOutcomeUnknown => {
+            RecoveryError::ManualIntervention
+        }
     }
 }
 
@@ -891,6 +894,18 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn app_server_timeout_mapping_distinguishes_unavailable_reads_from_unknown_mutations() {
+        assert_eq!(
+            map_native_import_error(NativeImportError::Timeout),
+            RecoveryError::Unavailable
+        );
+        assert_eq!(
+            map_native_import_error(NativeImportError::MutationOutcomeUnknown),
+            RecoveryError::ManualIntervention
+        );
+    }
 
     struct TempRoot(PathBuf);
 
