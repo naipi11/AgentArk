@@ -28,8 +28,10 @@ if ($networkScript -match 'unshare\s+--user\s+--map-root-user') {
 foreach ($fragment in @(
   'CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"',
   'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"',
-  'CARGO_BIN="$CARGO_HOME/bin/cargo"',
-  'PATH="$CARGO_HOME/bin:$PATH"',
+  'RUSTUP_BIN="$CARGO_HOME/bin/rustup"',
+  'CARGO_BIN="$("$RUSTUP_BIN" which cargo)"',
+  'TOOLCHAIN_BIN="$(dirname "$CARGO_BIN")"',
+  'PATH="$TOOLCHAIN_BIN:$CARGO_HOME/bin:$PATH"',
   '"$CARGO_BIN" test'
 )) {
   if (-not $networkScript.Contains($fragment)) {
