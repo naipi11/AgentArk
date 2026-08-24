@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
@@ -37,6 +38,10 @@ use agentark_security::{
 };
 use agentark_watch::{
     ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
+};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
 };
 use directories::ProjectDirs;
 use serde::Serialize;
@@ -1461,50 +1466,168 @@ fn safe_provider_labels<'a>(
 }
 
 fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
+    restore_project_files_guarded(root, entries, &|| Ok(()))
+}
+
+fn restore_project_files_guarded<G>(
+    root: &Path,
+    entries: &[WorkspaceFileEntry],
+    guard: &G,
+) -> Result<(), String>
+where
+    G: Fn() -> Result<(), String> + ?Sized,
+{
+    let root_dir = project_restore_dir(root)?;
     for entry in entries {
-        let destination = safe_project_destination(root, entry.workspace_id, &entry.relative_path)?;
-        if let Ok(metadata) = fs::symlink_metadata(&destination) {
-            if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
-                return Err("项目恢复路径无效".into());
+        validate_project_relative_path(&entry.relative_path)?;
+        let relative_path =
+            PathBuf::from(entry.workspace_id.to_string()).join(&entry.relative_path);
+        let parent = relative_path
+            .parent()
+            .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+        ensure_safe_project_relative_directory(&root_dir, parent)?;
+        match root_dir.symlink_metadata(&relative_path) {
+            Ok(metadata) => {
+                if is_cap_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                    return Err("项目恢复路径无效".into());
+                }
+                let mut existing_file = root_dir
+                    .open(&relative_path)
+                    .map_err(|_| "无法读取恢复项目文件".to_owned())?;
+                let mut existing = Vec::new();
+                existing_file
+                    .read_to_end(&mut existing)
+                    .map_err(|_| "无法读取恢复项目文件".to_owned())?;
+                if agentark_canonical::Sha256Digest::from_bytes(&existing)
+                    != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
+                {
+                    return Err(format!("项目文件冲突：{}", entry.relative_path));
+                }
+                continue;
             }
-            let existing = fs::read(&destination).map_err(|_| "无法读取恢复项目文件".to_owned())?;
-            if agentark_canonical::Sha256Digest::from_bytes(&existing)
-                != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
-            {
-                return Err(format!("项目文件冲突：{}", entry.relative_path));
-            }
-            continue;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("项目恢复路径无效".into()),
         }
-        let temporary = destination.with_extension(format!("{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, &entry.bytes).map_err(|_| "无法写入恢复项目文件".to_owned())?;
-        fs::rename(&temporary, &destination).map_err(|_| "无法提交恢复项目文件".to_owned())?;
+        guard()?;
+        match root_dir.symlink_metadata(&relative_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
+            Err(_) => return Err("项目恢复路径无效".into()),
+        }
+        let temporary = parent.join(format!(
+            ".{}.{}.tmp",
+            relative_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "项目恢复路径无效".to_owned())?,
+            Uuid::new_v4()
+        ));
+        let write_result = (|| {
+            let mut options = CapOpenOptions::new();
+            options.create_new(true).write(true);
+            let mut temporary_file = root_dir
+                .open_with(&temporary, &options)
+                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+            temporary_file
+                .write_all(&entry.bytes)
+                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+            temporary_file
+                .sync_all()
+                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+            drop(temporary_file);
+            guard()?;
+            match root_dir.symlink_metadata(&relative_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
+                Err(_) => return Err("项目恢复路径无效".into()),
+            }
+            root_dir
+                .rename(&temporary, &root_dir, &relative_path)
+                .map_err(|_| "无法提交恢复项目文件".to_owned())
+        })();
+        if write_result.is_err() {
+            let _ = root_dir.remove_file(&temporary);
+        }
+        write_result?;
     }
     Ok(())
 }
 
-fn safe_project_destination(
-    root: &Path,
-    workspace_id: Uuid,
-    relative: &str,
-) -> Result<PathBuf, String> {
-    validate_project_relative_path(relative)?;
-    ensure_safe_project_directory(root)?;
-    let mut current = root.join(workspace_id.to_string());
-    ensure_safe_project_directory(&current)?;
-    for segment in relative
-        .split('/')
-        .take(relative.split('/').count().saturating_sub(1))
-    {
-        current.push(segment);
-        ensure_safe_project_directory(&current)?;
-    }
-    let destination = root.join(workspace_id.to_string()).join(relative);
-    if let Ok(metadata) = fs::symlink_metadata(&destination)
-        && (is_link_or_reparse_point(&metadata) || !metadata.is_file())
-    {
+fn project_restore_dir(root: &Path) -> Result<Dir, String> {
+    let mut missing_segments = Vec::new();
+    let mut anchor = root;
+    let anchor_metadata = loop {
+        match fs::symlink_metadata(anchor) {
+            Ok(metadata) => break metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let segment = anchor
+                    .file_name()
+                    .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+                missing_segments.push(segment.to_owned());
+                anchor = anchor
+                    .parent()
+                    .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+            }
+            Err(_) => return Err("项目恢复路径无效".into()),
+        }
+    };
+    if is_link_or_reparse_point(&anchor_metadata) || !anchor_metadata.is_dir() {
         return Err("项目恢复路径无效".into());
     }
-    Ok(destination)
+    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())
+        .map_err(|_| "项目恢复路径无效".to_owned())?;
+    for segment in missing_segments.iter().rev() {
+        let segment = Path::new(segment);
+        match directory.symlink_metadata(segment) {
+            Ok(metadata) => {
+                if is_cap_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                    return Err("项目恢复路径无效".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(segment) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err("无法创建恢复项目目录".into()),
+                }
+                let metadata = directory
+                    .symlink_metadata(segment)
+                    .map_err(|_| "项目恢复路径无效".to_owned())?;
+                if is_cap_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                    return Err("项目恢复路径无效".into());
+                }
+            }
+            Err(_) => return Err("项目恢复路径无效".into()),
+        }
+        directory = directory
+            .open_dir(segment)
+            .map_err(|_| "项目恢复路径无效".to_owned())?;
+    }
+    Ok(directory)
+}
+
+fn ensure_safe_project_relative_directory(dir: &Dir, path: &Path) -> Result<(), String> {
+    match dir.symlink_metadata(path) {
+        Ok(metadata) => {
+            if is_cap_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err("项目恢复路径无效".into());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            if !parent.as_os_str().is_empty() {
+                ensure_safe_project_relative_directory(dir, parent)?;
+            }
+            match dir.create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err("无法创建恢复项目目录".into()),
+            }
+            ensure_safe_project_relative_directory(dir, path)
+        }
+        Err(_) => Err("项目恢复路径无效".into()),
+    }
 }
 
 fn validate_project_relative_path(relative: &str) -> Result<(), String> {
@@ -1521,38 +1644,27 @@ fn validate_project_relative_path(relative: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_safe_project_directory(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
-                return Err("项目恢复路径无效".into());
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or_else(|| "项目恢复路径无效".to_owned())?;
-            let parent_metadata =
-                fs::symlink_metadata(parent).map_err(|_| "项目恢复路径无效".to_owned())?;
-            if is_link_or_reparse_point(&parent_metadata) || !parent_metadata.is_dir() {
-                return Err("项目恢复路径无效".into());
-            }
-            match fs::create_dir(path) {
-                Ok(()) => {}
-                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return Err("无法创建恢复项目目录".into()),
-            }
-            ensure_safe_project_directory(path)
-        }
-        Err(_) => Err("项目恢复路径无效".into()),
-    }
-}
-
 fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
     #[cfg(windows)]
     {
+        metadata.file_attributes() & 0x0000_0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn is_cap_link_or_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
         metadata.file_attributes() & 0x0000_0400 != 0
     }
     #[cfg(not(windows))]
@@ -1726,6 +1838,7 @@ mod restore_lock_tests {
 mod project_restore_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(windows)]
     use std::process::Command;
@@ -1733,7 +1846,7 @@ mod project_restore_tests {
     use agentark_bundle::WorkspaceFileEntry;
     use uuid::Uuid;
 
-    use super::restore_project_files;
+    use super::{restore_project_files, restore_project_files_guarded};
 
     struct TempRoot(PathBuf);
 
@@ -1787,5 +1900,31 @@ mod project_restore_tests {
 
         assert!(result.is_err());
         assert!(!outside.0.join("src").join("main.rs").exists());
+    }
+
+    #[test]
+    fn project_restore_never_writes_outside_when_workspace_is_replaced_before_write() {
+        let root = TempRoot::new("project-restore-race-root");
+        let outside = TempRoot::new("project-restore-race-outside");
+        let workspace_id = Uuid::from_u128(98);
+        let workspace = root.0.join(workspace_id.to_string());
+        let parked_workspace = root.0.join("parked-workspace");
+        let entries = [WorkspaceFileEntry {
+            workspace_id,
+            relative_path: "src/main.rs".into(),
+            bytes: b"restored project content".to_vec(),
+        }];
+        let guard_calls = AtomicUsize::new(0);
+
+        let result = restore_project_files_guarded(&root.0, &entries, &|| {
+            if guard_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::rename(&workspace, &parked_workspace).unwrap();
+                link_directory(&workspace, &outside.0);
+            }
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert!(!outside.0.join("src").exists());
     }
 }

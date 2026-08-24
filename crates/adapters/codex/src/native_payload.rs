@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
@@ -7,7 +9,11 @@ use std::os::windows::fs::MetadataExt;
 use agentark_canonical::{
     CanonicalRole, CanonicalSession, ContentPartKind, Sha256Digest, canonical_hash,
 };
-use agentark_security::SecretScanner;
+use agentark_security::{AuthorizedRoot, SecretScanner};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -244,16 +250,24 @@ pub fn collect_native_rollouts(
     if !sessions_root.is_dir() {
         return Ok(Vec::new());
     }
+    let authorized =
+        AuthorizedRoot::new(sessions_root.clone()).map_err(|_| NativePayloadError::InvalidPath)?;
     let mut files = Vec::new();
     collect_files(&sessions_root, &mut files)?;
     let mut payloads = Vec::new();
     for session in sessions {
-        let Some((path, bytes)) = files.iter().find_map(|path| {
-            let name = path.file_name()?.to_string_lossy();
+        let mut matched = None;
+        for path in &files {
+            let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+                continue;
+            };
             if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                return None;
+                continue;
             }
-            let bytes = fs::read(path).ok()?;
+            let relative = path
+                .strip_prefix(&sessions_root)
+                .map_err(|_| NativePayloadError::InvalidPath)?;
+            let bytes = read_authorized_native_file(&authorized, relative)?;
             let matches_id = name.contains(&session.source_session_id)
                 || bytes.split(|byte| *byte == b'\n').any(|line| {
                     serde_json::from_slice::<Value>(line)
@@ -267,8 +281,12 @@ pub fn collect_native_rollouts(
                         })
                         .unwrap_or(false)
                 });
-            matches_id.then_some((path.clone(), bytes))
-        }) else {
+            if matches_id {
+                matched = Some((path.clone(), bytes));
+                break;
+            }
+        }
+        let Some((path, bytes)) = matched else {
             continue;
         };
         let relative = path
@@ -287,6 +305,21 @@ pub fn collect_native_rollouts(
         });
     }
     Ok(payloads)
+}
+
+fn read_authorized_native_file(
+    authorized: &AuthorizedRoot,
+    relative: &Path,
+) -> Result<Vec<u8>, NativePayloadError> {
+    let mut file = authorized
+        .open_regular_file(relative)
+        .map_err(|_| NativePayloadError::InvalidPath)?;
+    if has_multiple_hard_links(&file)? {
+        return Err(NativePayloadError::InvalidPath);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 pub fn sanitize_rollout_bytes(
@@ -504,7 +537,7 @@ where
             if prepared != destination || prepared.exists() {
                 return Err(NativePayloadError::Conflict);
             }
-            crate::write_rollout_atomic_guarded(&destination, std::slice::from_ref(&bytes), guard)?;
+            write_native_rollout_atomic_guarded(codex_home, &payload.relative_path, &bytes, guard)?;
             written.push(destination.clone());
             let thread_id = extract_thread_id(&bytes)?;
             mappings.push((payload.session_id.to_string(), thread_id));
@@ -528,8 +561,19 @@ where
                 cleanup_failed = true;
                 continue;
             }
-            if let Err(remove_error) = fs::remove_file(path)
-                && remove_error.kind() != std::io::ErrorKind::NotFound
+            let relative = path
+                .strip_prefix(&sessions_root)
+                .ok()
+                .and_then(|relative| relative.to_str());
+            let remove_result = relative
+                .ok_or(NativePayloadError::InvalidPath)
+                .and_then(|relative| remove_native_rollout(codex_home, relative));
+            if let Err(remove_error) = remove_result
+                && !matches!(
+                    remove_error,
+                    NativePayloadError::Io(ref error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                )
             {
                 cleanup_failed = true;
             }
@@ -551,6 +595,89 @@ where
         written_paths: written,
         restart_required: imported_count > 0,
     })
+}
+
+fn native_sessions_dir(codex_home: &Path) -> Result<Dir, NativePayloadError> {
+    let sessions_root = codex_home.join("sessions");
+    let metadata = fs::symlink_metadata(&sessions_root)?;
+    if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err(NativePayloadError::InvalidPath);
+    }
+    Dir::open_ambient_dir(&sessions_root, ambient_authority()).map_err(NativePayloadError::from)
+}
+
+fn write_native_rollout_atomic_guarded<G>(
+    codex_home: &Path,
+    relative: &str,
+    bytes: &[u8],
+    guard: &G,
+) -> Result<Sha256Digest, NativePayloadError>
+where
+    G: Fn() -> Result<(), crate::NativeImportError> + ?Sized,
+{
+    let dir = native_sessions_dir(codex_home)?;
+    let relative_path = Path::new(relative);
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    guard()?;
+    if !parent.as_os_str().is_empty() {
+        dir.create_dir_all(parent)?;
+    }
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        relative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(NativePayloadError::InvalidPath)?,
+        Uuid::new_v4()
+    ));
+    let mut temporary_created = false;
+    let mut renamed = false;
+    let result = (|| {
+        let mut options = CapOpenOptions::new();
+        options.create_new(true).write(true);
+        let mut file = dir.open_with(&temporary, &options)?;
+        temporary_created = true;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        guard()?;
+        dir.rename(&temporary, &dir, relative_path)?;
+        renamed = true;
+        let mut committed = dir.open(relative_path)?;
+        let mut committed_bytes = Vec::new();
+        committed.read_to_end(&mut committed_bytes)?;
+        Ok(Sha256Digest::from_bytes(&committed_bytes))
+    })();
+    if result.is_err() {
+        let cleanup_path = if renamed {
+            Some(relative_path)
+        } else if temporary_created {
+            Some(temporary.as_path())
+        } else {
+            None
+        };
+        if let Some(cleanup_path) = cleanup_path {
+            if guard().is_err() {
+                return Err(NativePayloadError::NativeImport(
+                    crate::NativeImportError::ManualIntervention,
+                ));
+            }
+            if let Err(error) = dir.remove_file(cleanup_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(NativePayloadError::NativeImport(
+                    crate::NativeImportError::ManualIntervention,
+                ));
+            }
+        }
+    }
+    result
+}
+
+fn remove_native_rollout(codex_home: &Path, relative: &str) -> Result<(), NativePayloadError> {
+    native_sessions_dir(codex_home)?
+        .remove_file(Path::new(relative))
+        .map_err(NativePayloadError::from)
 }
 
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), NativePayloadError> {
@@ -738,5 +865,17 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+fn has_multiple_hard_links(file: &cap_std::fs::File) -> Result<bool, NativePayloadError> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        Ok(file.metadata()?.nlink() > 1)
+    }
+    #[cfg(windows)]
+    {
+        Ok(winx::winapi_util::file::information(file)?.number_of_links() > 1)
     }
 }

@@ -28,6 +28,9 @@ if ($release -notmatch "! -name 'SHA256SUMS'") {
 if ($release -notmatch 'basename "\$file"') {
   throw 'release checksum generation must use the published asset basename'
 }
+if ($release -match '(?m)^\s+target/release/agentark(?:\.exe)?\s*$') {
+  throw 'release workflow must not upload same-named cross-platform CLI binaries'
+}
 if ($workflow -match 'ci/enforce-search-benchmark\.ps1') {
   throw 'the full 100k search benchmark must not run in every PR matrix job'
 }

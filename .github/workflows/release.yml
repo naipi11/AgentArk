@@ -53,8 +53,6 @@ jobs:
           name: agentark-${{ matrix.artifact }}
           path: |
             target/release/bundle/**
-            target/release/agentark.exe
-            target/release/agentark
           if-no-files-found: error
 
   publish:

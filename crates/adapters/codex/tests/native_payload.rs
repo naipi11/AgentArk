@@ -441,6 +441,41 @@ fn native_rollout_export_rejects_linked_session_subtree() {
 }
 
 #[test]
+fn native_rollout_export_rejects_hard_linked_rollout_file() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let sessions = root
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("08")
+        .join("23");
+    fs::create_dir_all(&sessions).unwrap();
+    let outside_rollout = outside
+        .path()
+        .join("rollout-2026-08-23T00-00-00-source-session-201.jsonl");
+    fs::write(
+        &outside_rollout,
+        br#"{"type":"session_meta","payload":{"session_id":"source-session-201","cwd":"C:\\source\\project"}}
+"#,
+    )
+    .unwrap();
+    fs::hard_link(
+        &outside_rollout,
+        sessions.join("rollout-2026-08-23T00-00-00-source-session-201.jsonl"),
+    )
+    .unwrap();
+
+    let result = collect_native_rollouts(
+        root.path(),
+        &[fixture_session()],
+        &SecretScanner::v1().unwrap(),
+    );
+
+    assert!(matches!(result, Err(NativePayloadError::InvalidPath)));
+}
+
+#[test]
 fn native_rollout_restore_rejects_linked_target_subtree() {
     let root = tempdir().unwrap();
     let outside = tempdir().unwrap();
@@ -462,6 +497,51 @@ fn native_rollout_restore_rejects_linked_target_subtree() {
         restore_native_rollouts(&codex_home, &[payload], &[], &root.path().join("backups"));
 
     assert!(matches!(result, Err(NativePayloadError::InvalidPath)));
+    assert!(
+        !outside
+            .path()
+            .join("08")
+            .join("23")
+            .join("rollout-native.jsonl")
+            .exists()
+    );
+}
+
+#[test]
+fn native_rollout_restore_never_writes_outside_when_target_subtree_is_replaced_before_write() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let codex_home = root.path().join("codex");
+    let sessions = codex_home.join("sessions");
+    let target_subtree = sessions.join("2026");
+    let parked_subtree = sessions.join("parked-2026");
+    fs::create_dir_all(&sessions).unwrap();
+    let payload = NativeRolloutPayload {
+        session_id: Uuid::from_u128(207),
+        relative_path: "2026/08/23/rollout-native.jsonl".into(),
+        bytes: br#"{"type":"session_meta","payload":{"session_id":"native-thread","cwd":"C:\\source\\project"}}
+"#
+        .to_vec(),
+        source_hash: Sha256Digest::from_bytes(b"source"),
+        redaction_count: 0,
+    };
+    let checks = AtomicUsize::new(0);
+
+    let result = restore_native_rollouts_guarded(
+        &codex_home,
+        &[payload],
+        &[],
+        &root.path().join("backups"),
+        &|| {
+            if checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                fs::rename(&target_subtree, &parked_subtree).unwrap();
+                link_directory(&target_subtree, outside.path());
+            }
+            Ok(())
+        },
+    );
+
+    assert!(result.is_err());
     assert!(
         !outside
             .path()
