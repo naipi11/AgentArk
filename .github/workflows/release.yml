@@ -52,7 +52,7 @@ jobs:
             target/release/bundle/**
             target/release/agentark.exe
             target/release/agentark
-          if-no-files-found: warn
+          if-no-files-found: error
 
   publish:
     if: startsWith(github.ref, 'refs/tags/')

@@ -19,6 +19,9 @@ if ($release -notmatch '(?m)^\s+target/release/bundle/\*\*$') {
 if ($release -match 'apps/desktop/src-tauri/target/release/bundle') {
   throw 'release workflow must not upload the obsolete per-package Tauri target directory'
 }
+if ($release -notmatch 'if-no-files-found:\s*error') {
+  throw 'release workflow must fail if a platform does not produce publishable artifacts'
+}
 
 $networkScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'network-silence.sh')
 if ($networkScript -notmatch 'sudo\s+unshare\s+--net') {
