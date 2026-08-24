@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
 use agentark_canonical::{
     CanonicalRole, CanonicalSession, ContentPartKind, Sha256Digest, canonical_hash,
 };
@@ -459,10 +462,12 @@ where
     let mut planned = Vec::new();
     let mut skipped_count = 0u64;
     for payload in payloads {
-        validate_relative_path(&payload.relative_path)?;
-        let destination = codex_home.join("sessions").join(&payload.relative_path);
+        let destination = safe_native_destination(codex_home, &payload.relative_path, false)?;
         let bytes = rewrite_native_workspace_paths(&payload.bytes, workspace_mappings)?;
-        if destination.is_file() {
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(NativePayloadError::InvalidPath);
+            }
             if fs::read(&destination)? == bytes {
                 skipped_count += 1;
                 continue;
@@ -495,6 +500,10 @@ where
     let mut mappings = Vec::new();
     let result = (|| {
         for (payload, destination, bytes) in planned {
+            let prepared = safe_native_destination(codex_home, &payload.relative_path, true)?;
+            if prepared != destination || prepared.exists() {
+                return Err(NativePayloadError::Conflict);
+            }
             crate::write_rollout_atomic_guarded(&destination, std::slice::from_ref(&bytes), guard)?;
             written.push(destination.clone());
             let thread_id = extract_thread_id(&bytes)?;
@@ -504,8 +513,18 @@ where
     })();
     if let Err(error) = result {
         let mut cleanup_failed = false;
+        let sessions_root = codex_home.join("sessions");
         for path in &written {
             if guard().is_err() {
+                cleanup_failed = true;
+                continue;
+            }
+            let safe_path = path
+                .strip_prefix(&sessions_root)
+                .ok()
+                .and_then(|relative| relative.to_str())
+                .and_then(|relative| safe_native_destination(codex_home, relative, false).ok());
+            if safe_path.as_deref() != Some(path.as_path()) {
                 cleanup_failed = true;
                 continue;
             }
@@ -535,12 +554,20 @@ where
 }
 
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), NativePayloadError> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if is_link_or_reparse_point(&root_metadata) || !root_metadata.is_dir() {
+        return Err(NativePayloadError::InvalidPath);
+    }
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if is_link_or_reparse_point(&metadata) {
+            return Err(NativePayloadError::InvalidPath);
+        }
+        if metadata.is_dir() {
             collect_files(&path, output)?;
-        } else if path.is_file() {
+        } else if metadata.is_file() {
             output.push(path);
         }
     }
@@ -641,4 +668,75 @@ fn validate_relative_path(relative: &str) -> Result<(), NativePayloadError> {
         return Err(NativePayloadError::InvalidPath);
     }
     Ok(())
+}
+
+fn safe_native_destination(
+    codex_home: &Path,
+    relative: &str,
+    create_missing_directories: bool,
+) -> Result<PathBuf, NativePayloadError> {
+    validate_relative_path(relative)?;
+    if !ensure_safe_directory(codex_home, create_missing_directories)? {
+        return Ok(codex_home.join("sessions").join(relative));
+    }
+
+    let mut current = codex_home.to_path_buf();
+    let segments = std::iter::once("sessions").chain(
+        relative
+            .split('/')
+            .take(relative.split('/').count().saturating_sub(1)),
+    );
+    for segment in segments {
+        current.push(segment);
+        if !ensure_safe_directory(&current, create_missing_directories)? {
+            break;
+        }
+    }
+
+    let destination = codex_home.join("sessions").join(relative);
+    if let Ok(metadata) = fs::symlink_metadata(&destination)
+        && (is_link_or_reparse_point(&metadata) || !metadata.is_file())
+    {
+        return Err(NativePayloadError::InvalidPath);
+    }
+    Ok(destination)
+}
+
+fn ensure_safe_directory(path: &Path, create_missing: bool) -> Result<bool, NativePayloadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err(NativePayloadError::InvalidPath);
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create_missing => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or(NativePayloadError::InvalidPath)?;
+            if !ensure_safe_directory(parent, false)? {
+                return Err(NativePayloadError::InvalidPath);
+            }
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(create_error) => return Err(create_error.into()),
+            }
+            ensure_safe_directory(path, false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        metadata.file_attributes() & 0x0000_0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }

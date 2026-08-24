@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
 use agentark_adapter_claude::ClaudeCodeAdapter;
 use agentark_adapter_codex::{CodexAdapter, NativeRolloutPayload};
 use agentark_adapter_grok::GrokBuildAdapter;
@@ -1459,10 +1462,12 @@ fn safe_provider_labels<'a>(
 
 fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
     for entry in entries {
-        let destination = root
-            .join(entry.workspace_id.to_string())
-            .join(&entry.relative_path);
-        if let Ok(existing) = fs::read(&destination) {
+        let destination = safe_project_destination(root, entry.workspace_id, &entry.relative_path)?;
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err("项目恢复路径无效".into());
+            }
+            let existing = fs::read(&destination).map_err(|_| "无法读取恢复项目文件".to_owned())?;
             if agentark_canonical::Sha256Digest::from_bytes(&existing)
                 != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
             {
@@ -1470,14 +1475,90 @@ fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<
             }
             continue;
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|_| "无法创建恢复项目目录".to_owned())?;
-        }
         let temporary = destination.with_extension(format!("{}.tmp", Uuid::new_v4()));
         fs::write(&temporary, &entry.bytes).map_err(|_| "无法写入恢复项目文件".to_owned())?;
         fs::rename(&temporary, &destination).map_err(|_| "无法提交恢复项目文件".to_owned())?;
     }
     Ok(())
+}
+
+fn safe_project_destination(
+    root: &Path,
+    workspace_id: Uuid,
+    relative: &str,
+) -> Result<PathBuf, String> {
+    validate_project_relative_path(relative)?;
+    ensure_safe_project_directory(root)?;
+    let mut current = root.join(workspace_id.to_string());
+    ensure_safe_project_directory(&current)?;
+    for segment in relative
+        .split('/')
+        .take(relative.split('/').count().saturating_sub(1))
+    {
+        current.push(segment);
+        ensure_safe_project_directory(&current)?;
+    }
+    let destination = root.join(workspace_id.to_string()).join(relative);
+    if let Ok(metadata) = fs::symlink_metadata(&destination)
+        && (is_link_or_reparse_point(&metadata) || !metadata.is_file())
+    {
+        return Err("项目恢复路径无效".into());
+    }
+    Ok(destination)
+}
+
+fn validate_project_relative_path(relative: &str) -> Result<(), String> {
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative.contains('\0')
+        || Path::new(relative).is_absolute()
+        || relative
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err("项目恢复路径无效".into());
+    }
+    Ok(())
+}
+
+fn ensure_safe_project_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err("项目恢复路径无效".into());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| "项目恢复路径无效".to_owned())?;
+            let parent_metadata =
+                fs::symlink_metadata(parent).map_err(|_| "项目恢复路径无效".to_owned())?;
+            if is_link_or_reparse_point(&parent_metadata) || !parent_metadata.is_dir() {
+                return Err("项目恢复路径无效".into());
+            }
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err("无法创建恢复项目目录".into()),
+            }
+            ensure_safe_project_directory(path)
+        }
+        Err(_) => Err("项目恢复路径无效".into()),
+    }
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        metadata.file_attributes() & 0x0000_0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 pub fn detected_codex_home() -> Option<PathBuf> {
@@ -1638,5 +1719,73 @@ mod restore_lock_tests {
             acquire_restore_lock(&lock).err().as_deref(),
             Some("恢复操作锁不可用")
         );
+    }
+}
+
+#[cfg(test)]
+mod project_restore_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(windows)]
+    use std::process::Command;
+
+    use agentark_bundle::WorkspaceFileEntry;
+    use uuid::Uuid;
+
+    use super::restore_project_files;
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("agentark-{label}-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn link_directory(link: &Path, target: &Path) {
+        let status = Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_string_lossy().as_ref(),
+                target.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    fn link_directory(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn project_restore_rejects_linked_workspace_destination() {
+        let root = TempRoot::new("project-restore-root");
+        let outside = TempRoot::new("project-restore-outside");
+        let workspace_id = Uuid::from_u128(97);
+        link_directory(&root.0.join(workspace_id.to_string()), &outside.0);
+        let entries = [WorkspaceFileEntry {
+            workspace_id,
+            relative_path: "src/main.rs".into(),
+            bytes: b"restored project content".to_vec(),
+        }];
+
+        let result = restore_project_files(&root.0, &entries);
+
+        assert!(result.is_err());
+        assert!(!outside.0.join("src").join("main.rs").exists());
     }
 }

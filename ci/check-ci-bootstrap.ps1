@@ -22,6 +22,12 @@ if ($release -match 'apps/desktop/src-tauri/target/release/bundle') {
 if ($release -notmatch 'if-no-files-found:\s*error') {
   throw 'release workflow must fail if a platform does not produce publishable artifacts'
 }
+if ($release -notmatch "! -name 'SHA256SUMS'") {
+  throw 'release checksum generation must exclude the manifest itself'
+}
+if ($release -notmatch 'basename "\$file"') {
+  throw 'release checksum generation must use the published asset basename'
+}
 if ($workflow -match 'ci/enforce-search-benchmark\.ps1') {
   throw 'the full 100k search benchmark must not run in every PR matrix job'
 }

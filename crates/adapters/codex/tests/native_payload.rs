@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(windows)]
+use std::process::Command;
+
 use agentark_adapter_codex::{
     NativeImportError, NativePayloadError, NativeRolloutPayload,
     build_canonical_continuation_source, canonical_visible_history, collect_native_rollouts,
@@ -17,6 +20,26 @@ use agentark_security::SecretScanner;
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
+
+#[cfg(windows)]
+fn link_directory(link: &Path, target: &Path) {
+    let status = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            link.to_string_lossy().as_ref(),
+            target.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+fn link_directory(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
 
 fn fixture_session() -> CanonicalSession {
     CanonicalSession {
@@ -392,6 +415,61 @@ fn restores_native_rollout_to_codex_home_with_mapping() {
     assert!(text.contains(r#""cwd":"C:\\target\\project""#));
     assert!(report.backup_path.is_some());
     assert_eq!(report.written_paths.len(), 1);
+}
+
+#[test]
+fn native_rollout_export_rejects_linked_session_subtree() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    link_directory(&sessions.join("linked"), outside.path());
+    fs::write(
+        outside.path().join("rollout-source-session-201.jsonl"),
+        br#"{"type":"session_meta","payload":{"id":"source-session-201"}}
+"#,
+    )
+    .unwrap();
+
+    let result = collect_native_rollouts(
+        root.path(),
+        &[fixture_session()],
+        &SecretScanner::v1().unwrap(),
+    );
+
+    assert!(matches!(result, Err(NativePayloadError::InvalidPath)));
+}
+
+#[test]
+fn native_rollout_restore_rejects_linked_target_subtree() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let codex_home = root.path().join("codex");
+    let sessions = codex_home.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    link_directory(&sessions.join("2026"), outside.path());
+    let payload = NativeRolloutPayload {
+        session_id: Uuid::from_u128(206),
+        relative_path: "2026/08/23/rollout-native.jsonl".into(),
+        bytes: br#"{"type":"session_meta","payload":{"session_id":"native-thread","cwd":"C:\\source\\project"}}
+"#
+        .to_vec(),
+        source_hash: Sha256Digest::from_bytes(b"source"),
+        redaction_count: 0,
+    };
+
+    let result =
+        restore_native_rollouts(&codex_home, &[payload], &[], &root.path().join("backups"));
+
+    assert!(matches!(result, Err(NativePayloadError::InvalidPath)));
+    assert!(
+        !outside
+            .path()
+            .join("08")
+            .join("23")
+            .join("rollout-native.jsonl")
+            .exists()
+    );
 }
 
 #[test]
