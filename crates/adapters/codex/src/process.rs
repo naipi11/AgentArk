@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::{CodexError, JsonRpcTransport, MAX_JSON_LINE, RawJsonRpc};
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(windows)]
 const OWNED_TREE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);

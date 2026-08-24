@@ -25,4 +25,21 @@ if ($networkScript -match 'unshare\s+--user\s+--map-root-user') {
   throw 'network-silence must not depend on unprivileged user namespaces on hosted runners'
 }
 
+foreach ($fragment in @(
+  'CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"',
+  'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"',
+  'CARGO_BIN="$CARGO_HOME/bin/cargo"',
+  'PATH="$CARGO_HOME/bin:$PATH"',
+  '"$CARGO_BIN" test'
+)) {
+  if (-not $networkScript.Contains($fragment)) {
+    throw "network-silence must carry the Rust runtime into the privileged namespace (missing: $fragment)"
+  }
+}
+
+$processSource = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\crates\adapters\codex\src\process.rs')
+if ($processSource -notmatch '(?ms)#\[cfg\(windows\)\]\s*const OWNED_TREE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs\(2\);') {
+  throw 'the owned Windows process-tree timeout must be compiled only on Windows'
+}
+
 Write-Output 'CI bootstrap and network-silence configuration is valid.'

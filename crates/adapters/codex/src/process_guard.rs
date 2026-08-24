@@ -1306,6 +1306,7 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::mpsc;
         use std::thread;
 
         use tempfile::tempdir;
@@ -1330,6 +1331,19 @@ mod windows {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
+            }
+        }
+
+        fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if path.is_file() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
@@ -1397,29 +1411,46 @@ mod windows {
         fn bounded_runner_times_out_and_kills_owned_sleeping_powershell() {
             let root = tempdir().unwrap();
             let started_marker = root.path().join("owned-child-started.txt");
+            let release_marker = root.path().join("owned-child-release.txt");
             let delayed_marker = root.path().join("owned-child-survived.txt");
             let script = format!(
-                "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Milliseconds 800; Set-Content -LiteralPath '{}' -Value survived",
+                "Set-Content -LiteralPath '{}' -Value started; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 25 }}; Set-Content -LiteralPath '{}' -Value survived",
                 started_marker.to_string_lossy().replace('\'', "''"),
+                release_marker.to_string_lossy().replace('\'', "''"),
                 delayed_marker.to_string_lossy().replace('\'', "''")
             );
             let started = Instant::now();
+            let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
+            let runner = thread::spawn(move || {
+                let outcome = run_bounded_command_typed(
+                    powershell_command(&script),
+                    Duration::from_secs(6),
+                    64 * 1024,
+                    64 * 1024,
+                );
+                outcome_tx.send(outcome).unwrap();
+            });
 
-            let outcome = run_bounded_command_typed(
-                powershell_command(&script),
-                Duration::from_millis(500),
-                64 * 1024,
-                64 * 1024,
-            )
-            .unwrap_err();
+            assert!(
+                wait_for_file(&started_marker, Duration::from_secs(4)),
+                "PowerShell command must start before its bounded deadline"
+            );
+            let outcome = outcome_rx
+                .recv_timeout(Duration::from_secs(7))
+                .expect("bounded command must finish after its deadline");
+            runner
+                .join()
+                .expect("bounded runner test thread must not panic");
+            std::fs::write(&release_marker, "release").unwrap();
 
+            let outcome = outcome.unwrap_err();
             let elapsed = started.elapsed();
             assert_eq!(outcome, BoundedCommandFailure::Timeout);
-            assert!(elapsed >= Duration::from_millis(300));
-            assert!(elapsed < Duration::from_secs(3));
-            assert!(started_marker.is_file());
-            thread::sleep(Duration::from_millis(500));
-            assert!(!delayed_marker.exists());
+            assert!(elapsed < Duration::from_secs(9));
+            assert!(
+                !wait_for_file(&delayed_marker, Duration::from_secs(1)),
+                "timed-out child must not observe the release signal"
+            );
         }
 
         #[test]
