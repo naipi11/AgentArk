@@ -94,3 +94,9 @@ fn resolve_existing_rejects_a_linked_parent_directory() {
             .is_err()
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn nofollow_directory_open_accepts_the_macos_system_temp_alias() {
+    assert!(open_directory_nofollow(&std::env::temp_dir()).is_ok());
+}

@@ -93,12 +93,29 @@ pub fn validate_relative_lexical(value: &str) -> Result<(), SecurityError> {
 /// it. The returned capability remains pinned to the opened directory even if
 /// its path is renamed afterward.
 pub fn open_directory_nofollow(path: &Path) -> Result<Dir, SecurityError> {
-    let (filesystem_root, components) = split_absolute_directory_path(path)?;
+    let normalized_path = normalize_system_directory_alias(path);
+    let (filesystem_root, components) = split_absolute_directory_path(&normalized_path)?;
     let mut directory = Dir::open_ambient_dir(&filesystem_root, ambient_authority())?;
     for component in components {
         directory = open_child_directory_nofollow(&directory, Path::new(&component))?;
     }
     Ok(directory)
+}
+
+fn normalize_system_directory_alias(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for (alias, canonical) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(relative) = path.strip_prefix(alias) {
+                return canonical.join(relative);
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Opens an absolute directory, creating missing normal-path components from
