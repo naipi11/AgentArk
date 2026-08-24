@@ -1,10 +1,33 @@
 use std::{fs, path::Path};
 
+#[cfg(windows)]
+use std::process::Command;
+
 use agentark_security::{
     AuthorizedRoot, PathClass, classify_windows_path, is_windows_reparse_point,
-    validate_relative_lexical,
+    open_directory_nofollow, validate_relative_lexical,
 };
 use tempfile::tempdir;
+
+#[cfg(windows)]
+fn link_directory(link: &Path, target: &Path) {
+    let status = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            link.to_string_lossy().as_ref(),
+            target.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+fn link_directory(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
 
 #[test]
 fn rejects_windows_unc_device_ads_and_traversal_strings_on_every_platform() {
@@ -45,4 +68,35 @@ fn opens_only_regular_files_beneath_the_authorized_root() {
     assert!(root.open_regular_file(Path::new("ok.jsonl")).is_ok());
     assert!(root.open_regular_file(Path::new("nested")).is_err());
     assert!(root.open_regular_file(Path::new("../escape")).is_err());
+}
+
+#[test]
+fn nofollow_directory_open_rejects_linked_root() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let linked = root.path().join("linked");
+    link_directory(&linked, outside.path());
+
+    assert!(open_directory_nofollow(&linked).is_err());
+    assert!(open_directory_nofollow(root.path()).is_ok());
+}
+
+#[test]
+fn resolve_existing_rejects_a_linked_parent_directory() {
+    let root_dir = tempdir().unwrap();
+    let outside_dir = tempdir().unwrap();
+    fs::write(outside_dir.path().join("secret.jsonl"), b"secret").unwrap();
+    link_directory(&root_dir.path().join("linked"), outside_dir.path());
+    let root = AuthorizedRoot::new(root_dir.path().to_path_buf()).unwrap();
+
+    assert!(
+        root.resolve_existing(Path::new("linked/secret.jsonl"))
+            .is_err()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn nofollow_directory_open_accepts_the_macos_system_temp_alias() {
+    assert!(open_directory_nofollow(&std::env::temp_dir()).is_ok());
 }

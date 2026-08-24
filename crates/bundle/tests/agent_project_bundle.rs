@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use agentark_bundle::{ProjectSelection, read_bundle, write_selected_sessions};
+use agentark_bundle::{
+    NativeBundleEntry, ProjectSelection, read_bundle, write_selected_sessions,
+    write_selected_sessions_with_native,
+};
 use agentark_canonical::{
     CanonicalSchemaVersion, CanonicalSession, Completeness, Workspace, workspace_id,
 };
@@ -42,6 +45,7 @@ fn exports_selected_agent_project_files_without_credentials() {
         attachments: vec![],
         raw_extra: BTreeMap::new(),
     };
+    let session_id = session.id;
     let bundle_path = root.path().join("export.ahbundle");
     let manifest = write_selected_sessions(
         &bundle_path,
@@ -59,6 +63,10 @@ fn exports_selected_agent_project_files_without_credentials() {
     assert_eq!(manifest.agent.as_deref(), Some("codex"));
     assert_eq!(manifest.workspace_count, 1);
     let bundle = read_bundle(&bundle_path).unwrap();
+    let recovery = bundle.recovery_manifest().unwrap().unwrap();
+    assert_eq!(recovery.sessions.len(), 1);
+    assert_eq!(recovery.sessions[0].canonical_session_id, session_id);
+    assert_eq!(recovery.sessions[0].native_payload_count, 0);
     assert!(
         bundle
             .entries
@@ -74,4 +82,48 @@ fn exports_selected_agent_project_files_without_credentials() {
     let files = bundle.workspace_file_entries().unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].relative_path, "README.md");
+}
+
+#[test]
+fn exports_and_reads_native_codex_rollout_payloads() {
+    let root = tempdir().unwrap();
+    let session = CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: Uuid::new_v4(),
+        install_id: Uuid::new_v4(),
+        source_session_id: "s-native".into(),
+        source_kind: "codex".into(),
+        workspace: None,
+        title: Some("native".into()),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: None,
+        model_name: None,
+        completeness: Completeness::Complete,
+        messages: vec![],
+        tool_events: vec![],
+        attachments: vec![],
+        raw_extra: BTreeMap::new(),
+    };
+    let bundle_path = root.path().join("native.ahbundle");
+    write_selected_sessions_with_native(
+        &bundle_path,
+        "codex",
+        std::slice::from_ref(&session),
+        &[],
+        &[NativeBundleEntry {
+            session_id: session.id,
+            relative_path: "2026/08/23/rollout-native.jsonl".into(),
+            bytes: b"{\"type\":\"session_meta\"}\n".to_vec(),
+            redaction_count: 0,
+        }],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let bundle = read_bundle(&bundle_path).unwrap();
+    let entries = bundle.native_rollout_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, session.id);
+    assert_eq!(entries[0].relative_path, "2026/08/23/rollout-native.jsonl");
 }

@@ -26,14 +26,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
       - uses: pnpm/action-setup@v4
         with:
           version: 11.22.0
           run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |
@@ -41,6 +41,9 @@ jobs:
           sudo apt-get install -y build-essential curl file libayatana-appindicator3-dev libgtk-3-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
       - run: pnpm install --frozen-lockfile
       - run: cargo build --release -p agentark
+      - name: Enforce search benchmark
+        if: runner.os == 'Linux'
+        run: pwsh -File ci/enforce-search-benchmark.ps1
       - run: pnpm --dir apps/desktop tauri build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -49,10 +52,13 @@ jobs:
         with:
           name: agentark-${{ matrix.artifact }}
           path: |
-            apps/desktop/src-tauri/target/release/bundle/**
-            target/release/agentark.exe
-            target/release/agentark
-          if-no-files-found: warn
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.AppImage
+            target/release/bundle/**/*.dmg
+          if-no-files-found: error
 
   publish:
     if: startsWith(github.ref, 'refs/tags/')
@@ -63,11 +69,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+      - name: Stage uniquely named release assets
+        shell: bash
+        run: |
+          mkdir -p release-publish
+          declare -A seen
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if [[ -n "${seen[$name]:-}" ]]; then
+              echo "duplicate release asset name: $name" >&2
+              exit 1
+            fi
+            seen[$name]=1
+            cp "$file" "release-publish/$name"
+          done < <(find release-artifacts -type f -print0 | sort -z)
+          test -n "$(find release-publish -maxdepth 1 -type f -print -quit)"
       - name: Generate SHA-256 manifest
         shell: bash
         run: |
-          find release-artifacts -type f -print0 | sort -z | xargs -0 sha256sum > release-artifacts/SHA256SUMS
+          find release-publish -maxdepth 1 -type f ! -name 'SHA256SUMS' -print0 | sort -z |
+            while IFS= read -r -d '' file; do
+              hash=$(sha256sum "$file" | cut -d ' ' -f 1)
+              printf '%s  %s\n' "$hash" "$(basename "$file")"
+            done > release-publish/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: release-artifacts/**
+          files: release-publish/*
           generate_release_notes: true

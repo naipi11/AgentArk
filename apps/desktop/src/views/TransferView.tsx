@@ -5,6 +5,24 @@ import { AgentSelector } from '../components/AgentSelector';
 import { useI18n } from '../i18n';
 
 const bundleDialogFilters = [{ name: 'AgentArk bundle', extensions: ['ahbundle'] }];
+const publicRecoveryReasonCodes = Object.freeze([
+  'native-identity-verified',
+  'target-default-continuation',
+  'continuation-writer-unavailable',
+  'missing-provider',
+  'verification-failed',
+  'target-conflict',
+  'recovery-unavailable',
+  'rollback-required',
+  'manual-intervention-required',
+  'native-payload-unavailable',
+  'target-default-unavailable',
+  'audit-persistence-failed',
+] as const);
+
+function isPublicRecoveryReasonCode(value: string): boolean {
+  return (publicRecoveryReasonCodes as readonly string[]).includes(value);
+}
 
 export function TransferView({ refreshToken }: { refreshToken: number }) {
   const { t } = useI18n();
@@ -14,9 +32,20 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const [includeFiles, setIncludeFiles] = useState(true);
   const [path, setPath] = useState('');
   const [preview, setPreview] = useState<BundleReport | null>(null);
+  const [restoreReport, setRestoreReport] = useState<BundleReport | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyAction, setBusyAction] = useState<'export' | 'import' | 'restore' | null>(null);
+
+  function safeRecoveryDiagnostic(value: string | undefined) {
+    return value && isPublicRecoveryReasonCode(value)
+      ? value
+      : t('transfer.recoveryDiagnosticsUnavailable');
+  }
+
+  function recoveryOutcomeSummary(count: number, singular: Parameters<typeof t>[0], plural: Parameters<typeof t>[0]) {
+    return t(count === 1 ? singular : plural).replace('{count}', String(count));
+  }
 
   useEffect(() => {
     void api.workspacesList(100, 0, agentKind === 'all' ? undefined : agentKind).then((items) => {
@@ -43,7 +72,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     if (!selectedPath) return;
     if (!selectedPath.toLowerCase().endsWith('.ahbundle')) selectedPath += '.ahbundle';
     setPath(selectedPath);
-    setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null);
+    setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null); setRestoreReport(null);
     try {
       const report = await api.bundleExport(selectedPath, agentKind === 'all' ? undefined : agentKind, selected, includeFiles);
       setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
@@ -67,8 +96,11 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     const chosenPath = Array.isArray(selectedPath) ? selectedPath[0] : selectedPath;
     if (!chosenPath) return;
     setPath(chosenPath);
-    setBusy(true); setBusyAction('import'); setMessage(null);
-    try { setPreview(await api.bundleVerify(chosenPath)); }
+    setBusy(true); setBusyAction('import'); setMessage(null); setRestoreReport(null);
+    try {
+      const report = await api.bundleVerify(chosenPath);
+      setPreview(report);
+    }
     catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
   }
@@ -77,7 +109,13 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     setBusy(true); setBusyAction('restore'); setMessage(null);
     try {
       const report = await api.bundleRestore(path);
-      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
+      const needsRecoveryAttention = Boolean(report.recoveryError)
+        || report.manualInterventionCount > 0
+        || report.archiveOnlyCount > 0;
+      setMessage(needsRecoveryAttention
+        ? t('transfer.restorePartial')
+        : `${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
+      setRestoreReport(report);
       setPreview(null);
     } catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
@@ -98,8 +136,16 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         <button className="primary-button" type="button" disabled={busy} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
         <button type="button" disabled={busy} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
       </div>
-      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
+      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><span className="muted">{t('transfer.automaticRecovery')}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
       {message && <p className="muted" role="status">{message}</p>}
+      {restoreReport && <div className="transfer-preview" role="status">
+        <strong>{t('transfer.outcomeSummary')}</strong>
+        <span>{recoveryOutcomeSummary(restoreReport.nativeIdentityCount, 'transfer.nativeIdentitySummaryOne', 'transfer.nativeIdentitySummaryMany')}</span>
+        <span>{recoveryOutcomeSummary(restoreReport.continuationCount, 'transfer.continuationSummaryOne', 'transfer.continuationSummaryMany')}</span>
+        <span>{recoveryOutcomeSummary(restoreReport.archiveOnlyCount, 'transfer.archiveOnlySummaryOne', 'transfer.archiveOnlySummaryMany')}</span>
+        {restoreReport.manualInterventionCount > 0 && <span>{recoveryOutcomeSummary(restoreReport.manualInterventionCount, 'transfer.manualInterventionSummaryOne', 'transfer.manualInterventionSummaryMany')}</span>}
+        {restoreReport.recoveryError && <details><summary>{t('transfer.recoveryDiagnostics')}</summary><span className="muted">{safeRecoveryDiagnostic(restoreReport.recoveryError)}</span></details>}
+      </div>}
     </section>
   );
 }

@@ -33,6 +33,7 @@ agentark-adapter-sdk = { path = "../../../crates/adapter-sdk" }
 agentark-cas = { path = "../../../crates/cas" }
 agentark-index = { path = "../../../crates/index" }
 agentark-security = { path = "../../../crates/security" }
+cap-std.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true

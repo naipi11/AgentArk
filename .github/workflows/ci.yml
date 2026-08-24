@@ -18,6 +18,10 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -29,10 +33,6 @@ jobs:
           sudo apt-get install -y \
             build-essential curl file libayatana-appindicator3-dev \
             libgtk-3-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.22.0
-          run_install: false
       - run: pnpm install --frozen-lockfile
       - run: cargo install --locked cargo-deny --version 0.20.2
       - run: cargo install --locked cargo-audit --version 0.22.2
@@ -44,11 +44,12 @@ jobs:
       - run: cargo deny check
       - run: cargo audit
       - run: pwsh -File ci/check-security-crate-majors.ps1
-      - run: pwsh -File ci/enforce-search-benchmark.ps1
       - run: pnpm --dir apps/desktop test
       - run: pnpm --dir apps/desktop build
       - run: pwsh -File ci/check-no-secret-canaries.ps1
       - run: pwsh -File ci/check-no-forbidden-codex-methods.ps1
+      - run: pwsh -File ci/check-ci-bootstrap.ps1
+      - run: pwsh -File ci/check-workspace-metadata.ps1
 
   network-silence:
     runs-on: ubuntu-latest
@@ -57,4 +58,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      - name: Prefetch locked Rust dependencies
+        run: cargo fetch --locked
       - run: bash ci/network-silence.sh

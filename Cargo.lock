@@ -84,6 +84,8 @@ dependencies = [
  "agentark-adapter-sdk",
  "agentark-canonical",
  "agentark-security",
+ "base64 0.22.1",
+ "cap-std",
  "dunce",
  "hex",
  "serde",
@@ -92,6 +94,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
+ "winx",
 ]
 
 [[package]]
@@ -290,6 +293,7 @@ dependencies = [
  "agentark-migration",
  "agentark-security",
  "agentark-watch",
+ "cap-std",
  "directories",
  "serde",
  "serde_json",
@@ -314,6 +318,7 @@ name = "agentark-index"
 version = "0.1.0"
 dependencies = [
  "agentark-canonical",
+ "agentark-migration",
  "agentark-security",
  "hex",
  "rusqlite",
@@ -344,12 +349,13 @@ dependencies = [
 name = "agentark-security"
 version = "0.1.0"
 dependencies = [
+ "cap-primitives",
  "cap-std",
  "chacha20poly1305",
- "dunce",
  "getrandom 0.4.3",
  "hex",
  "hkdf 0.13.0",
+ "io-lifetimes 3.0.1",
  "keyring",
  "regex",
  "serde",

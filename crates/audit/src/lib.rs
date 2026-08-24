@@ -34,8 +34,68 @@ pub struct AuditEvent {
     pub after_hash: Option<Sha256Digest>,
     pub plan_hash: Option<Sha256Digest>,
     pub result: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_recovery: Option<VendorRecoveryAudit>,
     pub previous_hash: Option<Sha256Digest>,
     pub event_hash: Sha256Digest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VendorRecoveryStatus {
+    Complete,
+    Partial,
+    ManualIntervention,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VendorRecoveryAudit {
+    pub native_identity_count: u64,
+    pub continuation_count: u64,
+    pub archive_only_count: u64,
+    pub manual_intervention_count: u64,
+    pub source_hashes_digest: Sha256Digest,
+    pub target_hashes_digest: Sha256Digest,
+    pub status: VendorRecoveryStatus,
+}
+
+impl VendorRecoveryAudit {
+    pub fn from_hashes(
+        native_identity_count: u64,
+        continuation_count: u64,
+        archive_only_count: u64,
+        manual_intervention_count: u64,
+        source_hashes: impl IntoIterator<Item = Sha256Digest>,
+        target_hashes: impl IntoIterator<Item = Sha256Digest>,
+    ) -> Self {
+        let status = if manual_intervention_count > 0 {
+            VendorRecoveryStatus::ManualIntervention
+        } else if archive_only_count > 0 {
+            VendorRecoveryStatus::Partial
+        } else {
+            VendorRecoveryStatus::Complete
+        };
+        Self {
+            native_identity_count,
+            continuation_count,
+            archive_only_count,
+            manual_intervention_count,
+            source_hashes_digest: aggregate_hashes(source_hashes),
+            target_hashes_digest: aggregate_hashes(target_hashes),
+            status,
+        }
+    }
+}
+
+fn aggregate_hashes(hashes: impl IntoIterator<Item = Sha256Digest>) -> Sha256Digest {
+    let mut hashes = hashes.into_iter().collect::<Vec<_>>();
+    hashes.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let values = hashes.iter().map(Sha256Digest::as_str).collect::<Vec<_>>();
+    let canonical = serde_jcs::to_vec(&values).expect("digest string lists always serialize");
+    Sha256Digest::from_bytes(&canonical)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +266,8 @@ mod tests {
             after_hash: None,
             plan_hash: None,
             result: "success".into(),
+            provider_labels: Vec::new(),
+            vendor_recovery: None,
             previous_hash: None,
             event_hash: Sha256Digest::from_bytes(b"pending"),
         }

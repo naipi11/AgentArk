@@ -1,13 +1,14 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentark_adapter_claude::ClaudeCodeAdapter;
-use agentark_adapter_codex::CodexAdapter;
+use agentark_adapter_codex::{CodexAdapter, NativeRolloutPayload};
 use agentark_adapter_grok::GrokBuildAdapter;
 use agentark_adapter_hermes::HermesAdapter;
 use agentark_adapter_openclaw::OpenClawAdapter;
@@ -17,19 +18,34 @@ use agentark_app::{
     AppError, AppServices, LockedIndexQueryService, QueryUseCase, ScanReport, ScanRequest,
     ScanService, ScanUseCase, VerifyUseCase,
 };
-use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
-use agentark_bundle::{ProjectSelection, WorkspaceFileEntry, read_bundle, write_selected_sessions};
+use agentark_audit::{
+    AuditEvent, AuditVerification, VendorRecoveryAudit, VendorRecoveryStatus, append_event,
+    verify_chain,
+};
+use agentark_bundle::{
+    NativeBundleEntry, ProjectSelection, WorkspaceFileEntry, read_bundle,
+    write_selected_sessions_with_native,
+};
 use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
-use agentark_index::IndexDb;
-use agentark_migration::agent_label;
-use agentark_security::{DatasetBootstrap, OsMasterKeyStore, SecretScanner};
+use agentark_index::{IndexDb, RestoreMapping};
+use agentark_migration::{RestoreOutcome, agent_label};
+use agentark_security::{
+    DatasetBootstrap, MasterKeyStore, MemoryMasterKeyStore, OsMasterKeyStore, SecretScanner,
+    open_child_directory_nofollow, open_or_create_directory_nofollow,
+};
 use agentark_watch::{
     ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
 };
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use directories::ProjectDirs;
 use serde::Serialize;
 use uuid::Uuid;
+
+use crate::recovery::{
+    CodexRecoveryExecutor, ExistingRestoreTarget, ProductionCodexRecoveryExecutor, RecoveryInput,
+    archive_only_recovery_report, recover_one_codex_session, recovery_source_hash,
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +60,20 @@ pub struct BundleReport {
     pub redacted: bool,
     pub redaction_count: u64,
     pub restore_scan_id: Option<Uuid>,
+    pub native_payload_count: u64,
+    pub native_imported_count: u64,
+    pub native_skipped_count: u64,
+    pub native_conflict_count: u64,
+    pub native_backup_path: Option<String>,
+    pub native_restart_required: bool,
+    pub native_error: Option<String>,
+    pub native_identity_count: u64,
+    pub continuation_count: u64,
+    pub archive_only_count: u64,
+    pub restore_mapping_count: u64,
+    pub recovery_error: Option<String>,
+    pub manual_intervention_count: u64,
+    pub provider_labels: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -51,8 +81,40 @@ pub struct AppState {
     pub services: Arc<Mutex<AppServices>>,
     data_root: PathBuf,
     scan_lock: Arc<Mutex<()>>,
+    restore_lock: Arc<Mutex<()>>,
+    key_store: StorageKeyStore,
     watch_roots: Arc<Mutex<Vec<WatchRoot>>>,
     watcher_started: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum StorageKeyStore {
+    Os,
+    Memory(MemoryMasterKeyStore),
+}
+
+#[doc(hidden)]
+pub trait RestoreMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String>;
+}
+
+struct IndexRestoreMappingWriter;
+
+impl RestoreMappingWriter for IndexRestoreMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        index
+            .record_restore_mapping(mapping)
+            .map_err(|_| "restore-mapping-persistence-failed".into())
+    }
+}
+
+fn acquire_restore_lock(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
+    lock.lock().map_err(|_| "恢复操作锁不可用".to_owned())
+}
+
+fn isolated_test_restore_lock() -> Arc<Mutex<()>> {
+    static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
 }
 
 struct EmptyUseCase;
@@ -115,6 +177,8 @@ impl AppState {
             })),
             data_root: default_data_dir(),
             scan_lock: Arc::new(Mutex::new(())),
+            restore_lock: Arc::new(Mutex::new(())),
+            key_store: StorageKeyStore::Os,
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
@@ -122,7 +186,8 @@ impl AppState {
 
     pub fn open_default() -> Self {
         let data_root = default_data_dir();
-        let Some(index) = open_index(&data_root) else {
+        let key_store = StorageKeyStore::Os;
+        let Some(index) = open_index(&data_root, &key_store) else {
             return Self::empty();
         };
         Self {
@@ -133,9 +198,44 @@ impl AppState {
             })),
             data_root,
             scan_lock: Arc::new(Mutex::new(())),
+            restore_lock: Arc::new(Mutex::new(())),
+            key_store,
             watch_roots: Arc::new(Mutex::new(Vec::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Test-only constructor for external integration tests that must isolate
+    /// AgentArk storage from the user's configured data root.
+    #[doc(hidden)]
+    pub fn for_data_root(data_root: PathBuf) -> Self {
+        Self {
+            services: Arc::new(Mutex::new(AppServices {
+                scanner: Box::new(EmptyUseCase),
+                verifier: Box::new(EmptyUseCase),
+                queries: Box::new(EmptyQuery),
+            })),
+            data_root,
+            scan_lock: Arc::new(Mutex::new(())),
+            restore_lock: isolated_test_restore_lock(),
+            key_store: StorageKeyStore::Memory(MemoryMasterKeyStore::empty()),
+            watch_roots: Arc::new(Mutex::new(Vec::new())),
+            watcher_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn try_restore_lock_for_test(&self) -> Result<bool, String> {
+        match self.restore_lock.try_lock() {
+            Ok(_guard) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Poisoned(_)) => Err("恢复操作锁不可用".to_owned()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn shares_restore_lock_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.restore_lock, &other.restore_lock)
     }
 
     pub fn scan_codex(&self, source_root: PathBuf) -> Result<ScanReport, String> {
@@ -183,7 +283,7 @@ impl AppState {
 
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -242,7 +342,7 @@ impl AppState {
 
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -300,7 +400,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -358,7 +458,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -419,7 +519,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -477,7 +577,7 @@ impl AppState {
             .collect();
         self.release_query_index()?;
         let scan_result = (|| {
-            let (cas, index) = open_storage(&self.data_root)?;
+            let (cas, index) = open_storage(&self.data_root, &self.key_store)?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
             let mut service = ScanService::new(adapter, cas, index, scanner);
             service
@@ -511,12 +611,18 @@ impl AppState {
         }
         self.release_query_index()?;
         let result = (|| {
-            let index =
-                open_index(&self.data_root).ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
+            let index = open_index(&self.data_root, &self.key_store)
+                .ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
             let sessions = index
                 .all_sessions_filtered(agent_kind.clone())
                 .map_err(|_| "无法读取本地会话".to_owned())?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+            let provider_labels = safe_provider_labels(
+                sessions
+                    .iter()
+                    .filter_map(|session| session.model_provider.as_deref()),
+                &scanner,
+            );
             let selected = workspace_ids
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>();
@@ -532,9 +638,46 @@ impl AppState {
                 })
                 .collect::<Vec<_>>();
             let agent = agent_kind.as_ref().map(agent_label).unwrap_or("all");
-            let manifest = write_selected_sessions(&path, agent, &sessions, &selections, &scanner)
-                .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
-            append_audit_event(&self.data_root, "bundle.exported", &path, None)?;
+            let native_entries = if agent_kind == Some(AgentKind::Codex) {
+                detected_codex_home()
+                    .filter(|root| root.is_dir())
+                    .map(|root| {
+                        agentark_adapter_codex::collect_native_rollouts(&root, &sessions, &scanner)
+                            .map(|payloads| {
+                                payloads
+                                    .into_iter()
+                                    .map(|payload| NativeBundleEntry {
+                                        session_id: payload.session_id,
+                                        relative_path: payload.relative_path,
+                                        bytes: payload.bytes,
+                                        redaction_count: payload.redaction_count,
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .transpose()
+                    .map_err(|_| "无法读取 Codex 原生会话文件".to_owned())?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let native_payload_count = native_entries.len() as u64;
+            let manifest = write_selected_sessions_with_native(
+                &path,
+                agent,
+                &sessions,
+                &selections,
+                &native_entries,
+                &scanner,
+            )
+            .map_err(|_| "无法写入 .ahbundle 备份".to_owned())?;
+            append_audit_event(
+                &self.data_root,
+                "bundle.exported",
+                &path,
+                None,
+                &provider_labels,
+            )?;
             Ok(BundleReport {
                 format: manifest.format,
                 agent: manifest.agent,
@@ -546,6 +689,20 @@ impl AppState {
                 redacted: manifest.redacted,
                 redaction_count: manifest.redaction_count,
                 restore_scan_id: None,
+                native_payload_count,
+                native_imported_count: 0,
+                native_skipped_count: 0,
+                native_conflict_count: 0,
+                native_backup_path: None,
+                native_restart_required: false,
+                native_error: None,
+                native_identity_count: 0,
+                continuation_count: 0,
+                archive_only_count: 0,
+                restore_mapping_count: 0,
+                recovery_error: None,
+                manual_intervention_count: 0,
+                provider_labels,
             })
         })();
         let _ = self.refresh_query_index();
@@ -554,6 +711,17 @@ impl AppState {
 
     pub fn bundle_verify(&self, path: PathBuf) -> Result<BundleReport, String> {
         let bundle = read_bundle(&path).map_err(|_| "无法验证 .ahbundle 文件".to_owned())?;
+        let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+        let recovery_manifest = bundle
+            .recovery_manifest()
+            .map_err(|_| "备份中的恢复清单无效".to_owned())?;
+        let provider_labels = safe_provider_labels(
+            recovery_manifest
+                .iter()
+                .flat_map(|manifest| manifest.sessions.iter())
+                .filter_map(|session| session.source_provider.as_deref()),
+            &scanner,
+        );
         let mut conflict_count = 0;
         let restore_root = self.data_root.join("restored-workspaces");
         for entry in bundle
@@ -581,24 +749,129 @@ impl AppState {
             redacted: bundle.manifest.redacted,
             redaction_count: bundle.manifest.redaction_count,
             restore_scan_id: None,
+            native_payload_count: bundle
+                .native_rollout_entries()
+                .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?
+                .len() as u64,
+            native_imported_count: 0,
+            native_skipped_count: 0,
+            native_conflict_count: 0,
+            native_backup_path: None,
+            native_restart_required: false,
+            native_error: None,
+            native_identity_count: 0,
+            continuation_count: 0,
+            archive_only_count: 0,
+            restore_mapping_count: 0,
+            recovery_error: None,
+            manual_intervention_count: 0,
+            provider_labels,
         })
     }
 
     pub fn bundle_restore(&self, path: PathBuf) -> Result<BundleReport, String> {
+        let codex_home = detected_codex_home().unwrap_or_default();
+        let executable = resolve_codex_executable();
+        let backup_root = codex_home.join("agentark-backups");
+        let executor = ProductionCodexRecoveryExecutor::new();
+        self.bundle_restore_with_executor(path, &executor, codex_home, executable, backup_root)
+    }
+
+    #[doc(hidden)]
+    pub fn bundle_restore_with_executor(
+        &self,
+        path: PathBuf,
+        executor: &dyn CodexRecoveryExecutor,
+        codex_home: PathBuf,
+        executable: PathBuf,
+        backup_root: PathBuf,
+    ) -> Result<BundleReport, String> {
+        self.bundle_restore_with_executor_and_mapping_writer(
+            path,
+            executor,
+            &IndexRestoreMappingWriter,
+            codex_home,
+            executable,
+            backup_root,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn bundle_restore_with_executor_and_mapping_writer(
+        &self,
+        path: PathBuf,
+        executor: &dyn CodexRecoveryExecutor,
+        mapping_writer: &dyn RestoreMappingWriter,
+        codex_home: PathBuf,
+        executable: PathBuf,
+        backup_root: PathBuf,
+    ) -> Result<BundleReport, String> {
+        let _restore_guard = acquire_restore_lock(&self.restore_lock)?;
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
         let bundle = read_bundle(&path).map_err(|_| "无法读取 .ahbundle 备份".to_owned())?;
+        let recovery_manifest = bundle
+            .recovery_manifest()
+            .map_err(|_| "备份中的恢复清单无效".to_owned())?;
         let mut sessions = bundle
             .session_records()
             .map_err(|_| "备份中的会话数据无效".to_owned())?;
+        let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+        let provider_labels = safe_provider_labels(
+            sessions
+                .iter()
+                .filter_map(|session| session.model_provider.as_deref()),
+            &scanner,
+        );
         let workspace_ids = bundle
             .workspace_ids()
             .map_err(|_| "备份中的项目清单无效".to_owned())?;
         let file_entries = bundle
             .workspace_file_entries()
             .map_err(|_| "备份中的项目文件清单无效".to_owned())?;
+        let native_entries = bundle
+            .native_rollout_entries()
+            .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?;
+        let native_payload_count = native_entries.len() as u64;
+        let mut payloads_by_session = HashMap::<Uuid, Vec<NativeRolloutPayload>>::new();
+        for entry in native_entries {
+            let payload = NativeRolloutPayload {
+                session_id: entry.session_id,
+                relative_path: entry.relative_path,
+                source_hash: agentark_canonical::Sha256Digest::from_bytes(&entry.bytes),
+                bytes: entry.bytes,
+                redaction_count: entry.redaction_count,
+            };
+            payloads_by_session
+                .entry(payload.session_id)
+                .or_default()
+                .push(payload);
+        }
+        let recovery_sources = recovery_manifest
+            .map(|manifest| {
+                manifest
+                    .sessions
+                    .into_iter()
+                    .map(|session| (session.canonical_session_id, session))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let restore_root = self.data_root.join("restored-workspaces");
+        let workspace_mappings = sessions
+            .iter()
+            .filter_map(|session| {
+                session.workspace.as_ref().map(|workspace| {
+                    (
+                        workspace.path_native.clone(),
+                        restore_root
+                            .join(workspace.id.to_string())
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         restore_project_files(&restore_root, &file_entries)?;
         for session in &mut sessions {
             if let Some(workspace) = session.workspace.as_mut()
@@ -612,12 +885,292 @@ impl AppState {
         }
         self.release_query_index()?;
         let result = (|| {
-            let (_cas, mut index) = open_storage(&self.data_root)?;
+            let (_cas, mut index) = open_storage(&self.data_root, &self.key_store)?;
             let scan_id = index
                 .restore_sessions(&sessions)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
-            append_audit_event(&self.data_root, "bundle.restored", &path, Some(scan_id))?;
-            Ok(BundleReport {
+            append_audit_event(
+                &self.data_root,
+                "bundle.restored",
+                &path,
+                Some(scan_id),
+                &provider_labels,
+            )?;
+            let mut native_identity_count = 0u64;
+            let mut continuation_count = 0u64;
+            let mut archive_only_count = 0u64;
+            let mut restore_mapping_count = 0u64;
+            let mut recovery_error = None;
+            let mut native_skipped_count = 0u64;
+            let mut native_conflict_count = 0u64;
+            let mut native_backup_path = None;
+            let mut manual_intervention_count = 0u64;
+            let mut audit_native_identity_count = 0u64;
+            let mut audit_continuation_count = 0u64;
+            let mut audit_archive_only_count = 0u64;
+            let mut audit_manual_intervention_count = 0u64;
+            let mut audit_source_hashes = Vec::new();
+            let mut audit_target_hashes = Vec::new();
+            let mut vendor_provider_labels =
+                provider_labels.iter().cloned().collect::<BTreeSet<_>>();
+            let bundle_target_agent = target_agent_kind(bundle.manifest.agent.as_deref());
+            let bundle_is_codex = match bundle.manifest.agent.as_deref() {
+                Some("codex") => true,
+                Some(_) => false,
+                None => {
+                    !sessions.is_empty()
+                        && sessions.iter().all(|session| {
+                            source_agent_kind(&session.source_kind) == Some(AgentKind::Codex)
+                        })
+                }
+            };
+            for session in &sessions {
+                let mut recovery_session = session.clone();
+                if let Some(source) = recovery_sources.get(&session.id) {
+                    recovery_session.model_provider = source.source_provider.clone();
+                    recovery_session.model_name = source.source_model.clone();
+                }
+                let native_payload = payloads_by_session
+                    .remove(&session.id)
+                    .and_then(|payloads| payloads.into_iter().next());
+                let input = RecoveryInput {
+                    session: recovery_session,
+                    native_payload,
+                    workspace_mappings: workspace_mappings.clone(),
+                    codex_home: codex_home.clone(),
+                    executable: executable.clone(),
+                    backup_root: backup_root.clone(),
+                };
+                let audit_source_hash = recovery_source_hash(&input).unwrap_or_else(|_| {
+                    agentark_canonical::Sha256Digest::from_bytes(
+                        &serde_json::to_vec(&input.session).unwrap_or_default(),
+                    )
+                });
+                audit_source_hashes.push(audit_source_hash);
+                let target_agent = bundle_target_agent
+                    .clone()
+                    .or_else(|| source_agent_kind(&session.source_kind));
+                let existing_mappings = match index.restore_mappings_for(session.id) {
+                    Ok(mappings) => mappings,
+                    Err(_) => {
+                        manual_intervention_count += 1;
+                        audit_manual_intervention_count += 1;
+                        recovery_error = Some("restore-mapping-conflict".into());
+                        continue;
+                    }
+                };
+                let target_mappings = target_agent
+                    .as_ref()
+                    .map(|target_agent| {
+                        existing_mappings
+                            .iter()
+                            .filter(|mapping| &mapping.target_agent == target_agent)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let durable_mappings = target_mappings
+                    .iter()
+                    .copied()
+                    .filter(|mapping| {
+                        matches!(
+                            mapping.outcome,
+                            RestoreOutcome::NativeIdentity | RestoreOutcome::Continuation
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if durable_mappings.len() > 1 {
+                    manual_intervention_count += 1;
+                    audit_manual_intervention_count += 1;
+                    recovery_error = Some("restore-mapping-conflict".into());
+                    continue;
+                }
+                if let Some(mapping) = durable_mappings.first() {
+                    let target = mapping
+                        .target_native_id
+                        .clone()
+                        .zip(mapping.target_provider.clone())
+                        .zip(mapping.target_hash.clone())
+                        .map(|((target_native_id, model_provider), rollout_hash)| {
+                            ExistingRestoreTarget {
+                                outcome: mapping.outcome,
+                                target_native_id,
+                                model_provider,
+                                rollout_hash,
+                            }
+                        });
+                    let target_is_exact = target.as_ref().is_some_and(|target| {
+                        executor.verify_existing_target(&input, target).is_ok()
+                    });
+                    let current_source_hash = recovery_source_hash(&input).ok();
+                    let source_hash_matches = current_source_hash
+                        .as_ref()
+                        .is_some_and(|hash| mapping.source_hash == *hash)
+                        || input
+                            .native_payload
+                            .as_ref()
+                            .is_some_and(|payload| mapping.source_hash == payload.source_hash);
+                    if !target_is_exact || !source_hash_matches {
+                        manual_intervention_count += 1;
+                        audit_manual_intervention_count += 1;
+                        recovery_error = Some("restore-mapping-conflict".into());
+                        continue;
+                    }
+                    restore_mapping_count += 1;
+                    match mapping.outcome {
+                        RestoreOutcome::NativeIdentity => audit_native_identity_count += 1,
+                        RestoreOutcome::Continuation => audit_continuation_count += 1,
+                        RestoreOutcome::ArchiveOnly => audit_archive_only_count += 1,
+                    }
+                    if let Some(target_hash) = &mapping.target_hash {
+                        audit_target_hashes.push(target_hash.clone());
+                    }
+                    extend_safe_provider_labels(
+                        &mut vendor_provider_labels,
+                        mapping.target_provider.as_deref(),
+                        &scanner,
+                    );
+                    continue;
+                }
+                let has_archive_mapping = target_mappings
+                    .iter()
+                    .any(|mapping| mapping.outcome == RestoreOutcome::ArchiveOnly);
+                let recovery = if bundle_is_codex {
+                    recover_one_codex_session(executor, &input)
+                } else {
+                    archive_only_recovery_report(
+                        &input,
+                        if bundle_target_agent.is_some() {
+                            "target-recovery-unavailable"
+                        } else {
+                            "target-agent-unavailable"
+                        },
+                    )
+                };
+                extend_safe_provider_labels(
+                    &mut vendor_provider_labels,
+                    recovery.source_provider.provider.as_deref(),
+                    &scanner,
+                );
+                extend_safe_provider_labels(
+                    &mut vendor_provider_labels,
+                    recovery
+                        .target_provider
+                        .as_ref()
+                        .and_then(|identity| identity.provider.as_deref()),
+                    &scanner,
+                );
+                native_skipped_count += recovery.native_skipped_count;
+                native_conflict_count += recovery.native_conflict_count;
+                if native_backup_path.is_none() {
+                    native_backup_path = recovery
+                        .native_backup_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
+                }
+                if recovery.requires_manual_intervention {
+                    manual_intervention_count += 1;
+                    audit_manual_intervention_count += 1;
+                    if let Some(target_hash) = &recovery.target_hash {
+                        audit_target_hashes.push(target_hash.clone());
+                    }
+                    recovery_error = Some("manual-intervention-required".into());
+                    continue;
+                }
+                if recovery.outcome == RestoreOutcome::ArchiveOnly && has_archive_mapping {
+                    archive_only_count += 1;
+                    audit_archive_only_count += 1;
+                    restore_mapping_count += 1;
+                    if recovery_error.is_none() {
+                        recovery_error = Some(recovery.reason_code.clone());
+                    }
+                    continue;
+                }
+                let Some(target_agent) = target_agent else {
+                    archive_only_count += 1;
+                    audit_archive_only_count += 1;
+                    if recovery_error.is_none() {
+                        recovery_error = Some("target-agent-unavailable".into());
+                    }
+                    continue;
+                };
+                let mapping = RestoreMapping {
+                    source_session_id: session.id,
+                    target_agent,
+                    outcome: recovery.outcome,
+                    source_native_id: recovery.source_native_id.clone(),
+                    target_native_id: recovery.target_native_id.clone(),
+                    source_provider: recovery.source_provider.provider.clone(),
+                    target_provider: recovery
+                        .target_provider
+                        .clone()
+                        .and_then(|identity| identity.provider),
+                    source_hash: recovery.source_hash.clone(),
+                    target_hash: recovery.target_hash.clone(),
+                    reason_code: recovery.reason_code.clone(),
+                    created_at: restore_mapping_timestamp(),
+                };
+                match mapping_writer.record(&mut index, &mapping) {
+                    Ok(()) => {
+                        restore_mapping_count += 1;
+                        match recovery.outcome {
+                            RestoreOutcome::NativeIdentity => {
+                                native_identity_count += 1;
+                                audit_native_identity_count += 1;
+                            }
+                            RestoreOutcome::Continuation => {
+                                continuation_count += 1;
+                                audit_continuation_count += 1;
+                            }
+                            RestoreOutcome::ArchiveOnly => {
+                                archive_only_count += 1;
+                                audit_archive_only_count += 1;
+                                if recovery_error.is_none() {
+                                    recovery_error = Some(recovery.reason_code.clone());
+                                }
+                            }
+                        }
+                        if matches!(
+                            recovery.outcome,
+                            RestoreOutcome::NativeIdentity | RestoreOutcome::Continuation
+                        ) && let Some(target_hash) = &recovery.target_hash
+                        {
+                            audit_target_hashes.push(target_hash.clone());
+                        }
+                    }
+                    Err(_) => match executor.rollback(&input, &recovery) {
+                        Ok(()) => {
+                            archive_only_count += 1;
+                            audit_archive_only_count += 1;
+                            if has_archive_mapping {
+                                restore_mapping_count += 1;
+                            }
+                            if recovery_error.is_none() {
+                                recovery_error = Some("restore-mapping-persistence-failed".into());
+                            }
+                        }
+                        Err(_) => {
+                            manual_intervention_count += 1;
+                            audit_manual_intervention_count += 1;
+                            if let Some(target_hash) = &recovery.target_hash {
+                                audit_target_hashes.push(target_hash.clone());
+                            }
+                            recovery_error = Some("manual-intervention-required".into());
+                        }
+                    },
+                }
+            }
+            let native_imported_count = native_identity_count + continuation_count;
+            let native_restart_required = native_imported_count > 0;
+            let vendor_recovery = VendorRecoveryAudit::from_hashes(
+                audit_native_identity_count,
+                audit_continuation_count,
+                audit_archive_only_count,
+                audit_manual_intervention_count,
+                audit_source_hashes,
+                audit_target_hashes,
+            );
+            let provider_labels = vendor_provider_labels.into_iter().collect::<Vec<_>>();
+            let mut report = BundleReport {
                 format: bundle.manifest.format.clone(),
                 agent: bundle.manifest.agent.clone(),
                 session_count: bundle.manifest.session_count,
@@ -628,8 +1181,45 @@ impl AppState {
                 redacted: bundle.manifest.redacted,
                 redaction_count: bundle.manifest.redaction_count,
                 restore_scan_id: Some(scan_id),
-            })
+                native_payload_count,
+                native_imported_count,
+                native_skipped_count,
+                native_conflict_count,
+                native_backup_path,
+                native_restart_required,
+                native_error: recovery_error.clone(),
+                native_identity_count,
+                continuation_count,
+                archive_only_count,
+                restore_mapping_count,
+                recovery_error,
+                manual_intervention_count,
+                provider_labels: provider_labels.clone(),
+            };
+            if append_vendor_recovery_audit_event(
+                &self.data_root,
+                &provider_labels,
+                vendor_recovery,
+            )
+            .is_err()
+            {
+                let diagnostic = Some("audit-persistence-failed".into());
+                report.native_error = diagnostic.clone();
+                report.recovery_error = diagnostic;
+            }
+            Ok(report)
         })();
+        let _ = self.refresh_query_index();
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn restore_mappings_for(&self, session_id: Uuid) -> Result<Vec<RestoreMapping>, String> {
+        self.release_query_index()?;
+        let result = open_index(&self.data_root, &self.key_store)
+            .ok_or_else(|| "无法打开本地加密索引".to_owned())?
+            .restore_mappings_for(session_id)
+            .map_err(|_| "无法读取恢复映射".to_owned());
         let _ = self.refresh_query_index();
         result
     }
@@ -731,7 +1321,7 @@ impl AppState {
     }
 
     fn refresh_query_index(&self) -> Result<(), String> {
-        let index = open_index(&self.data_root)
+        let index = open_index(&self.data_root, &self.key_store)
             .ok_or_else(|| "扫描完成，但无法重新打开本地索引".to_owned())?;
         let mut services = self
             .services
@@ -749,11 +1339,43 @@ fn now_ns() -> u128 {
         .unwrap_or_default()
 }
 
+fn restore_mapping_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| format!("unix:{}", duration.as_secs()))
+        .unwrap_or_else(|_| "unix:0".into())
+}
+
+fn target_agent_kind(label: Option<&str>) -> Option<AgentKind> {
+    match label {
+        Some("codex") => Some(AgentKind::Codex),
+        Some("claude-code") => Some(AgentKind::ClaudeCode),
+        Some("hermes") => Some(AgentKind::Hermes),
+        Some("openclaw") => Some(AgentKind::OpenClaw),
+        Some("opencode") => Some(AgentKind::OpenCode),
+        Some("grok-build") => Some(AgentKind::GrokBuild),
+        _ => None,
+    }
+}
+
+fn source_agent_kind(source_kind: &str) -> Option<AgentKind> {
+    match source_kind {
+        "app-server" | "codex" => Some(AgentKind::Codex),
+        "claude" | "claude-code" => Some(AgentKind::ClaudeCode),
+        "hermes" => Some(AgentKind::Hermes),
+        "openclaw" => Some(AgentKind::OpenClaw),
+        "opencode" => Some(AgentKind::OpenCode),
+        "grok" | "grok-build" => Some(AgentKind::GrokBuild),
+        _ => None,
+    }
+}
+
 fn append_audit_event(
     root: &Path,
     event_type: &str,
     path: &Path,
     target: Option<Uuid>,
+    provider_labels: &[String],
 ) -> Result<(), String> {
     let event = AuditEvent {
         event_id: Uuid::new_v4(),
@@ -769,6 +1391,8 @@ fn append_audit_event(
         after_hash: None,
         plan_hash: None,
         result: "success".into(),
+        provider_labels: provider_labels.to_vec(),
+        vendor_recovery: None,
         previous_hash: None,
         event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
     };
@@ -777,27 +1401,223 @@ fn append_audit_event(
         .map_err(|_| "无法写入审计账本".to_owned())
 }
 
+fn append_vendor_recovery_audit_event(
+    root: &Path,
+    provider_labels: &[String],
+    vendor_recovery: VendorRecoveryAudit,
+) -> Result<(), String> {
+    let result = match vendor_recovery.status {
+        VendorRecoveryStatus::Complete => "complete",
+        VendorRecoveryStatus::Partial => "partial",
+        VendorRecoveryStatus::ManualIntervention => "manualIntervention",
+    };
+    let event = AuditEvent {
+        event_id: Uuid::new_v4(),
+        event_type: "vendor.recovery.completed".into(),
+        timestamp: "now".into(),
+        actor: "agentark-desktop".into(),
+        source: None,
+        target: None,
+        before_hash: None,
+        after_hash: None,
+        plan_hash: None,
+        result: result.into(),
+        provider_labels: provider_labels.to_vec(),
+        vendor_recovery: Some(vendor_recovery),
+        previous_hash: None,
+        event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
+    };
+    append_event(&root.join("audit.jsonl"), event)
+        .map(|_| ())
+        .map_err(|_| "audit-persistence-failed".to_owned())
+}
+
+fn extend_safe_provider_labels(
+    labels: &mut BTreeSet<String>,
+    value: Option<&str>,
+    scanner: &SecretScanner,
+) {
+    labels.extend(safe_provider_labels(value, scanner));
+}
+
+fn safe_provider_labels<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    scanner: &SecretScanner,
+) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let label = value.trim();
+            (!label.is_empty()
+                && scanner.sanitize(label).findings.is_empty()
+                && label.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                }))
+            .then(|| label.to_owned())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
+    restore_project_files_guarded(root, entries, &|| Ok(()))
+}
+
+fn restore_project_files_guarded<G>(
+    root: &Path,
+    entries: &[WorkspaceFileEntry],
+    guard: &G,
+) -> Result<(), String>
+where
+    G: Fn() -> Result<(), String> + ?Sized,
+{
+    let root_dir = project_restore_dir(root)?;
     for entry in entries {
-        let destination = root
-            .join(entry.workspace_id.to_string())
-            .join(&entry.relative_path);
-        if let Ok(existing) = fs::read(&destination) {
-            if agentark_canonical::Sha256Digest::from_bytes(&existing)
-                != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
-            {
-                return Err(format!("项目文件冲突：{}", entry.relative_path));
+        validate_project_relative_path(&entry.relative_path)?;
+        let relative_path =
+            PathBuf::from(entry.workspace_id.to_string()).join(&entry.relative_path);
+        let parent = relative_path
+            .parent()
+            .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+        let filename = relative_path
+            .file_name()
+            .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+        let parent_dir = open_or_create_project_relative_directory(&root_dir, parent)?;
+        match parent_dir.symlink_metadata(filename) {
+            Ok(metadata) => {
+                if is_cap_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                    return Err("项目恢复路径无效".into());
+                }
+                let mut existing_file = parent_dir
+                    .open(filename)
+                    .map_err(|_| "无法读取恢复项目文件".to_owned())?;
+                let mut existing = Vec::new();
+                existing_file
+                    .read_to_end(&mut existing)
+                    .map_err(|_| "无法读取恢复项目文件".to_owned())?;
+                if agentark_canonical::Sha256Digest::from_bytes(&existing)
+                    != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
+                {
+                    return Err(format!("项目文件冲突：{}", entry.relative_path));
+                }
+                continue;
             }
-            continue;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("项目恢复路径无效".into()),
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|_| "无法创建恢复项目目录".to_owned())?;
+        guard()?;
+        ensure_current_project_relative_directory_is_safe(&root_dir, parent)?;
+        match parent_dir.symlink_metadata(filename) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
+            Err(_) => return Err("项目恢复路径无效".into()),
         }
-        let temporary = destination.with_extension(format!("{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, &entry.bytes).map_err(|_| "无法写入恢复项目文件".to_owned())?;
-        fs::rename(&temporary, &destination).map_err(|_| "无法提交恢复项目文件".to_owned())?;
+        let temporary = PathBuf::from(format!(
+            ".{}.{}.tmp",
+            filename
+                .to_str()
+                .ok_or_else(|| "项目恢复路径无效".to_owned())?,
+            Uuid::new_v4()
+        ));
+        let write_result = (|| {
+            let mut options = CapOpenOptions::new();
+            options.create_new(true).write(true);
+            let mut temporary_file = parent_dir
+                .open_with(&temporary, &options)
+                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+            temporary_file
+                .write_all(&entry.bytes)
+                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+            temporary_file
+                .sync_all()
+                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+            drop(temporary_file);
+            guard()?;
+            ensure_current_project_relative_directory_is_safe(&root_dir, parent)?;
+            match parent_dir.symlink_metadata(filename) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
+                Err(_) => return Err("项目恢复路径无效".into()),
+            }
+            parent_dir
+                .rename(&temporary, &parent_dir, filename)
+                .map_err(|_| "无法提交恢复项目文件".to_owned())
+        })();
+        if write_result.is_err() {
+            let _ = parent_dir.remove_file(&temporary);
+        }
+        write_result?;
     }
     Ok(())
+}
+
+fn project_restore_dir(root: &Path) -> Result<Dir, String> {
+    open_or_create_directory_nofollow(root).map_err(|_| "项目恢复路径无效".to_owned())
+}
+
+fn open_or_create_project_relative_directory(dir: &Dir, path: &Path) -> Result<Dir, String> {
+    let mut current = dir.try_clone().map_err(|_| "项目恢复路径无效".to_owned())?;
+    for component in path.components() {
+        let std::path::Component::Normal(value) = component else {
+            return Err("项目恢复路径无效".into());
+        };
+        let child = Path::new(value);
+        match current.symlink_metadata(child) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("项目恢复路径无效".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match current.create_dir(child) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err("无法创建恢复项目目录".into()),
+                }
+            }
+            Err(_) => return Err("项目恢复路径无效".into()),
+        }
+        current = open_child_directory_nofollow(&current, child)
+            .map_err(|_| "项目恢复路径无效".to_owned())?;
+    }
+    Ok(current)
+}
+
+fn ensure_current_project_relative_directory_is_safe(dir: &Dir, path: &Path) -> Result<(), String> {
+    let metadata = dir
+        .symlink_metadata(path)
+        .map_err(|_| "项目恢复路径无效".to_owned())?;
+    if is_cap_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err("项目恢复路径无效".into());
+    }
+    Ok(())
+}
+
+fn validate_project_relative_path(relative: &str) -> Result<(), String> {
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative.contains('\0')
+        || Path::new(relative).is_absolute()
+        || relative
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err("项目恢复路径无效".into());
+    }
+    Ok(())
+}
+
+fn is_cap_link_or_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        metadata.file_attributes() & 0x0000_0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 pub fn detected_codex_home() -> Option<PathBuf> {
@@ -839,34 +1659,56 @@ fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".agentark-data"))
 }
 
-fn open_index(root: &Path) -> Option<IndexDb> {
+fn open_index(root: &Path, key_store: &StorageKeyStore) -> Option<IndexDb> {
+    let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
+    match key_store {
+        StorageKeyStore::Os => {
+            let store = OsMasterKeyStore::new(machine_id).ok()?;
+            open_index_with_store(root, &store)
+        }
+        StorageKeyStore::Memory(store) => open_index_with_store(root, store),
+    }
+}
+
+fn open_index_with_store(root: &Path, store: &dyn MasterKeyStore) -> Option<IndexDb> {
     let bootstrap_path = root.join("bootstrap.json");
     if !bootstrap_path.is_file() {
         return None;
     }
     let bootstrap: DatasetBootstrap =
         serde_json::from_slice(&std::fs::read(bootstrap_path).ok()?).ok()?;
-    let machine_id = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        root.to_string_lossy().as_bytes(),
-    );
-    let store = OsMasterKeyStore::new(machine_id).ok()?;
-    let keys = bootstrap.unlock(&store).ok()?;
+    let keys = bootstrap.unlock(store).ok()?;
     IndexDb::open(&root.join("index.db"), keys.sqlcipher_key()).ok()
 }
 
-fn open_storage(root: &Path) -> Result<(EncryptedCas, IndexDb), String> {
+fn open_storage(
+    root: &Path,
+    key_store: &StorageKeyStore,
+) -> Result<(EncryptedCas, IndexDb), String> {
+    let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
+    match key_store {
+        StorageKeyStore::Os => {
+            let store =
+                OsMasterKeyStore::new(machine_id).map_err(|_| "系统密钥存储不可用".to_owned())?;
+            open_storage_with_store(root, &store)
+        }
+        StorageKeyStore::Memory(store) => open_storage_with_store(root, store),
+    }
+}
+
+fn open_storage_with_store(
+    root: &Path,
+    store: &dyn MasterKeyStore,
+) -> Result<(EncryptedCas, IndexDb), String> {
     fs::create_dir_all(root).map_err(|_| "无法创建 AgentArk 数据目录".to_owned())?;
     let bootstrap_path = root.join("bootstrap.json");
-    let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
-    let store = OsMasterKeyStore::new(machine_id).map_err(|_| "系统密钥存储不可用".to_owned())?;
     let bootstrap = if bootstrap_path.is_file() {
         serde_json::from_slice(
             &fs::read(&bootstrap_path).map_err(|_| "无法读取本地数据密钥".to_owned())?,
         )
         .map_err(|_| "本地数据密钥格式无效".to_owned())?
     } else {
-        let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store)
+        let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), store)
             .map_err(|_| "无法创建本地数据密钥".to_owned())?;
         fs::write(
             &bootstrap_path,
@@ -877,7 +1719,7 @@ fn open_storage(root: &Path) -> Result<(EncryptedCas, IndexDb), String> {
         bootstrap
     };
     let keys = bootstrap
-        .unlock(&store)
+        .unlock(store)
         .map_err(|_| "无法解锁本地数据密钥".to_owned())?;
     let cas = EncryptedCas::open(root.join("cas"), &keys)
         .map_err(|_| "无法打开本地加密归档".to_owned())?;
@@ -913,4 +1755,129 @@ fn resolve_codex_executable() -> PathBuf {
         }
     }
     PathBuf::from("codex")
+}
+
+#[cfg(test)]
+mod restore_lock_tests {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use super::acquire_restore_lock;
+
+    #[test]
+    fn poisoned_restore_lock_fails_closed() {
+        let lock = Arc::new(Mutex::new(()));
+        let poisoned = Arc::clone(&lock);
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison restore lock fixture");
+        })
+        .join();
+
+        assert_eq!(
+            acquire_restore_lock(&lock).err().as_deref(),
+            Some("恢复操作锁不可用")
+        );
+    }
+}
+
+#[cfg(test)]
+mod project_restore_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(windows)]
+    use std::process::Command;
+
+    use agentark_bundle::WorkspaceFileEntry;
+    use uuid::Uuid;
+
+    use super::{restore_project_files, restore_project_files_guarded};
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("agentark-{label}-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn link_directory(link: &Path, target: &Path) {
+        let status = Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_string_lossy().as_ref(),
+                target.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    fn link_directory(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn project_restore_rejects_linked_workspace_destination() {
+        let root = TempRoot::new("project-restore-root");
+        let outside = TempRoot::new("project-restore-outside");
+        let workspace_id = Uuid::from_u128(97);
+        link_directory(&root.0.join(workspace_id.to_string()), &outside.0);
+        let entries = [WorkspaceFileEntry {
+            workspace_id,
+            relative_path: "src/main.rs".into(),
+            bytes: b"restored project content".to_vec(),
+        }];
+
+        let result = restore_project_files(&root.0, &entries);
+
+        assert!(result.is_err());
+        assert!(!outside.0.join("src").join("main.rs").exists());
+    }
+
+    #[test]
+    fn project_restore_never_writes_outside_when_workspace_is_replaced_before_write() {
+        let root = TempRoot::new("project-restore-race-root");
+        let outside = TempRoot::new("project-restore-race-outside");
+        let workspace_id = Uuid::from_u128(98);
+        let workspace = root.0.join(workspace_id.to_string());
+        let parked_workspace = root.0.join("parked-workspace");
+        let entries = [WorkspaceFileEntry {
+            workspace_id,
+            relative_path: "src/main.rs".into(),
+            bytes: b"restored project content".to_vec(),
+        }];
+        let guard_calls = AtomicUsize::new(0);
+
+        let result = restore_project_files_guarded(&root.0, &entries, &|| {
+            if guard_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                match fs::rename(&workspace, &parked_workspace) {
+                    Ok(()) => link_directory(&workspace, &outside.0),
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Err("test directory replacement was blocked by held handle".into());
+                    }
+                    Err(error) => panic!("unexpected directory replacement failure: {error}"),
+                }
+            }
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert!(guard_calls.load(Ordering::SeqCst) >= 1);
+        assert!(!outside.0.join("src").exists());
+    }
 }

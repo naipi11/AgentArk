@@ -356,6 +356,8 @@ fn append_audit(
         after_hash: None,
         plan_hash: None,
         result: "success".into(),
+        provider_labels: Vec::new(),
+        vendor_recovery: None,
         previous_hash: None,
         event_hash: agentark_canonical::Sha256Digest::from_bytes(b"pending"),
     };

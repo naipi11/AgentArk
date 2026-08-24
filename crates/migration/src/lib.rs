@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod recovery;
+
+pub use recovery::{
+    ProviderIdentity, RecoveryDecision, RestoreOutcome, TargetRecoveryCapabilities, decide_recovery,
+};
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;

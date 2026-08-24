@@ -14,7 +14,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAGIC: &[u8; 9] = b"AHBUNDLE1";
-const FORMAT_VERSION: &str = "1.1";
+const FORMAT_VERSION: &str = "1.2";
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: u32 = 100_000;
@@ -62,6 +62,22 @@ pub struct BundleManifest {
     pub entries: Vec<BundleEntryMeta>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleRecoverySession {
+    pub canonical_session_id: uuid::Uuid,
+    pub source_provider: Option<String>,
+    pub source_model: Option<String>,
+    pub native_payload_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleRecoveryManifest {
+    pub version: String,
+    pub sessions: Vec<BundleRecoverySession>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSelection {
     pub workspace_id: uuid::Uuid,
@@ -77,11 +93,24 @@ pub struct WorkspaceFileEntry {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeBundleEntry {
+    pub session_id: uuid::Uuid,
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+    pub redaction_count: u64,
+}
+
 struct BundleWriteMeta {
     agent: Option<String>,
     source_root: Option<String>,
     workspace_count: u64,
     file_count: u64,
+}
+
+enum RecoveryLabelKind {
+    Provider,
+    Model,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +126,13 @@ pub struct Bundle {
 }
 
 impl Bundle {
+    pub fn recovery_manifest(&self) -> Result<Option<BundleRecoveryManifest>, BundleError> {
+        self.entries
+            .get("recovery/manifest.json")
+            .map(|bytes| serde_json::from_slice(bytes).map_err(BundleError::from))
+            .transpose()
+    }
+
     pub fn session_records(&self) -> Result<Vec<CanonicalSession>, BundleError> {
         let mut sessions = Vec::new();
         for (path, bytes) in &self.entries {
@@ -165,6 +201,34 @@ impl Bundle {
         ids.dedup();
         Ok(ids)
     }
+
+    pub fn native_rollout_entries(&self) -> Result<Vec<NativeBundleEntry>, BundleError> {
+        let mut entries = Vec::new();
+        for path in self.entries.keys() {
+            let Some(rest) = path.strip_prefix("native/codex/") else {
+                continue;
+            };
+            let Some((session, relative)) = rest.split_once('/') else {
+                return Err(BundleError::UnsafePath(path.clone()));
+            };
+            let session_id = uuid::Uuid::parse_str(session)
+                .map_err(|_| BundleError::UnsafePath(path.clone()))?;
+            validate_relative_path(relative)?;
+            entries.push(NativeBundleEntry {
+                session_id,
+                relative_path: relative.to_owned(),
+                bytes: self
+                    .entries
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| BundleError::InvalidFormat(path.clone()))?,
+                // Redaction totals are intentionally represented by the
+                // bundle manifest rather than duplicated in each payload.
+                redaction_count: 0,
+            });
+        }
+        Ok(entries)
+    }
 }
 
 pub fn write_sessions(
@@ -204,6 +268,17 @@ pub fn write_selected_sessions(
     agent: &str,
     sessions: &[CanonicalSession],
     selections: &[ProjectSelection],
+    scanner: &SecretScanner,
+) -> Result<BundleManifest, BundleError> {
+    write_selected_sessions_with_native(path, agent, sessions, selections, &[], scanner)
+}
+
+pub fn write_selected_sessions_with_native(
+    path: &Path,
+    agent: &str,
+    sessions: &[CanonicalSession],
+    selections: &[ProjectSelection],
+    native_entries: &[NativeBundleEntry],
     scanner: &SecretScanner,
 ) -> Result<BundleManifest, BundleError> {
     let mut entries = Vec::with_capacity(sessions.len() + selections.len());
@@ -279,6 +354,44 @@ pub fn write_selected_sessions(
         });
         workspace_count += 1;
     }
+    for native in native_entries {
+        validate_relative_path(&native.relative_path)?;
+        redaction_count += native.redaction_count;
+        entries.push(BundleEntry {
+            path: format!(
+                "native/codex/{}/{}",
+                native.session_id, native.relative_path
+            ),
+            bytes: native.bytes.clone(),
+        });
+    }
+    let recovery_manifest = BundleRecoveryManifest {
+        version: "1".into(),
+        sessions: sessions
+            .iter()
+            .map(|session| BundleRecoverySession {
+                canonical_session_id: session.id,
+                source_provider: safe_recovery_label(
+                    session.model_provider.as_deref(),
+                    scanner,
+                    RecoveryLabelKind::Provider,
+                ),
+                source_model: safe_recovery_label(
+                    session.model_name.as_deref(),
+                    scanner,
+                    RecoveryLabelKind::Model,
+                ),
+                native_payload_count: native_entries
+                    .iter()
+                    .filter(|entry| entry.session_id == session.id)
+                    .count() as u64,
+            })
+            .collect(),
+    };
+    entries.push(BundleEntry {
+        path: "recovery/manifest.json".into(),
+        bytes: serde_json::to_vec_pretty(&recovery_manifest)?,
+    });
     let source_root = selections
         .first()
         .map(|selection| selection.root.to_string_lossy().into_owned());
@@ -445,7 +558,7 @@ pub fn read_bundle(path: &Path) -> Result<Bundle, BundleError> {
         .get("manifest.json")
         .ok_or_else(|| BundleError::InvalidFormat("manifest.json is missing".into()))?;
     let manifest: BundleManifest = serde_json::from_slice(manifest_bytes)?;
-    if manifest.format != "1.0" && manifest.format != FORMAT_VERSION {
+    if !matches!(manifest.format.as_str(), "1.0" | "1.1" | FORMAT_VERSION) {
         return Err(BundleError::InvalidFormat(
             "unsupported bundle version".into(),
         ));
@@ -489,6 +602,33 @@ fn redact_value(value: Value, scanner: &SecretScanner) -> (Value, u64) {
             (Value::Object(values), count)
         }
         other => (other, 0),
+    }
+}
+
+fn safe_recovery_label(
+    value: Option<&str>,
+    scanner: &SecretScanner,
+    kind: RecoveryLabelKind,
+) -> Option<String> {
+    let label = value?.trim();
+    if label.is_empty() {
+        return None;
+    }
+    if !scanner.sanitize(label).findings.is_empty() {
+        return None;
+    }
+    match kind {
+        RecoveryLabelKind::Provider => label
+            .chars()
+            .all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+            .then(|| label.to_owned()),
+        RecoveryLabelKind::Model => (!label.contains('/')
+            && !label.contains('\\')
+            && !label.contains(':')
+            && !label.contains("://"))
+        .then(|| label.to_owned()),
     }
 }
 

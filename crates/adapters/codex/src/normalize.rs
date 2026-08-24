@@ -190,7 +190,7 @@ fn item_text(item: &Value) -> String {
                 .iter()
                 .filter_map(|part| {
                     let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
-                    if kind == "input_text" || kind == "text" {
+                    if kind == "input_text" || kind == "output_text" || kind == "text" {
                         part.get("text").and_then(Value::as_str)
                     } else {
                         None

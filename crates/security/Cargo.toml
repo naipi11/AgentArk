@@ -7,11 +7,12 @@ publish.workspace = true
 
 [dependencies]
 cap-std.workspace = true
+cap-primitives = "=4.0.2"
 chacha20poly1305.workspace = true
-dunce.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 hex.workspace = true
+io-lifetimes = "=3.0.1"
 keyring.workspace = true
 regex.workspace = true
 sha2.workspace = true

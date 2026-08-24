@@ -1,0 +1,1968 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use agentark_adapter_codex::{
+    CodexContinuationReport, CodexContinuationRequest, CodexError, CodexTargetDefault,
+    JsonRpcTransport, NativeRestoreReport, RawJsonRpc, fork_rollout_with_target_provider_transport,
+    probe_target_default_transport,
+};
+use agentark_audit::{AuditEvent, VendorRecoveryAudit, VendorRecoveryStatus};
+use agentark_bundle::{NativeBundleEntry, read_bundle, write_selected_sessions_with_native};
+use agentark_canonical::{
+    AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession, Completeness,
+};
+use agentark_desktop_lib::recovery::{
+    CodexRecoveryExecutor, ExistingRestoreTarget, NativeAttemptSummary, RecoveryError,
+    RecoveryInput,
+};
+use agentark_desktop_lib::{AppState, RestoreMappingWriter};
+use agentark_index::{IndexDb, RestoreMapping};
+use agentark_security::SecretScanner;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+const SAFE_PROVIDER_LABEL: &str = "openai";
+const PROVIDER_TOKEN_CANARY: &str = "sk-proj-AgentArkProviderCanary1234567890123456";
+
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("agentark-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeScript {
+    Success,
+    MissingProvider,
+    ManualIntervention,
+    VerificationWithBackup,
+}
+
+#[derive(Clone, Copy)]
+enum ContinuationScript {
+    Success,
+    Unavailable,
+    ManualIntervention,
+}
+
+struct FakeExecutor {
+    native: Mutex<VecDeque<NativeScript>>,
+    continuation: Mutex<VecDeque<ContinuationScript>>,
+    target_default: Mutex<CodexTargetDefault>,
+    existing_verification: Mutex<Result<(), RecoveryError>>,
+    vendor_writes: AtomicUsize,
+    target_probe_calls: AtomicUsize,
+    native_calls: AtomicUsize,
+    continuation_calls: AtomicUsize,
+    existing_verification_calls: AtomicUsize,
+    rollback_calls: AtomicUsize,
+    rollback_fails: bool,
+    native_summary: Mutex<NativeAttemptSummary>,
+    restore_lock_probe: Option<AppState>,
+    restore_lock_checks: AtomicUsize,
+    audit_path_to_block: Option<PathBuf>,
+    audit_blocked: AtomicUsize,
+}
+
+impl FakeExecutor {
+    fn with_restore_lock_probe(mut self, state: AppState) -> Self {
+        self.restore_lock_probe = Some(state);
+        self
+    }
+
+    fn assert_restore_lock_held(&self) {
+        if let Some(state) = &self.restore_lock_probe {
+            assert!(!state.try_restore_lock_for_test().unwrap());
+            self.restore_lock_checks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn restore_lock_check_count(&self) -> usize {
+        self.restore_lock_checks.load(Ordering::SeqCst)
+    }
+
+    fn set_target_default(&self, provider: &str, model: &str) {
+        *self.target_default.lock().unwrap() = CodexTargetDefault {
+            model_provider: provider.into(),
+            model: model.into(),
+        };
+    }
+
+    fn target_probe_call_count(&self) -> usize {
+        self.target_probe_calls.load(Ordering::SeqCst)
+    }
+
+    fn existing_target_conflict(self) -> Self {
+        *self.existing_verification.lock().unwrap() = Err(RecoveryError::Conflict);
+        self
+    }
+
+    fn native_success(self) -> Self {
+        self.native.lock().unwrap().push_back(NativeScript::Success);
+        self
+    }
+
+    fn native_missing_provider(self) -> Self {
+        self.native
+            .lock()
+            .unwrap()
+            .push_back(NativeScript::MissingProvider);
+        self
+    }
+
+    fn native_manual_intervention(self) -> Self {
+        self.native
+            .lock()
+            .unwrap()
+            .push_back(NativeScript::ManualIntervention);
+        self
+    }
+
+    fn native_verification_with_backup(self) -> Self {
+        self.native
+            .lock()
+            .unwrap()
+            .push_back(NativeScript::VerificationWithBackup);
+        self
+    }
+
+    fn continuation_success(self) -> Self {
+        self.continuation
+            .lock()
+            .unwrap()
+            .push_back(ContinuationScript::Success);
+        self
+    }
+
+    fn continuation_unavailable(self) -> Self {
+        self.continuation
+            .lock()
+            .unwrap()
+            .push_back(ContinuationScript::Unavailable);
+        self
+    }
+
+    fn continuation_manual_intervention(self) -> Self {
+        self.continuation
+            .lock()
+            .unwrap()
+            .push_back(ContinuationScript::ManualIntervention);
+        self
+    }
+
+    fn vendor_write_count(&self) -> usize {
+        self.vendor_writes.load(Ordering::SeqCst)
+    }
+
+    fn continuation_call_count(&self) -> usize {
+        self.continuation_calls.load(Ordering::SeqCst)
+    }
+
+    fn existing_verification_call_count(&self) -> usize {
+        self.existing_verification_calls.load(Ordering::SeqCst)
+    }
+
+    fn rollback_failure(mut self) -> Self {
+        self.rollback_fails = true;
+        self
+    }
+
+    fn rollback_call_count(&self) -> usize {
+        self.rollback_calls.load(Ordering::SeqCst)
+    }
+
+    fn block_final_audit(mut self, audit_path: PathBuf) -> Self {
+        self.audit_path_to_block = Some(audit_path);
+        self
+    }
+
+    fn block_audit_once(&self) {
+        let Some(path) = &self.audit_path_to_block else {
+            return;
+        };
+        if self.audit_blocked.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+}
+
+impl CodexRecoveryExecutor for FakeExecutor {
+    fn probe_target_default(
+        &self,
+        _input: &RecoveryInput,
+    ) -> Result<CodexTargetDefault, RecoveryError> {
+        self.target_probe_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.target_default.lock().unwrap().clone())
+    }
+
+    fn try_native_identity(
+        &self,
+        input: &RecoveryInput,
+        _target_default: &CodexTargetDefault,
+    ) -> Result<NativeRestoreReport, RecoveryError> {
+        self.assert_restore_lock_held();
+        self.native_calls.fetch_add(1, Ordering::SeqCst);
+        match self.native.lock().unwrap().pop_front().unwrap() {
+            NativeScript::Success => {
+                self.vendor_writes.fetch_add(1, Ordering::SeqCst);
+                self.block_audit_once();
+                Ok(NativeRestoreReport {
+                    imported_count: 1,
+                    skipped_count: 2,
+                    conflict_count: 0,
+                    backup_path: Some(input.backup_root.join("fake-native")),
+                    mappings: vec![(
+                        input.session.id.to_string(),
+                        input.session.source_session_id.clone(),
+                    )],
+                    written_paths: vec![input.codex_home.join("sessions/fake-native.jsonl")],
+                    restart_required: true,
+                })
+            }
+            NativeScript::MissingProvider => Err(RecoveryError::MissingProvider),
+            NativeScript::ManualIntervention => Err(RecoveryError::Rollback),
+            NativeScript::VerificationWithBackup => {
+                *self.native_summary.lock().unwrap() = NativeAttemptSummary {
+                    skipped_count: 0,
+                    conflict_count: 1,
+                    backup_path: Some(input.backup_root.join("failed-native-backup")),
+                };
+                Err(RecoveryError::Verification)
+            }
+        }
+    }
+
+    fn create_continuation(
+        &self,
+        input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
+    ) -> Result<CodexContinuationReport, RecoveryError> {
+        self.assert_restore_lock_held();
+        self.continuation_calls.fetch_add(1, Ordering::SeqCst);
+        match self.continuation.lock().unwrap().pop_front().unwrap() {
+            ContinuationScript::Success => {
+                self.vendor_writes.fetch_add(1, Ordering::SeqCst);
+                let target_thread_id = format!("continued-{}", input.session.source_session_id);
+                let rollout_path = input.codex_home.join("sessions").join(format!(
+                    "fake-continuation-{}.jsonl",
+                    input.session.source_session_id
+                ));
+                fs::write(&rollout_path, b"verified fake continuation").unwrap();
+                self.block_audit_once();
+                Ok(CodexContinuationReport {
+                    source_thread_id: input.session.source_session_id.clone(),
+                    target_thread_id,
+                    rollout_path,
+                    model_provider: target_default.model_provider.clone(),
+                    model: target_default.model.clone(),
+                    visible_turns: input.session.messages.len(),
+                    rollout_hash: agentark_canonical::Sha256Digest::from_bytes(
+                        b"verified fake continuation",
+                    ),
+                    visible_history: agentark_adapter_codex::canonical_visible_history(
+                        &input.session,
+                    )
+                    .unwrap()
+                    .expectation(),
+                })
+            }
+            ContinuationScript::Unavailable => Err(RecoveryError::Unavailable),
+            ContinuationScript::ManualIntervention => Err(RecoveryError::ManualIntervention),
+        }
+    }
+
+    fn verify_existing_target(
+        &self,
+        _input: &RecoveryInput,
+        _target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError> {
+        self.existing_verification_calls
+            .fetch_add(1, Ordering::SeqCst);
+        *self.existing_verification.lock().unwrap()
+    }
+
+    fn rollback(
+        &self,
+        _input: &RecoveryInput,
+        _report: &agentark_desktop_lib::recovery::AutomaticRecoveryReport,
+    ) -> Result<(), RecoveryError> {
+        self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        if self.rollback_fails {
+            Err(RecoveryError::ManualIntervention)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn native_attempt_summary(&self) -> NativeAttemptSummary {
+        self.native_summary.lock().unwrap().clone()
+    }
+}
+
+fn fake_executor() -> FakeExecutor {
+    FakeExecutor {
+        native: Mutex::new(VecDeque::new()),
+        continuation: Mutex::new(VecDeque::new()),
+        target_default: Mutex::new(CodexTargetDefault {
+            model_provider: "source-provider".into(),
+            model: "source-model".into(),
+        }),
+        existing_verification: Mutex::new(Ok(())),
+        vendor_writes: AtomicUsize::new(0),
+        target_probe_calls: AtomicUsize::new(0),
+        native_calls: AtomicUsize::new(0),
+        continuation_calls: AtomicUsize::new(0),
+        existing_verification_calls: AtomicUsize::new(0),
+        rollback_calls: AtomicUsize::new(0),
+        rollback_fails: false,
+        native_summary: Mutex::new(NativeAttemptSummary::default()),
+        restore_lock_probe: None,
+        restore_lock_checks: AtomicUsize::new(0),
+        audit_path_to_block: None,
+        audit_blocked: AtomicUsize::new(0),
+    }
+}
+
+struct ReleaseCanaryTransport {
+    sent: Arc<Mutex<Vec<Value>>>,
+    responses: VecDeque<Value>,
+}
+
+impl ReleaseCanaryTransport {
+    fn new(responses: Vec<Value>) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                sent: Arc::clone(&sent),
+                responses: responses.into(),
+            },
+            sent,
+        )
+    }
+}
+
+impl JsonRpcTransport for ReleaseCanaryTransport {
+    fn send_value(&mut self, value: &Value) -> Result<(), CodexError> {
+        self.sent.lock().unwrap().push(value.clone());
+        Ok(())
+    }
+
+    fn receive_value(&mut self) -> Result<RawJsonRpc, CodexError> {
+        let value = self.responses.pop_front().ok_or(CodexError::EndOfStream)?;
+        Ok(RawJsonRpc {
+            bytes: serde_json::to_vec(&value).unwrap(),
+            value,
+        })
+    }
+}
+
+struct ScriptedProviderRuntimeExecutor {
+    sent: Mutex<Vec<Value>>,
+    native_calls: AtomicUsize,
+    fork_calls: AtomicUsize,
+}
+
+impl ScriptedProviderRuntimeExecutor {
+    fn new() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+            native_calls: AtomicUsize::new(0),
+            fork_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CodexRecoveryExecutor for ScriptedProviderRuntimeExecutor {
+    fn probe_target_default(
+        &self,
+        _input: &RecoveryInput,
+    ) -> Result<CodexTargetDefault, RecoveryError> {
+        let responses = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "config": {
+                        "model_provider": SAFE_PROVIDER_LABEL,
+                        "api_key": PROVIDER_TOKEN_CANARY,
+                        "base_url": "https://provider-config-canary.invalid/v1"
+                    },
+                    "layers": [{"value": PROVIDER_TOKEN_CANARY}]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [{"id": "gpt-5", "model": "gpt-5", "isDefault": true}],
+                    "nextCursor": null
+                }
+            }),
+        ];
+        let (mut transport, sent) = ReleaseCanaryTransport::new(responses);
+        let target = probe_target_default_transport(&mut transport)
+            .map_err(|_| RecoveryError::Unavailable)?;
+        self.sent
+            .lock()
+            .unwrap()
+            .extend(sent.lock().unwrap().iter().cloned());
+        Ok(target)
+    }
+
+    fn try_native_identity(
+        &self,
+        _input: &RecoveryInput,
+        _target_default: &CodexTargetDefault,
+    ) -> Result<NativeRestoreReport, RecoveryError> {
+        self.native_calls.fetch_add(1, Ordering::SeqCst);
+        Err(RecoveryError::Verification)
+    }
+
+    fn create_continuation(
+        &self,
+        input: &RecoveryInput,
+        target_default: &CodexTargetDefault,
+    ) -> Result<CodexContinuationReport, RecoveryError> {
+        self.fork_calls.fetch_add(1, Ordering::SeqCst);
+        let sessions = input.codex_home.join("sessions");
+        let source_rollout = sessions.join("scripted-source.jsonl");
+        let target_rollout = sessions.join("scripted-target.jsonl");
+        let target_cwd = input.codex_home.join("scripted-project");
+        fs::create_dir_all(&target_cwd).unwrap();
+        fs::write(&source_rollout, b"sanitized source").unwrap();
+        fs::write(&target_rollout, b"verified target").unwrap();
+        let target_thread_id = "019scripted-target";
+        let responses = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "modelProvider": SAFE_PROVIDER_LABEL,
+                    "model": "gpt-5",
+                    "thread": {"id": target_thread_id, "path": target_rollout}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "data": [{
+                        "id": target_thread_id,
+                        "cwd": target_cwd,
+                        "name": input.session.title,
+                        "path": target_rollout,
+                        "modelProvider": SAFE_PROVIDER_LABEL
+                    }],
+                    "nextCursor": null
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "result": {
+                    "thread": {
+                        "id": target_thread_id,
+                        "cwd": target_cwd,
+                        "name": input.session.title,
+                        "modelProvider": SAFE_PROVIDER_LABEL,
+                        "turns": [{"id": "turn-1", "items": [
+                            {"type": "agentMessage", "text": "sanitized fixture"}
+                        ]}]
+                    }
+                }
+            }),
+        ];
+        let (mut transport, sent) = ReleaseCanaryTransport::new(responses);
+        let request = CodexContinuationRequest {
+            source_rollout,
+            source_thread_id: input.session.source_session_id.clone(),
+            target_cwd,
+            target_provider: Some(target_default.model_provider.clone()),
+            target_model: Some(target_default.model.clone()),
+            title: input.session.title.clone(),
+            visible_history: agentark_adapter_codex::canonical_visible_history(&input.session)
+                .unwrap()
+                .expectation(),
+        };
+        let report = fork_rollout_with_target_provider_transport(
+            &mut transport,
+            &input.codex_home,
+            &request,
+        )
+        .map_err(|_| RecoveryError::Verification)?;
+        self.sent
+            .lock()
+            .unwrap()
+            .extend(sent.lock().unwrap().iter().cloned());
+        Ok(report)
+    }
+
+    fn verify_existing_target(
+        &self,
+        _input: &RecoveryInput,
+        _target: &ExistingRestoreTarget,
+    ) -> Result<(), RecoveryError> {
+        Ok(())
+    }
+
+    fn rollback(
+        &self,
+        _input: &RecoveryInput,
+        _report: &agentark_desktop_lib::recovery::AutomaticRecoveryReport,
+    ) -> Result<(), RecoveryError> {
+        Ok(())
+    }
+}
+
+fn serialized_continuation_request_with_provider_canary(root: &TempRoot) -> String {
+    let codex_home = root.path().join("request-codex-home");
+    let sessions = codex_home.join("sessions");
+    let source_rollout = sessions.join("source.jsonl");
+    let target_rollout = sessions.join("target.jsonl");
+    let target_cwd = root.path().join("request-project");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    fs::write(
+        &source_rollout,
+        format!(r#"{{"provider":"{SAFE_PROVIDER_LABEL}","apiKey":"{PROVIDER_TOKEN_CANARY}"}}"#),
+    )
+    .unwrap();
+    fs::write(&target_rollout, b"target rollout").unwrap();
+
+    let target_thread_id = "019release-canary-target";
+    let responses = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "modelProvider": SAFE_PROVIDER_LABEL,
+                "model": "gpt-5",
+                "thread": {
+                    "id": target_thread_id,
+                    "path": target_rollout,
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "data": [{
+                    "id": target_thread_id,
+                    "cwd": target_cwd,
+                    "path": target_rollout,
+                    "modelProvider": SAFE_PROVIDER_LABEL
+                }],
+                "nextCursor": null
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {
+                "thread": {
+                    "id": target_thread_id,
+                    "cwd": target_cwd,
+                    "modelProvider": SAFE_PROVIDER_LABEL,
+                    "turns": [{"id": "turn-1", "items": []}]
+                }
+            }
+        }),
+    ];
+    let (mut transport, sent) = ReleaseCanaryTransport::new(responses);
+    let request = CodexContinuationRequest {
+        source_rollout,
+        source_thread_id: "019release-canary-source".into(),
+        target_cwd,
+        target_provider: Some(SAFE_PROVIDER_LABEL.into()),
+        target_model: Some("gpt-5".into()),
+        title: None,
+        visible_history: agentark_adapter_codex::CodexVisibleHistoryExpectation {
+            message_count: 0,
+            content_hash: agentark_canonical::Sha256Digest::parse(
+                "sha256:9d8b77fbc3e8a7bfa6757b47b9419947b07c1599f91de8aceb4ab2b863635a6b",
+            )
+            .unwrap(),
+        },
+    };
+
+    fork_rollout_with_target_provider_transport(&mut transport, &codex_home, &request).unwrap();
+
+    let sent = sent.lock().unwrap();
+    serde_json::to_string(
+        sent.iter()
+            .find(|value| value["method"] == "thread/fork")
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn session(id: u128, native_id: &str) -> CanonicalSession {
+    let session_id = Uuid::from_u128(id);
+    let mut message =
+        CanonicalMessage::text_fixture(1, &session_id.to_string(), "sanitized fixture");
+    message.id = Uuid::new_v5(&session_id, b"fixture-message");
+    CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: session_id,
+        install_id: Uuid::from_u128(100),
+        source_session_id: native_id.into(),
+        source_kind: "app-server".into(),
+        workspace: None,
+        title: Some(format!("fixture {id}")),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: Some("source-provider".into()),
+        model_name: Some("source-model".into()),
+        completeness: Completeness::Complete,
+        messages: vec![message],
+        tool_events: Vec::new(),
+        attachments: Vec::new(),
+        raw_extra: Default::default(),
+    }
+}
+
+fn payload(session: &CanonicalSession) -> NativeBundleEntry {
+    let bytes = format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{}\",\"cwd\":\"C:/fixture\"}}}}\n",
+        session.source_session_id
+    )
+    .into_bytes();
+    NativeBundleEntry {
+        session_id: session.id,
+        relative_path: format!("2026/08/23/rollout-{}.jsonl", session.source_session_id),
+        bytes,
+        redaction_count: 0,
+    }
+}
+
+fn restore_with(executor: &FakeExecutor) -> Result<agentark_desktop_lib::BundleReport, String> {
+    restore_sessions_with(executor, vec![session(1, "native-one")])
+}
+
+fn restore_sessions_with(
+    executor: &FakeExecutor,
+    sessions: Vec<CanonicalSession>,
+) -> Result<agentark_desktop_lib::BundleReport, String> {
+    restore_fixture(executor, sessions, "codex", true).map(|fixture| fixture.report)
+}
+
+struct RestoredFixture {
+    _root: TempRoot,
+    state: AppState,
+    report: agentark_desktop_lib::BundleReport,
+    session_ids: Vec<Uuid>,
+    bundle_path: PathBuf,
+    codex_home: PathBuf,
+}
+
+fn restore_fixture(
+    executor: &dyn CodexRecoveryExecutor,
+    sessions: Vec<CanonicalSession>,
+    agent: &str,
+    include_payloads: bool,
+) -> Result<RestoredFixture, String> {
+    restore_fixture_with_writer(executor, sessions, agent, include_payloads, None)
+}
+
+fn restore_fixture_with_writer(
+    executor: &dyn CodexRecoveryExecutor,
+    sessions: Vec<CanonicalSession>,
+    agent: &str,
+    include_payloads: bool,
+    mapping_writer: Option<&dyn RestoreMappingWriter>,
+) -> Result<RestoredFixture, String> {
+    let root = TempRoot::new("provider-independent-restore");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("fixture.ahbundle");
+    let payloads = if include_payloads {
+        sessions.iter().map(payload).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let scanner = SecretScanner::v1().unwrap();
+    write_selected_sessions_with_native(&bundle_path, agent, &sessions, &[], &payloads, &scanner)
+        .unwrap();
+    let state = AppState::for_data_root(data_root);
+    let report = match mapping_writer {
+        Some(mapping_writer) => state.bundle_restore_with_executor_and_mapping_writer(
+            bundle_path.clone(),
+            executor,
+            mapping_writer,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )?,
+        None => state.bundle_restore_with_executor(
+            bundle_path.clone(),
+            executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )?,
+    };
+    Ok(RestoredFixture {
+        _root: root,
+        state,
+        report,
+        session_ids: sessions.iter().map(|session| session.id).collect(),
+        bundle_path,
+        codex_home,
+    })
+}
+
+fn audit_events(fixture: &RestoredFixture) -> Vec<AuditEvent> {
+    fs::read_to_string(fixture._root.path().join("data/audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn vendor_summary(fixture: &RestoredFixture) -> VendorRecoveryAudit {
+    audit_events(fixture)
+        .last()
+        .unwrap()
+        .vendor_recovery
+        .clone()
+        .unwrap()
+}
+
+fn write_legacy_codex_bundle(path: &Path, session: &CanonicalSession, agent: Option<&str>) {
+    let mut session_bytes = serde_json::to_vec(session).unwrap();
+    session_bytes.push(b'\n');
+    let session_path = format!("sessions/{}.ndjson", session.id);
+    let manifest = json!({
+        "format": "1.1",
+        "agent": agent,
+        "createdAt": "2026-08-23T00:00:00Z",
+        "sessionCount": 1,
+        "workspaceCount": 0,
+        "fileCount": 0,
+        "redacted": false,
+        "redactionCount": 0,
+        "entries": [{
+            "path": session_path,
+            "size": session_bytes.len(),
+            "sha256": sha256_hex(&session_bytes)
+        }]
+    });
+    let entries = [
+        (
+            "manifest.json".to_owned(),
+            serde_json::to_vec(&manifest).unwrap(),
+        ),
+        (session_path, session_bytes),
+    ];
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(b"AHBUNDLE1").unwrap();
+    file.write_all(&(entries.len() as u32).to_le_bytes())
+        .unwrap();
+    for (entry_path, bytes) in entries {
+        file.write_all(&(entry_path.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(entry_path.as_bytes()).unwrap();
+        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&sha256_bytes(&bytes)).unwrap();
+        file.write_all(&bytes).unwrap();
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    agentark_canonical::Sha256Digest::from_bytes(bytes)
+        .as_str()
+        .strip_prefix("sha256:")
+        .unwrap()
+        .to_owned()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let hex = sha256_hex(bytes);
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    digest
+}
+
+fn restore_again(
+    fixture: &RestoredFixture,
+    executor: &dyn CodexRecoveryExecutor,
+) -> agentark_desktop_lib::BundleReport {
+    fixture
+        .state
+        .bundle_restore_with_executor(
+            fixture.bundle_path.clone(),
+            executor,
+            fixture.codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            fixture.codex_home.join("agentark-backups"),
+        )
+        .unwrap()
+}
+
+fn restore_again_with_writer(
+    fixture: &RestoredFixture,
+    executor: &dyn CodexRecoveryExecutor,
+    mapping_writer: &dyn RestoreMappingWriter,
+) -> agentark_desktop_lib::BundleReport {
+    fixture
+        .state
+        .bundle_restore_with_executor_and_mapping_writer(
+            fixture.bundle_path.clone(),
+            executor,
+            mapping_writer,
+            fixture.codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            fixture.codex_home.join("agentark-backups"),
+        )
+        .unwrap()
+}
+
+struct LockCheckingMappingWriter {
+    state: AppState,
+    calls: AtomicUsize,
+}
+
+impl LockCheckingMappingWriter {
+    fn new(state: AppState) -> Self {
+        Self {
+            state,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl RestoreMappingWriter for LockCheckingMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        assert!(!self.state.try_restore_lock_for_test().unwrap());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        index
+            .record_restore_mapping(mapping)
+            .map_err(|_| "fixture-mapping-failure".into())
+    }
+}
+
+#[test]
+fn restore_lock_spans_vendor_write_mapping_and_repeat_reuse() {
+    let root = TempRoot::new("shared-restore-lock");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("fixture.ahbundle");
+    let restored_session = session(30, "native-concurrent");
+    write_selected_sessions_with_native(
+        &bundle_path,
+        "codex",
+        std::slice::from_ref(&restored_session),
+        &[],
+        &[payload(&restored_session)],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success()
+        .with_restore_lock_probe(state.clone());
+    let mapping_writer = LockCheckingMappingWriter::new(state.clone());
+
+    let first_report = state
+        .bundle_restore_with_executor_and_mapping_writer(
+            bundle_path.clone(),
+            &executor,
+            &mapping_writer,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+    let second_report = state
+        .bundle_restore_with_executor_and_mapping_writer(
+            bundle_path,
+            &executor,
+            &mapping_writer,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+    let mappings = state.restore_mappings_for(restored_session.id).unwrap();
+
+    assert_eq!(executor.restore_lock_check_count(), 2);
+    assert_eq!(mapping_writer.call_count(), 1);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), 1);
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(
+        mappings[0].target_native_id.as_deref(),
+        Some("continued-native-concurrent")
+    );
+    assert_eq!(first_report.restore_mapping_count, 1);
+    assert_eq!(second_report.restore_mapping_count, 1);
+    assert_eq!(first_report.continuation_count, 1);
+    assert_eq!(second_report.continuation_count, 0);
+    assert!(!second_report.native_restart_required);
+}
+
+#[test]
+fn isolated_test_states_share_one_restore_lock() {
+    let first = AppState::for_data_root(TempRoot::new("shared-lock-first").path().join("data"));
+    let second = AppState::for_data_root(TempRoot::new("shared-lock-second").path().join("data"));
+
+    assert!(first.shares_restore_lock_for_test(&second));
+}
+
+#[test]
+fn compatible_payload_retains_original_id() {
+    let executor = fake_executor().native_success();
+    let report = restore_with(&executor).unwrap();
+    assert_eq!(report.native_identity_count, 1);
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.manual_intervention_count, 0);
+    assert_eq!(report.native_skipped_count, 2);
+    assert!(
+        report
+            .native_backup_path
+            .as_deref()
+            .unwrap()
+            .ends_with("fake-native")
+    );
+}
+
+#[test]
+fn missing_source_provider_falls_back_to_target_default_continuation() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let report = restore_with(&executor).unwrap();
+    assert_eq!(report.native_identity_count, 0);
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+}
+
+#[test]
+fn codex_session_without_native_payload_continues_from_canonical_history() {
+    let executor = fake_executor().continuation_success();
+
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(40, "canonical-only-source")],
+        "codex",
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.continuation_count, 1);
+    assert_eq!(fixture.report.archive_only_count, 0);
+    assert_eq!(executor.native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.continuation_call_count(), 1);
+    let mapping = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+    assert_eq!(mapping.len(), 1);
+    assert_eq!(
+        mapping[0].outcome,
+        agentark_migration::RestoreOutcome::Continuation
+    );
+}
+
+#[test]
+fn legacy_v1_1_codex_bundle_without_recovery_or_native_entries_continues() {
+    let root = TempRoot::new("legacy-canonical-continuation");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("legacy.ahbundle");
+    let legacy_session = session(41, "legacy-source");
+    write_legacy_codex_bundle(&bundle_path, &legacy_session, Some("codex"));
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor().continuation_success();
+
+    let report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            &executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(executor.native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(
+        state.restore_mappings_for(legacy_session.id).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn legacy_bundle_with_unambiguous_codex_sessions_continues_without_agent_label() {
+    let root = TempRoot::new("legacy-unambiguous-codex");
+    let data_root = root.path().join("data");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("legacy-no-agent.ahbundle");
+    let legacy_session = session(43, "legacy-unambiguous-source");
+    write_legacy_codex_bundle(&bundle_path, &legacy_session, None);
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor().continuation_success();
+
+    let report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            &executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(executor.continuation_call_count(), 1);
+}
+
+#[test]
+fn changed_canonical_history_conflicts_before_repeat_write_without_native_payload() {
+    let executor = fake_executor().continuation_success();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(42, "canonical-history-change")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+    let mut changed = session(42, "canonical-history-change");
+    changed.messages[0].content[0].text = Some("changed sanitized canonical text".into());
+    write_selected_sessions_with_native(
+        &fixture.bundle_path,
+        "codex",
+        std::slice::from_ref(&changed),
+        &[],
+        &[],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.continuation_count, 0);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn production_scripted_target_default_skips_incompatible_native_and_forks_explicitly() {
+    let executor = ScriptedProviderRuntimeExecutor::new();
+    let mut custom_session = session(8, "native-custom-provider");
+    custom_session.model_provider = Some("custom".into());
+    custom_session.model_name = Some("claude-custom".into());
+
+    let fixture = restore_fixture(&executor, vec![custom_session], "codex", true).unwrap();
+
+    assert_eq!(executor.native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.fork_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.continuation_count, 1);
+    let sent = executor.sent.lock().unwrap();
+    let fork = sent
+        .iter()
+        .find(|request| request["method"] == "thread/fork")
+        .unwrap();
+    assert_eq!(fork["params"]["modelProvider"], SAFE_PROVIDER_LABEL);
+    assert_eq!(fork["params"]["model"], "gpt-5");
+    let mapping = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        mapping.target_provider.as_deref(),
+        Some(SAFE_PROVIDER_LABEL)
+    );
+    let sinks = format!(
+        "{}\n{:?}\n{}\n{}",
+        serde_json::to_string(&fixture.report).unwrap(),
+        mapping,
+        fs::read_to_string(fixture._root.path().join("data/audit.jsonl")).unwrap(),
+        serde_json::to_string(&*sent).unwrap()
+    );
+    assert!(!sinks.contains(PROVIDER_TOKEN_CANARY));
+    assert!(!sinks.contains("https://provider-config-canary.invalid/v1"));
+}
+
+#[test]
+fn repeating_verified_continuation_reuses_one_target_and_one_mapping() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture =
+        restore_fixture(&executor, vec![session(9, "native-repeat")], "codex", true).unwrap();
+    let original = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(executor.target_probe_call_count(), 1);
+    executor.set_target_default("other-provider", "other-model");
+
+    let second = restore_again(&fixture, &executor);
+    let mappings = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), 1);
+    assert_eq!(executor.target_probe_call_count(), 1);
+    assert_eq!(second.native_identity_count, 0);
+    assert_eq!(second.continuation_count, 0);
+    assert_eq!(second.native_imported_count, 0);
+    assert!(!second.native_restart_required);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].target_native_id, original.target_native_id);
+}
+
+#[test]
+fn changed_native_bytes_with_same_canonical_history_reuses_without_repeat_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(10, "native-changed-source")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let changed_session = session(10, "native-changed-source");
+    let mut changed_payload = payload(&changed_session);
+    changed_payload
+        .bytes
+        .extend_from_slice(b"{\"type\":\"changed\"}\n");
+    write_selected_sessions_with_native(
+        &fixture.bundle_path,
+        "codex",
+        std::slice::from_ref(&changed_session),
+        &[],
+        &[changed_payload],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.native_identity_count, 0);
+    assert_eq!(second.continuation_count, 0);
+    assert_eq!(second.manual_intervention_count, 0);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(second.recovery_error, None);
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn missing_or_mismatched_mapped_target_conflicts_without_new_vendor_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success()
+        .existing_target_conflict();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(11, "native-missing-target")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn repeated_archive_only_restore_does_not_add_another_archive_mapping() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .native_missing_provider()
+        .continuation_unavailable()
+        .continuation_unavailable();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(12, "native-archive-repeat")],
+        "codex",
+        true,
+    )
+    .unwrap();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(second.archive_only_count, 1);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn provider_token_canary_stays_out_of_release_sinks_while_label_survives() {
+    let request_root = TempRoot::new("provider-token-request");
+    let continuation_request = serialized_continuation_request_with_provider_canary(&request_root);
+
+    let mut canary_session = session(7, "native-provider-canary");
+    canary_session.model_provider = Some(SAFE_PROVIDER_LABEL.into());
+    canary_session.raw_extra = BTreeMap::from([(
+        "providerConfiguration".into(),
+        json!({"apiKey": PROVIDER_TOKEN_CANARY}),
+    )]);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture(&executor, vec![canary_session], "codex", true).unwrap();
+
+    let bundle = read_bundle(&fixture._root.path().join("fixture.ahbundle")).unwrap();
+    let recovery_manifest = String::from_utf8(
+        bundle
+            .entries
+            .get("recovery/manifest.json")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let mapping = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let restore_mapping = format!("{mapping:?}");
+    let ui_report = serde_json::to_string(&fixture.report).unwrap();
+    let audit_event = fs::read_to_string(fixture._root.path().join("data/audit.jsonl")).unwrap();
+    assert!(fixture.state.audit_verify().unwrap().valid);
+
+    let sinks = [
+        ("native continuation request", continuation_request),
+        ("recovery manifest", recovery_manifest),
+        ("restore mapping", restore_mapping),
+        ("UI report", ui_report),
+        ("audit event", audit_event),
+    ];
+    let leaked_tokens = sinks
+        .iter()
+        .filter_map(|(name, value)| value.contains(PROVIDER_TOKEN_CANARY).then_some(*name))
+        .collect::<Vec<_>>();
+    let missing_labels = sinks
+        .iter()
+        .filter_map(|(name, value)| (!value.contains(SAFE_PROVIDER_LABEL)).then_some(*name))
+        .collect::<Vec<_>>();
+
+    assert!(
+        leaked_tokens.is_empty(),
+        "provider token canary leaked into: {leaked_tokens:?}"
+    );
+    assert!(
+        missing_labels.is_empty(),
+        "safe provider label missing from: {missing_labels:?}"
+    );
+}
+
+#[test]
+fn unverified_target_stays_archive_only_without_vendor_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_unavailable();
+    let report = restore_with(&executor).unwrap();
+    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(executor.vendor_write_count(), 0);
+}
+
+#[test]
+fn archive_only_session_does_not_skip_later_continuation_or_mapping() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .native_missing_provider()
+        .continuation_unavailable()
+        .continuation_success();
+    let fixture = restore_fixture(
+        &executor,
+        vec![session(1, "native-one"), session(2, "native-two")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let report = &fixture.report;
+    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.restore_mapping_count, 2);
+    for session_id in fixture.session_ids {
+        assert_eq!(
+            fixture
+                .state
+                .restore_mappings_for(session_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn non_codex_bundle_records_archive_only_mapping_for_every_session() {
+    let fixture = restore_fixture(
+        &fake_executor(),
+        vec![session(1, "claude-one"), session(2, "claude-two")],
+        "claude-code",
+        false,
+    )
+    .unwrap();
+    assert_eq!(fixture.report.archive_only_count, 2);
+    assert_eq!(fixture.report.restore_mapping_count, 2);
+    for session_id in fixture.session_ids {
+        let mappings = fixture.state.restore_mappings_for(session_id).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].target_agent, AgentKind::ClaudeCode);
+        assert_eq!(mappings[0].reason_code, "target-recovery-unavailable");
+    }
+}
+
+#[test]
+fn all_agent_bundle_uses_safe_source_agent_mapping_and_unavailable_reason() {
+    let fixture = restore_fixture(
+        &fake_executor(),
+        vec![session(1, "native-one")],
+        "all",
+        false,
+    )
+    .unwrap();
+    let mappings = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+
+    assert_eq!(fixture.report.archive_only_count, 1);
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].target_agent, AgentKind::Codex);
+    assert_eq!(mappings[0].reason_code, "target-agent-unavailable");
+}
+
+#[test]
+fn native_rollback_failure_requires_manual_intervention_without_continuation() {
+    let executor = fake_executor().native_manual_intervention();
+    let fixture =
+        restore_fixture(&executor, vec![session(1, "native-one")], "codex", true).unwrap();
+    let report = &fixture.report;
+    assert_eq!(report.native_identity_count, 0);
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.manual_intervention_count, 1);
+    assert_eq!(report.restore_mapping_count, 0);
+    assert_eq!(executor.continuation_call_count(), 0);
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("manual-intervention-required")
+    );
+    assert!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+struct FailingMappingWriter;
+
+impl RestoreMappingWriter for FailingMappingWriter {
+    fn record(&self, _index: &mut IndexDb, _mapping: &RestoreMapping) -> Result<(), String> {
+        Err("fixture-mapping-failure".into())
+    }
+}
+
+struct MissingTargetHashMappingWriter;
+
+impl RestoreMappingWriter for MissingTargetHashMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        let mut incomplete = mapping.clone();
+        incomplete.target_hash = None;
+        index
+            .record_restore_mapping(&incomplete)
+            .map_err(|_| "fixture-mapping-failure".into())
+    }
+}
+
+struct LegacyPayloadHashMappingWriter {
+    source_hash: agentark_canonical::Sha256Digest,
+}
+
+impl RestoreMappingWriter for LegacyPayloadHashMappingWriter {
+    fn record(&self, index: &mut IndexDb, mapping: &RestoreMapping) -> Result<(), String> {
+        let mut legacy = mapping.clone();
+        legacy.source_hash = self.source_hash.clone();
+        index
+            .record_restore_mapping(&legacy)
+            .map_err(|_| "fixture-mapping-failure".into())
+    }
+}
+
+#[test]
+fn legacy_payload_hash_mapping_reuses_exact_target_without_repeat_write() {
+    let restored_session = session(45, "legacy-payload-hash");
+    let legacy_hash =
+        agentark_canonical::Sha256Digest::from_bytes(&payload(&restored_session).bytes);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![restored_session],
+        "codex",
+        true,
+        Some(&LegacyPayloadHashMappingWriter {
+            source_hash: legacy_hash,
+        }),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.existing_verification_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.restore_mapping_count, 1);
+    assert_eq!(second.manual_intervention_count, 0);
+}
+
+#[test]
+fn legacy_payload_hash_mapping_still_conflicts_when_exact_target_is_invalid() {
+    let restored_session = session(46, "legacy-payload-hash-invalid-target");
+    let legacy_hash =
+        agentark_canonical::Sha256Digest::from_bytes(&payload(&restored_session).bytes);
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success()
+        .existing_target_conflict();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![restored_session],
+        "codex",
+        true,
+        Some(&LegacyPayloadHashMappingWriter {
+            source_hash: legacy_hash,
+        }),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.existing_verification_call_count(), 1);
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+}
+
+#[test]
+fn existing_mapping_without_target_hash_conflicts_before_repeat_vendor_write() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![session(44, "missing-target-hash")],
+        "codex",
+        true,
+        Some(&MissingTargetHashMappingWriter),
+    )
+    .unwrap();
+    let writes_before = executor.vendor_write_count();
+
+    let second = restore_again(&fixture, &executor);
+
+    assert_eq!(executor.vendor_write_count(), writes_before);
+    assert_eq!(executor.continuation_call_count(), 1);
+    assert_eq!(second.manual_intervention_count, 1);
+    assert_eq!(
+        second.recovery_error.as_deref(),
+        Some("restore-mapping-conflict")
+    );
+}
+
+#[test]
+fn failed_archive_upgrade_keeps_existing_mapping_count_after_rollback() {
+    let initial_executor = fake_executor()
+        .native_missing_provider()
+        .continuation_unavailable();
+    let fixture = restore_fixture(
+        &initial_executor,
+        vec![session(31, "native-archive-upgrade")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let retry_executor = fake_executor()
+        .native_missing_provider()
+        .continuation_success();
+
+    let report = restore_again_with_writer(&fixture, &retry_executor, &FailingMappingWriter);
+    let mappings = fixture
+        .state
+        .restore_mappings_for(fixture.session_ids[0])
+        .unwrap();
+
+    assert_eq!(retry_executor.rollback_call_count(), 1);
+    assert_eq!(report.native_identity_count, 0);
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 1);
+    assert_eq!(report.restore_mapping_count, 1);
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("restore-mapping-persistence-failed")
+    );
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(
+        mappings[0].outcome,
+        agentark_migration::RestoreOutcome::ArchiveOnly
+    );
+}
+
+#[test]
+fn mapping_persistence_failure_rolls_back_and_is_not_counted_as_success() {
+    let executor = fake_executor().native_success();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![session(1, "native-one")],
+        "codex",
+        true,
+        Some(&FailingMappingWriter),
+    )
+    .unwrap();
+
+    assert_eq!(executor.rollback_call_count(), 1);
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.continuation_count, 0);
+    assert_eq!(fixture.report.archive_only_count, 1);
+    assert_eq!(fixture.report.restore_mapping_count, 0);
+    assert_eq!(
+        fixture.report.recovery_error.as_deref(),
+        Some("restore-mapping-persistence-failed")
+    );
+    assert!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .is_empty()
+    );
+    let audit = vendor_summary(&fixture);
+    assert_eq!(audit.archive_only_count, 1);
+    assert_eq!(audit.manual_intervention_count, 0);
+    assert_eq!(audit.status, VendorRecoveryStatus::Partial);
+    assert_eq!(
+        audit.target_hashes_digest.as_str(),
+        "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    );
+}
+
+#[test]
+fn mapping_persistence_and_rollback_failure_requires_manual_intervention() {
+    let executor = fake_executor().native_success().rollback_failure();
+    let fixture = restore_fixture_with_writer(
+        &executor,
+        vec![session(1, "native-one")],
+        "codex",
+        true,
+        Some(&FailingMappingWriter),
+    )
+    .unwrap();
+
+    assert_eq!(fixture.report.native_identity_count, 0);
+    assert_eq!(fixture.report.archive_only_count, 0);
+    assert_eq!(fixture.report.manual_intervention_count, 1);
+    assert_eq!(
+        fixture.report.recovery_error.as_deref(),
+        Some("manual-intervention-required")
+    );
+    let audit = vendor_summary(&fixture);
+    assert_eq!(audit.archive_only_count, 0);
+    assert_eq!(audit.manual_intervention_count, 1);
+    assert_eq!(audit.status, VendorRecoveryStatus::ManualIntervention);
+    assert_eq!(
+        audit.target_hashes_digest.as_str(),
+        "sha256:3bff9163cef68f1366cd6b53e5679e897fae1f3cf20b1014afcfe78836dce698"
+    );
+}
+
+#[test]
+fn failed_native_attempt_preserves_conflict_and_backup_metrics_after_continuation() {
+    let executor = fake_executor()
+        .native_verification_with_backup()
+        .continuation_success();
+    let report = restore_with(&executor).unwrap();
+
+    assert_eq!(report.continuation_count, 1);
+    assert_eq!(report.native_conflict_count, 1);
+    assert!(
+        report
+            .native_backup_path
+            .as_deref()
+            .unwrap()
+            .ends_with("failed-native-backup")
+    );
+}
+
+#[test]
+fn failed_continuation_rollback_reports_manual_intervention() {
+    let executor = fake_executor()
+        .native_missing_provider()
+        .continuation_manual_intervention();
+    let fixture =
+        restore_fixture(&executor, vec![session(1, "native-one")], "codex", true).unwrap();
+    let report = &fixture.report;
+
+    assert_eq!(report.continuation_count, 0);
+    assert_eq!(report.archive_only_count, 0);
+    assert_eq!(report.manual_intervention_count, 1);
+    assert_eq!(report.restore_mapping_count, 0);
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("manual-intervention-required")
+    );
+    assert!(
+        fixture
+            .state
+            .restore_mappings_for(fixture.session_ids[0])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn native_recovery_appends_archive_then_complete_vendor_audit() {
+    let executor = fake_executor().native_success();
+    let fixture =
+        restore_fixture(&executor, vec![session(50, "native-audit")], "codex", true).unwrap();
+    let events = audit_events(&fixture);
+
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bundle.restored", "vendor.recovery.completed"]
+    );
+    let summary = events[1].vendor_recovery.as_ref().unwrap();
+    assert_eq!(summary.native_identity_count, 1);
+    assert_eq!(summary.continuation_count, 0);
+    assert_eq!(summary.archive_only_count, 0);
+    assert_eq!(summary.manual_intervention_count, 0);
+    assert_eq!(summary.status, VendorRecoveryStatus::Complete);
+    assert_eq!(events[1].result, "complete");
+    assert_eq!(events[1].source, None);
+    assert_eq!(events[1].target, None);
+    assert!(fixture.state.audit_verify().unwrap().valid);
+}
+
+#[test]
+fn continuation_and_archive_only_audits_report_truthful_partial_counts() {
+    let continuation_executor = fake_executor().continuation_success();
+    continuation_executor.set_target_default("target-provider", "target-model");
+    let continuation = restore_fixture(
+        &continuation_executor,
+        vec![session(51, "continuation-audit")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let continuation_summary = vendor_summary(&continuation);
+    assert_eq!(continuation_summary.continuation_count, 1);
+    assert_eq!(continuation_summary.status, VendorRecoveryStatus::Complete);
+    assert_eq!(
+        audit_events(&continuation)[1].provider_labels,
+        vec!["source-provider", "target-provider"]
+    );
+
+    let archive_executor = fake_executor().continuation_unavailable();
+    let archive = restore_fixture(
+        &archive_executor,
+        vec![session(52, "archive-audit")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let archive_summary = vendor_summary(&archive);
+    assert_eq!(archive_summary.archive_only_count, 1);
+    assert_eq!(archive_summary.status, VendorRecoveryStatus::Partial);
+    assert_eq!(audit_events(&archive)[1].result, "partial");
+}
+
+#[test]
+fn mixed_and_manual_fixtures_append_final_truthful_vendor_audits() {
+    let mixed_executor = fake_executor()
+        .native_success()
+        .native_missing_provider()
+        .native_missing_provider()
+        .continuation_success()
+        .continuation_unavailable();
+    let mixed = restore_fixture(
+        &mixed_executor,
+        vec![
+            session(53, "native-mixed"),
+            session(54, "continuation-mixed"),
+            session(55, "archive-mixed"),
+        ],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let mixed_summary = vendor_summary(&mixed);
+    assert_eq!(mixed_summary.native_identity_count, 1);
+    assert_eq!(mixed_summary.continuation_count, 1);
+    assert_eq!(mixed_summary.archive_only_count, 1);
+    assert_eq!(mixed_summary.manual_intervention_count, 0);
+    assert_eq!(mixed_summary.status, VendorRecoveryStatus::Partial);
+    assert!(mixed.state.audit_verify().unwrap().valid);
+
+    let manual_executor = fake_executor().native_manual_intervention();
+    let manual = restore_fixture(
+        &manual_executor,
+        vec![session(56, "manual-audit")],
+        "codex",
+        true,
+    )
+    .unwrap();
+    let manual_summary = vendor_summary(&manual);
+    assert_eq!(manual_summary.manual_intervention_count, 1);
+    assert_eq!(
+        manual_summary.status,
+        VendorRecoveryStatus::ManualIntervention
+    );
+    assert_eq!(audit_events(&manual)[1].result, "manualIntervention");
+}
+
+#[test]
+fn recovery_audit_hashes_are_deterministic_across_session_order() {
+    let first_executor = fake_executor()
+        .continuation_success()
+        .continuation_success();
+    let first = restore_fixture(
+        &first_executor,
+        vec![session(57, "hash-a"), session(58, "hash-b")],
+        "codex",
+        false,
+    )
+    .unwrap();
+    let second_executor = fake_executor()
+        .continuation_success()
+        .continuation_success();
+    let second = restore_fixture(
+        &second_executor,
+        vec![session(58, "hash-b"), session(57, "hash-a")],
+        "codex",
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(vendor_summary(&first), vendor_summary(&second));
+}
+
+#[test]
+fn verified_mapping_reuse_is_included_in_final_vendor_audit() {
+    let executor = fake_executor().continuation_success();
+    let fixture =
+        restore_fixture(&executor, vec![session(59, "reuse-audit")], "codex", false).unwrap();
+    let first_summary = vendor_summary(&fixture);
+
+    let second_report = restore_again(&fixture, &executor);
+    let events = audit_events(&fixture);
+    let reused = events.last().unwrap().vendor_recovery.as_ref().unwrap();
+
+    assert_eq!(second_report.continuation_count, 0);
+    assert_eq!(reused.continuation_count, 1);
+    assert_eq!(
+        reused.source_hashes_digest,
+        first_summary.source_hashes_digest
+    );
+    assert_eq!(
+        reused.target_hashes_digest,
+        first_summary.target_hashes_digest
+    );
+    assert_eq!(reused.status, VendorRecoveryStatus::Complete);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "bundle.restored",
+            "vendor.recovery.completed",
+            "bundle.restored",
+            "vendor.recovery.completed",
+        ]
+    );
+}
+
+#[test]
+fn final_audit_failure_preserves_archive_target_and_mapping_with_safe_diagnostic() {
+    let root = TempRoot::new("final-audit-failure");
+    let data_root = root.path().join("data");
+    let audit_path = data_root.join("audit.jsonl");
+    let codex_home = root.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    let bundle_path = root.path().join("fixture.ahbundle");
+    let restored_session = session(60, "audit-failure");
+    write_selected_sessions_with_native(
+        &bundle_path,
+        "codex",
+        std::slice::from_ref(&restored_session),
+        &[],
+        &[],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    let state = AppState::for_data_root(data_root);
+    let executor = fake_executor()
+        .continuation_success()
+        .block_final_audit(audit_path.clone());
+
+    let report = state
+        .bundle_restore_with_executor(
+            bundle_path,
+            &executor,
+            codex_home.clone(),
+            PathBuf::from("fake-codex"),
+            codex_home.join("agentark-backups"),
+        )
+        .unwrap();
+
+    assert_eq!(
+        report.recovery_error.as_deref(),
+        Some("audit-persistence-failed")
+    );
+    assert_eq!(
+        report.native_error.as_deref(),
+        Some("audit-persistence-failed")
+    );
+    assert_eq!(executor.rollback_call_count(), 0);
+    assert!(
+        codex_home
+            .join("sessions/fake-continuation-audit-failure.jsonl")
+            .is_file()
+    );
+    assert_eq!(
+        state
+            .restore_mappings_for(restored_session.id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut permissions = fs::metadata(&audit_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(&audit_path, permissions).unwrap();
+    assert!(state.audit_verify().unwrap().valid);
+}
