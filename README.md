@@ -2,7 +2,7 @@
   <img src="AgentArk.png" alt="AgentArk icon" width="144" height="144">
   <h1>AgentArk</h1>
   <p><strong>Local-first archive, search, backup, and safe recovery for coding-agent session history.</strong></p>
-  <p>中文 · <a href="#english">English</a></p>
+  <p><a href="./README.zh-CN.md">中文</a> · English</p>
 </div>
 
 <p align="center">
@@ -84,13 +84,3 @@ AgentArk restores its searchable archive first. For Codex, it then automatically
 Run the desktop release build with `pnpm --dir apps/desktop tauri build`. It produces MSI and NSIS installers under `target/release/bundle/`.
 
 For implementation decisions, capability contracts, and the longer-term roadmap, see [AgentArk.md](AgentArk.md).
-
----
-
-<a id="english"></a>
-
-## English
-
-AgentArk is a local-first Windows desktop application for indexing, searching, exporting, and safely restoring coding-agent session history and project context. The Chinese section above is the authoritative quick-start guide; the UI itself supports Chinese and English.
-
-The current verified native continuation path is Codex-only. Other supported Agents remain fully archived and searchable while their vendor-specific continuation writers undergo separate protocol verification.
