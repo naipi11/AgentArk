@@ -22,6 +22,12 @@ if ($release -match 'apps/desktop/src-tauri/target/release/bundle') {
 if ($release -notmatch 'if-no-files-found:\s*error') {
   throw 'release workflow must fail if a platform does not produce publishable artifacts'
 }
+if ($workflow -match 'ci/enforce-search-benchmark\.ps1') {
+  throw 'the full 100k search benchmark must not run in every PR matrix job'
+}
+if ($release -notmatch "(?ms)- name: Enforce search benchmark\s+if: runner\.os == 'Linux'\s+run: pwsh -File ci/enforce-search-benchmark\.ps1") {
+  throw 'release workflow must run the full search benchmark once on Linux before publishing'
+}
 
 $networkScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'network-silence.sh')
 if ($networkScript -notmatch 'sudo\s+unshare\s+--net') {

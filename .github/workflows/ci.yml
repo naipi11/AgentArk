@@ -44,7 +44,6 @@ jobs:
       - run: cargo deny check
       - run: cargo audit
       - run: pwsh -File ci/check-security-crate-majors.ps1
-      - run: pwsh -File ci/enforce-search-benchmark.ps1
       - run: pnpm --dir apps/desktop test
       - run: pnpm --dir apps/desktop build
       - run: pwsh -File ci/check-no-secret-canaries.ps1
