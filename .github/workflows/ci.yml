@@ -50,6 +50,7 @@ jobs:
       - run: pwsh -File ci/check-no-secret-canaries.ps1
       - run: pwsh -File ci/check-no-forbidden-codex-methods.ps1
       - run: pwsh -File ci/check-ci-bootstrap.ps1
+      - run: pwsh -File ci/check-workspace-metadata.ps1
 
   network-silence:
     runs-on: ubuntu-latest
