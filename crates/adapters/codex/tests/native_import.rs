@@ -4,6 +4,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
+use std::process::Command;
+
 use agentark_adapter_codex::{
     AGENTARK_APP_SERVER_CLIENT_VERSION, CodexContinuationRequest, CodexError, CodexTargetDefault,
     CodexTargetSessionExpectation, CodexVisibleHistoryExpectation, JsonRpcTransport,
@@ -19,6 +22,26 @@ use agentark_adapter_codex::{
 use agentark_canonical::Sha256Digest;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+
+#[cfg(windows)]
+fn link_directory(link: &Path, target: &Path) {
+    let status = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            link.to_string_lossy().as_ref(),
+            target.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+fn link_directory(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
 
 struct ScriptedTransport {
     sent: Arc<Mutex<Vec<Value>>>,
@@ -1384,6 +1407,45 @@ fn backup_manifest_contains_existing_target_hashes() {
     .unwrap();
     assert!(backup.join("manifest.json").is_file());
     assert!(backup.join("sessions").join("rollout.jsonl").is_file());
+}
+
+#[test]
+fn backup_rejects_linked_source_subtree_without_copying_it() {
+    let codex_home = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    link_directory(&sessions.join("linked"), outside.path());
+    fs::write(outside.path().join("secret.jsonl"), b"outside secret").unwrap();
+    let source = sessions.join("linked").join("secret.jsonl");
+
+    let result = backup_codex_targets(
+        codex_home.path(),
+        &codex_home.path().join("backups"),
+        &[source],
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn backup_rejects_hard_linked_source_file_without_copying_it() {
+    let codex_home = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let sessions = codex_home.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let outside_source = outside.path().join("secret.jsonl");
+    fs::write(&outside_source, b"outside secret").unwrap();
+    let source = sessions.join("secret.jsonl");
+    fs::hard_link(&outside_source, &source).unwrap();
+
+    let result = backup_codex_targets(
+        codex_home.path(),
+        &codex_home.path().join("backups"),
+        &[source],
+    );
+
+    assert!(result.is_err());
 }
 
 #[test]

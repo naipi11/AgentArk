@@ -80,3 +80,17 @@ fn nofollow_directory_open_rejects_linked_root() {
     assert!(open_directory_nofollow(&linked).is_err());
     assert!(open_directory_nofollow(root.path()).is_ok());
 }
+
+#[test]
+fn resolve_existing_rejects_a_linked_parent_directory() {
+    let root_dir = tempdir().unwrap();
+    let outside_dir = tempdir().unwrap();
+    fs::write(outside_dir.path().join("secret.jsonl"), b"secret").unwrap();
+    link_directory(&root_dir.path().join("linked"), outside_dir.path());
+    let root = AuthorizedRoot::new(root_dir.path().to_path_buf()).unwrap();
+
+    assert!(
+        root.resolve_existing(Path::new("linked/secret.jsonl"))
+            .is_err()
+    );
+}

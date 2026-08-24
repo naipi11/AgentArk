@@ -1,10 +1,14 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentark_canonical::Sha256Digest;
+use agentark_security::{
+    AuthorizedRoot, SecurityError, open_child_directory_nofollow, open_or_create_directory_nofollow,
+};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
@@ -104,37 +108,117 @@ pub fn backup_codex_targets(
         .map(|value| value.as_millis())
         .unwrap_or_default();
     let backup = backup_root.join(format!("codex-{stamp}-{}", Uuid::new_v4()));
-    fs::create_dir_all(&backup)?;
+    let source_root = match AuthorizedRoot::new(codex_home.to_path_buf()) {
+        Ok(root) => Some(root),
+        Err(SecurityError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => {
+            return Err(NativeImportError::Invalid(
+                "backup CODEX_HOME is unsafe".into(),
+            ));
+        }
+    };
+    let backup_dir = open_or_create_directory_nofollow(&backup)
+        .map_err(|_| NativeImportError::Invalid("backup destination is unsafe".into()))?;
     let mut manifest = Vec::new();
     for source in files {
         let relative = source
             .strip_prefix(codex_home)
             .map_err(|_| NativeImportError::Invalid("backup target escapes CODEX_HOME".into()))?;
-        if !source.is_file() {
-            manifest.push(json!({
-                "path": relative.to_string_lossy().replace('\\', "/"),
-                "status": "missing"
-            }));
+        let path = relative.to_string_lossy().replace('\\', "/");
+        let Some(source_root) = source_root.as_ref() else {
+            manifest.push(json!({"path": path, "status": "missing"}));
             continue;
+        };
+        let mut input = match source_root.open_regular_file(relative) {
+            Ok(file) => file,
+            Err(SecurityError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                manifest.push(json!({"path": path, "status": "missing"}));
+                continue;
+            }
+            Err(_) => {
+                return Err(NativeImportError::Invalid(
+                    "backup target is not a safe regular file".into(),
+                ));
+            }
+        };
+        if backup_file_has_multiple_hard_links(&input)? {
+            return Err(NativeImportError::Invalid(
+                "backup target has multiple hard links".into(),
+            ));
         }
-        let bytes = fs::read(source)?;
-        let destination = backup.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&destination, &bytes)?;
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes)?;
+        write_backup_file(&backup_dir, relative, &bytes)?;
         manifest.push(json!({
-            "path": relative.to_string_lossy().replace('\\', "/"),
+            "path": path,
             "status": "backed-up",
             "size": bytes.len(),
             "sha256": Sha256Digest::from_bytes(&bytes).as_str()
         }));
     }
-    fs::write(
-        backup.join("manifest.json"),
-        serde_json::to_vec_pretty(&json!({"files": manifest}))?,
-    )?;
+    let manifest_bytes = serde_json::to_vec_pretty(&json!({"files": manifest}))?;
+    let mut options = CapOpenOptions::new();
+    options.create_new(true).write(true);
+    let mut manifest_file = backup_dir.open_with(Path::new("manifest.json"), &options)?;
+    manifest_file.write_all(&manifest_bytes)?;
+    manifest_file.sync_all()?;
     Ok(backup)
+}
+
+fn write_backup_file(dir: &Dir, relative: &Path, bytes: &[u8]) -> Result<(), NativeImportError> {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let filename = relative
+        .file_name()
+        .ok_or_else(|| NativeImportError::Invalid("backup target has no filename".into()))?;
+    let parent_dir = open_or_create_backup_relative_directory(dir, parent)?;
+    let mut options = CapOpenOptions::new();
+    options.create_new(true).write(true);
+    let mut destination = parent_dir.open_with(filename, &options)?;
+    destination.write_all(bytes)?;
+    destination.sync_all()?;
+    Ok(())
+}
+
+fn open_or_create_backup_relative_directory(
+    dir: &Dir,
+    relative: &Path,
+) -> Result<Dir, NativeImportError> {
+    let mut current = dir.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            return Err(NativeImportError::Invalid("backup path is invalid".into()));
+        };
+        let child = Path::new(value);
+        match current.symlink_metadata(child) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(NativeImportError::Invalid("backup path is invalid".into())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match current.create_dir(child) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        current = open_child_directory_nofollow(&current, child)
+            .map_err(|_| NativeImportError::Invalid("backup path is invalid".into()))?;
+    }
+    Ok(current)
+}
+
+fn backup_file_has_multiple_hard_links(
+    file: &cap_std::fs::File,
+) -> Result<bool, NativeImportError> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        Ok(file.metadata()?.nlink() > 1)
+    }
+    #[cfg(windows)]
+    {
+        Ok(winx::winapi_util::file::information(file)?.number_of_links() > 1)
+    }
 }
 
 pub fn verify_rollout_with_app_server(

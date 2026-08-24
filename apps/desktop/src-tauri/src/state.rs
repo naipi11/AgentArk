@@ -32,7 +32,7 @@ use agentark_index::{IndexDb, RestoreMapping};
 use agentark_migration::{RestoreOutcome, agent_label};
 use agentark_security::{
     DatasetBootstrap, MasterKeyStore, MemoryMasterKeyStore, OsMasterKeyStore, SecretScanner,
-    open_child_directory_nofollow, open_directory_nofollow,
+    open_child_directory_nofollow, open_or_create_directory_nofollow,
 };
 use agentark_watch::{
     ReconcileEvent, ReconciliationQueue, WatchRoot, diff_fingerprints, fingerprint_root,
@@ -1553,43 +1553,7 @@ where
 }
 
 fn project_restore_dir(root: &Path) -> Result<Dir, String> {
-    let mut missing_segments = Vec::new();
-    let mut anchor = root;
-    loop {
-        match fs::symlink_metadata(anchor) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let segment = anchor
-                    .file_name()
-                    .ok_or_else(|| "项目恢复路径无效".to_owned())?;
-                missing_segments.push(segment.to_owned());
-                anchor = anchor
-                    .parent()
-                    .ok_or_else(|| "项目恢复路径无效".to_owned())?;
-            }
-            Err(_) => return Err("项目恢复路径无效".into()),
-        }
-    }
-    let mut directory =
-        open_directory_nofollow(anchor).map_err(|_| "项目恢复路径无效".to_owned())?;
-    for segment in missing_segments.iter().rev() {
-        let segment = Path::new(segment);
-        match directory.symlink_metadata(segment) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err("项目恢复路径无效".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match directory.create_dir(segment) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(_) => return Err("无法创建恢复项目目录".into()),
-                }
-            }
-            Err(_) => return Err("项目恢复路径无效".into()),
-        }
-        directory = open_child_directory_nofollow(&directory, segment)
-            .map_err(|_| "项目恢复路径无效".to_owned())?;
-    }
-    Ok(directory)
+    open_or_create_directory_nofollow(root).map_err(|_| "项目恢复路径无效".to_owned())
 }
 
 fn open_or_create_project_relative_directory(dir: &Dir, path: &Path) -> Result<Dir, String> {

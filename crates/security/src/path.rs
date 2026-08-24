@@ -101,6 +101,46 @@ pub fn open_directory_nofollow(path: &Path) -> Result<Dir, SecurityError> {
     Ok(directory)
 }
 
+/// Opens an absolute directory, creating missing normal-path components from
+/// the nearest existing parent while rejecting every symlink or Windows
+/// reparse point encountered during traversal.
+pub fn open_or_create_directory_nofollow(path: &Path) -> Result<Dir, SecurityError> {
+    if !path.is_absolute() {
+        return Err(SecurityError::RootNotAuthorized);
+    }
+    let mut missing_components = Vec::new();
+    let mut anchor = path;
+    loop {
+        match std::fs::symlink_metadata(anchor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = anchor.file_name().ok_or(SecurityError::PathEscape)?;
+                missing_components.push(component.to_owned());
+                anchor = anchor.parent().ok_or(SecurityError::PathEscape)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut directory = open_directory_nofollow(anchor)?;
+    for component in missing_components.iter().rev() {
+        let component = Path::new(component);
+        match directory.symlink_metadata(component) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(SecurityError::RootNotAuthorized),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(component) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        directory = open_child_directory_nofollow(&directory, component)?;
+    }
+    Ok(directory)
+}
+
 /// Opens one child directory without following a symlink or Windows reparse
 /// point. Callers retain the parent capability, so this is race-resistant for
 /// child replacement between validation and use.
@@ -159,12 +199,10 @@ impl AuthorizedRoot {
     pub fn resolve_existing(&self, relative: &Path) -> Result<PathBuf, SecurityError> {
         let value = relative.to_str().ok_or(SecurityError::NonUtf8Path)?;
         validate_relative_lexical(value)?;
-        for component in relative.components() {
-            if !matches!(component, std::path::Component::Normal(_)) {
-                return Err(SecurityError::PathEscape);
-            }
-        }
-        let metadata = self.dir.symlink_metadata(relative)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let filename = relative.file_name().ok_or(SecurityError::PathEscape)?;
+        let parent_dir = self.open_relative_directory_nofollow(parent)?;
+        let metadata = parent_dir.symlink_metadata(filename)?;
         if metadata.file_type().is_symlink() {
             return Err(SecurityError::ForbiddenPathClass("symlink"));
         }
@@ -175,15 +213,7 @@ impl AuthorizedRoot {
                 return Err(SecurityError::ForbiddenPathClass("reparse-point"));
             }
         }
-        let canonical_relative = self.dir.canonicalize(relative)?;
-        if canonical_relative.is_absolute()
-            || canonical_relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(SecurityError::PathEscape);
-        }
-        Ok(self.root.join(canonical_relative))
+        Ok(self.root.join(relative))
     }
 
     pub fn open_regular_file(&self, relative: &Path) -> Result<File, SecurityError> {
