@@ -106,8 +106,13 @@ pub fn workspaces_list(
 }
 
 #[tauri::command]
-pub fn scan_codex(state: State<'_, AppState>, source_root: String) -> Result<ScanReport, String> {
-    state.scan_codex(std::path::PathBuf::from(source_root.trim()))
+pub async fn scan_codex(
+    state: State<'_, AppState>,
+    source_root: String,
+) -> Result<ScanReport, String> {
+    let state = state.inner().clone();
+    let source_root = std::path::PathBuf::from(source_root.trim());
+    run_blocking_command(move || state.scan_codex(source_root)).await
 }
 
 #[tauri::command]
@@ -116,8 +121,13 @@ pub fn codex_default_root() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn scan_claude(state: State<'_, AppState>, source_root: String) -> Result<ScanReport, String> {
-    state.scan_claude(std::path::PathBuf::from(source_root.trim()))
+pub async fn scan_claude(
+    state: State<'_, AppState>,
+    source_root: String,
+) -> Result<ScanReport, String> {
+    let state = state.inner().clone();
+    let source_root = std::path::PathBuf::from(source_root.trim());
+    run_blocking_command(move || state.scan_claude(source_root)).await
 }
 
 #[tauri::command]
@@ -126,8 +136,13 @@ pub fn claude_default_root() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn scan_hermes(state: State<'_, AppState>, source_root: String) -> Result<ScanReport, String> {
-    state.scan_hermes(std::path::PathBuf::from(source_root.trim()))
+pub async fn scan_hermes(
+    state: State<'_, AppState>,
+    source_root: String,
+) -> Result<ScanReport, String> {
+    let state = state.inner().clone();
+    let source_root = std::path::PathBuf::from(source_root.trim());
+    run_blocking_command(move || state.scan_hermes(source_root)).await
 }
 
 #[tauri::command]
@@ -136,11 +151,13 @@ pub fn hermes_default_root() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn scan_openclaw(
+pub async fn scan_openclaw(
     state: State<'_, AppState>,
     source_root: String,
 ) -> Result<ScanReport, String> {
-    state.scan_openclaw(std::path::PathBuf::from(source_root.trim()))
+    let state = state.inner().clone();
+    let source_root = std::path::PathBuf::from(source_root.trim());
+    run_blocking_command(move || state.scan_openclaw(source_root)).await
 }
 
 #[tauri::command]
@@ -149,11 +166,13 @@ pub fn openclaw_default_root() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn scan_opencode(
+pub async fn scan_opencode(
     state: State<'_, AppState>,
     source_root: String,
 ) -> Result<ScanReport, String> {
-    state.scan_opencode(std::path::PathBuf::from(source_root.trim()))
+    let state = state.inner().clone();
+    let source_root = std::path::PathBuf::from(source_root.trim());
+    run_blocking_command(move || state.scan_opencode(source_root)).await
 }
 
 #[tauri::command]
@@ -162,11 +181,13 @@ pub fn opencode_default_root() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn scan_grok_build(
+pub async fn scan_grok_build(
     state: State<'_, AppState>,
     source_root: String,
 ) -> Result<ScanReport, String> {
-    state.scan_grok_build(std::path::PathBuf::from(source_root.trim()))
+    let state = state.inner().clone();
+    let source_root = std::path::PathBuf::from(source_root.trim());
+    run_blocking_command(move || state.scan_grok_build(source_root)).await
 }
 
 #[tauri::command]
@@ -221,4 +242,30 @@ fn with_query<T>(
         .lock()
         .map_err(|_| "desktop state unavailable".to_owned())?;
     operation(guard.queries.as_ref()).map_err(|_| "query operation failed".to_owned())
+}
+
+async fn run_blocking_command<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| "扫描任务意外终止".to_owned())?
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::run_blocking_command;
+
+    #[test]
+    fn blocking_scan_work_runs_off_the_caller_thread() {
+        let caller_thread = thread::current().id();
+        let worker_thread = tauri::async_runtime::block_on(run_blocking_command(move || {
+            Ok::<_, String>(thread::current().id())
+        }))
+        .unwrap();
+
+        assert_ne!(worker_thread, caller_thread);
+    }
 }

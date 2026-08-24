@@ -14,6 +14,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%2F11%20x64-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10 和 11 x64">
+  <img src="https://img.shields.io/badge/macOS-Apple%20silicon-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS Apple 芯片">
+  <img src="https://img.shields.io/badge/Linux-x64-FCC624?style=flat-square&logo=linux&logoColor=111827" alt="Linux x64">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2">
   <img src="https://img.shields.io/badge/Rust-2024-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust 2024">
   <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111827" alt="React 19">
@@ -29,7 +31,15 @@ AgentArk 将本机编程 Agent 的会话和项目工作区统一整理为可搜�
 - 可携带的 `.ahbundle` 导出/导入，并可选择包含哪些项目文件
 - 审计链、冲突检测、回滚与安全诊断报告
 - 桌面客户端支持中文和英文
-- 原生 Windows 安装程序；日常使用无需命令行
+- 原生 Windows、macOS 与 Linux 桌面安装程序；日常使用无需命令行
+
+## v0.6.1 包含的功能
+
+- 面向 Codex、Claude Code、Hermes、OpenClaw、OpenCode 和 Grok Build 的按 Agent 项目与会话浏览
+- 中文 / 英文桌面界面，以及可携带的 `.ahbundle` 导出/导入流程
+- 当无法保留原始原生身份时，为 Codex 创建经过验证、与提供方无关的续接会话
+- 面向 Windows、Apple 芯片 macOS 和 Linux 的已发布桌面安装包
+- 耗时扫描会在桌面窗口线程之外执行，建立索引期间 AgentArk 仍可保持响应
 
 ## 恢复能力
 
@@ -47,9 +57,12 @@ AgentArk 不会导出提供方凭据、接口密钥、账号标识或隐藏推�
 ## 安装
 
 1. 打开 [Releases](https://github.com/naipi11/AgentArk/releases/latest)。
-2. 下载 `AgentArk_0.6.0_x64-setup.exe`（推荐）或 `AgentArk_0.6.0_x64_en-US.msi`。
+2. 按平台选择安装包：
+   - **Windows：** `AgentArk_0.6.1_x64-setup.exe`（推荐）或 `AgentArk_0.6.1_x64_en-US.msi`
+   - **Apple 芯片 macOS：** `AgentArk_0.6.1_aarch64.dmg`
+   - **Linux x64：** `AgentArk_0.6.1_amd64.AppImage`、`.deb` 或 `.rpm`
 3. 如需可复现的安装记录，请核对发布的 SHA-256 校验值。
-4. 运行安装程序，并从开始菜单打开 **AgentArk**。
+4. 运行安装程序，并从开始菜单或系统应用启动器打开 **AgentArk**。
 5. 打开 **扫描**，选择一个 Agent，扫描后即可浏览它的项目和会话。
 
 通常的按用户安装不需要管理员权限。

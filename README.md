@@ -14,6 +14,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%2F11%20x64-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10 and 11 x64">
+  <img src="https://img.shields.io/badge/macOS-Apple%20silicon-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS Apple silicon">
+  <img src="https://img.shields.io/badge/Linux-x64-FCC624?style=flat-square&logo=linux&logoColor=111827" alt="Linux x64">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2">
   <img src="https://img.shields.io/badge/Rust-2024-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust 2024">
   <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111827" alt="React 19">
@@ -29,7 +31,15 @@ AgentArk consolidates local coding-agent conversations and workspaces into a sea
 - Portable `.ahbundle` export/import with project-file selection
 - Audit chain, conflict detection, rollback, and safe diagnostic reporting
 - Chinese / English desktop interface
-- Native Windows desktop installer; no terminal required for normal use
+- Native Windows, macOS, and Linux desktop installers; no terminal required for normal use
+
+## What's included in v0.6.1
+
+- Agent-scoped project and session browsing for Codex, Claude Code, Hermes, OpenClaw, OpenCode, and Grok Build
+- Chinese / English desktop interface and portable `.ahbundle` export/import workflow
+- Verified provider-independent Codex continuation when the original native identity cannot be retained
+- Published desktop packages for Windows, macOS Apple silicon, and Linux
+- Long-running scans execute away from the desktop window thread, keeping AgentArk responsive while indexing
 
 ## Recovery capability
 
@@ -47,9 +57,12 @@ AgentArk never exports provider credentials, endpoint secrets, account identifie
 ## Install
 
 1. Open [Releases](https://github.com/naipi11/AgentArk/releases/latest).
-2. Download AgentArk_0.6.0_x64-setup.exe (recommended) or AgentArk_0.6.0_x64_en-US.msi.
+2. Choose the package for your platform:
+   - **Windows:** AgentArk_0.6.1_x64-setup.exe (recommended) or AgentArk_0.6.1_x64_en-US.msi
+   - **macOS Apple silicon:** AgentArk_0.6.1_aarch64.dmg
+   - **Linux x64:** AgentArk_0.6.1_amd64.AppImage, `.deb`, or `.rpm`
 3. Verify the published SHA-256 checksum if you need a reproducible installation record.
-4. Run the installer and open **AgentArk** from the Start menu.
+4. Run the installer and open **AgentArk** from the Start menu or your system application launcher.
 5. Open **Scan**, choose an Agent, then scan and browse its projects/sessions.
 
 No administrator rights are required for a typical per-user installation.
