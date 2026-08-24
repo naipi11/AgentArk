@@ -49,7 +49,7 @@ jobs:
         with:
           name: agentark-${{ matrix.artifact }}
           path: |
-            apps/desktop/src-tauri/target/release/bundle/**
+            target/release/bundle/**
             target/release/agentark.exe
             target/release/agentark
           if-no-files-found: warn

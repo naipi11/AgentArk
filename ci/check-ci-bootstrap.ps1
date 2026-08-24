@@ -13,6 +13,12 @@ $releaseNode = $release.IndexOf('uses: actions/setup-node@v4')
 if ($releasePnpm -lt 0 -or $releaseNode -lt 0 -or $releasePnpm -gt $releaseNode) {
   throw 'release workflow must install pnpm before actions/setup-node uses cache: pnpm'
 }
+if ($release -notmatch '(?m)^\s+target/release/bundle/\*\*$') {
+  throw 'release workflow must upload Tauri bundles from the workspace target directory'
+}
+if ($release -match 'apps/desktop/src-tauri/target/release/bundle') {
+  throw 'release workflow must not upload the obsolete per-package Tauri target directory'
+}
 
 $networkScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'network-silence.sh')
 if ($networkScript -notmatch 'sudo\s+unshare\s+--net') {
