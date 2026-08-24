@@ -7,8 +7,16 @@ if ($workspace -notmatch '(?m)^publish\s*=\s*false\s*$') {
   throw 'workspace packages must default to publish = false'
 }
 
+$manifestPaths = if (Get-Command rg -ErrorAction SilentlyContinue) {
+  $paths = @(& rg --files -g Cargo.toml $root)
+  if ($LASTEXITCODE -ne 0) { throw 'rg failed while enumerating workspace package manifests' }
+  $paths
+} else {
+  @(Get-ChildItem -LiteralPath $root -Filter Cargo.toml -Recurse -File | ForEach-Object FullName)
+}
+
 $missingPublishMetadata = @()
-& rg --files -g Cargo.toml $root |
+$manifestPaths |
   Where-Object { $_ -ne $workspaceManifest } |
   ForEach-Object {
     $manifest = Get-Content -Raw -LiteralPath $_

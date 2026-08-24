@@ -29,6 +29,16 @@ if ($release -notmatch "(?ms)- name: Enforce search benchmark\s+if: runner\.os =
   throw 'release workflow must run the full search benchmark once on Linux before publishing'
 }
 
+foreach ($scannerName in @(
+  'check-no-secret-canaries.ps1',
+  'check-workspace-metadata.ps1'
+)) {
+  $scanner = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot $scannerName)
+  if ($scanner -notmatch 'Get-Command\s+rg') {
+    throw "$scannerName must have a PowerShell fallback when ripgrep is unavailable"
+  }
+}
+
 $networkScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'network-silence.sh')
 if ($networkScript -notmatch 'sudo\s+unshare\s+--net') {
   throw 'network-silence must use the privileged network namespace path on hosted runners'
