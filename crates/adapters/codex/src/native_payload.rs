@@ -9,11 +9,10 @@ use std::os::windows::fs::MetadataExt;
 use agentark_canonical::{
     CanonicalRole, CanonicalSession, ContentPartKind, Sha256Digest, canonical_hash,
 };
-use agentark_security::{AuthorizedRoot, SecretScanner};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions as CapOpenOptions},
+use agentark_security::{
+    AuthorizedRoot, SecretScanner, open_child_directory_nofollow, open_directory_nofollow,
 };
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -599,11 +598,7 @@ where
 
 fn native_sessions_dir(codex_home: &Path) -> Result<Dir, NativePayloadError> {
     let sessions_root = codex_home.join("sessions");
-    let metadata = fs::symlink_metadata(&sessions_root)?;
-    if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
-        return Err(NativePayloadError::InvalidPath);
-    }
-    Dir::open_ambient_dir(&sessions_root, ambient_authority()).map_err(NativePayloadError::from)
+    open_directory_nofollow(&sessions_root).map_err(|_| NativePayloadError::InvalidPath)
 }
 
 fn write_native_rollout_atomic_guarded<G>(
@@ -618,16 +613,14 @@ where
     let dir = native_sessions_dir(codex_home)?;
     let relative_path = Path::new(relative);
     let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let filename = relative_path
+        .file_name()
+        .ok_or(NativePayloadError::InvalidPath)?;
     guard()?;
-    if !parent.as_os_str().is_empty() {
-        dir.create_dir_all(parent)?;
-    }
-    let temporary = parent.join(format!(
+    let parent_dir = open_or_create_native_directory(&dir, parent)?;
+    let temporary = PathBuf::from(format!(
         ".{}.{}.tmp",
-        relative_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(NativePayloadError::InvalidPath)?,
+        filename.to_str().ok_or(NativePayloadError::InvalidPath)?,
         Uuid::new_v4()
     ));
     let mut temporary_created = false;
@@ -635,22 +628,22 @@ where
     let result = (|| {
         let mut options = CapOpenOptions::new();
         options.create_new(true).write(true);
-        let mut file = dir.open_with(&temporary, &options)?;
+        let mut file = parent_dir.open_with(&temporary, &options)?;
         temporary_created = true;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         guard()?;
-        dir.rename(&temporary, &dir, relative_path)?;
+        parent_dir.rename(&temporary, &parent_dir, filename)?;
         renamed = true;
-        let mut committed = dir.open(relative_path)?;
+        let mut committed = parent_dir.open(filename)?;
         let mut committed_bytes = Vec::new();
         committed.read_to_end(&mut committed_bytes)?;
         Ok(Sha256Digest::from_bytes(&committed_bytes))
     })();
     if result.is_err() {
         let cleanup_path = if renamed {
-            Some(relative_path)
+            Some(Path::new(filename))
         } else if temporary_created {
             Some(temporary.as_path())
         } else {
@@ -662,7 +655,7 @@ where
                     crate::NativeImportError::ManualIntervention,
                 ));
             }
-            if let Err(error) = dir.remove_file(cleanup_path)
+            if let Err(error) = parent_dir.remove_file(cleanup_path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
                 return Err(NativePayloadError::NativeImport(
@@ -675,9 +668,52 @@ where
 }
 
 fn remove_native_rollout(codex_home: &Path, relative: &str) -> Result<(), NativePayloadError> {
-    native_sessions_dir(codex_home)?
-        .remove_file(Path::new(relative))
+    let sessions_dir = native_sessions_dir(codex_home)?;
+    let relative_path = Path::new(relative);
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let filename = relative_path
+        .file_name()
+        .ok_or(NativePayloadError::InvalidPath)?;
+    open_existing_native_directory(&sessions_dir, parent)?
+        .remove_file(filename)
         .map_err(NativePayloadError::from)
+}
+
+fn open_or_create_native_directory(dir: &Dir, relative: &Path) -> Result<Dir, NativePayloadError> {
+    let mut current = dir.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            return Err(NativePayloadError::InvalidPath);
+        };
+        let child = Path::new(value);
+        match current.symlink_metadata(child) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(NativePayloadError::InvalidPath),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match current.create_dir(child) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        current = open_child_directory_nofollow(&current, child)
+            .map_err(|_| NativePayloadError::InvalidPath)?;
+    }
+    Ok(current)
+}
+
+fn open_existing_native_directory(dir: &Dir, relative: &Path) -> Result<Dir, NativePayloadError> {
+    let mut current = dir.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            return Err(NativePayloadError::InvalidPath);
+        };
+        current = open_child_directory_nofollow(&current, Path::new(value))
+            .map_err(|_| NativePayloadError::InvalidPath)?;
+    }
+    Ok(current)
 }
 
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), NativePayloadError> {

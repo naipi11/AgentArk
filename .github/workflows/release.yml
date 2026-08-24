@@ -52,7 +52,12 @@ jobs:
         with:
           name: agentark-${{ matrix.artifact }}
           path: |
-            target/release/bundle/**
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.AppImage
+            target/release/bundle/**/*.dmg
           if-no-files-found: error
 
   publish:
@@ -64,15 +69,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+      - name: Stage uniquely named release assets
+        shell: bash
+        run: |
+          mkdir -p release-publish
+          declare -A seen
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if [[ -n "${seen[$name]:-}" ]]; then
+              echo "duplicate release asset name: $name" >&2
+              exit 1
+            fi
+            seen[$name]=1
+            cp "$file" "release-publish/$name"
+          done < <(find release-artifacts -type f -print0 | sort -z)
+          test -n "$(find release-publish -maxdepth 1 -type f -print -quit)"
       - name: Generate SHA-256 manifest
         shell: bash
         run: |
-          find release-artifacts -type f ! -name 'SHA256SUMS' -print0 | sort -z |
+          find release-publish -maxdepth 1 -type f ! -name 'SHA256SUMS' -print0 | sort -z |
             while IFS= read -r -d '' file; do
               hash=$(sha256sum "$file" | cut -d ' ' -f 1)
               printf '%s  %s\n' "$hash" "$(basename "$file")"
-            done > release-artifacts/SHA256SUMS
+            done > release-publish/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: release-artifacts/**
+          files: release-publish/*
           generate_release_notes: true

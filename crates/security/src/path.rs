@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Component, Path, PathBuf},
+};
 
+use cap_primitives::fs::open_dir_nofollow;
 use cap_std::{
     ambient_authority,
     fs::{Dir, File},
 };
+use io_lifetimes::AsFilelike;
 
 use crate::SecurityError;
 
@@ -83,6 +88,59 @@ pub fn validate_relative_lexical(value: &str) -> Result<(), SecurityError> {
     Ok(())
 }
 
+/// Opens an existing absolute directory through a stable filesystem root and
+/// rejects every symlink or Windows reparse point encountered while traversing
+/// it. The returned capability remains pinned to the opened directory even if
+/// its path is renamed afterward.
+pub fn open_directory_nofollow(path: &Path) -> Result<Dir, SecurityError> {
+    let (filesystem_root, components) = split_absolute_directory_path(path)?;
+    let mut directory = Dir::open_ambient_dir(&filesystem_root, ambient_authority())?;
+    for component in components {
+        directory = open_child_directory_nofollow(&directory, Path::new(&component))?;
+    }
+    Ok(directory)
+}
+
+/// Opens one child directory without following a symlink or Windows reparse
+/// point. Callers retain the parent capability, so this is race-resistant for
+/// child replacement between validation and use.
+pub fn open_child_directory_nofollow(parent: &Dir, child: &Path) -> Result<Dir, SecurityError> {
+    if !matches!(child.components().next(), Some(Component::Normal(_)))
+        || child.components().count() != 1
+    {
+        return Err(SecurityError::PathEscape);
+    }
+    open_dir_nofollow(&parent.as_filelike_view::<std::fs::File>(), child)
+        .map(Dir::from_std_file)
+        .map_err(SecurityError::from)
+}
+
+fn split_absolute_directory_path(path: &Path) -> Result<(PathBuf, Vec<OsString>), SecurityError> {
+    if !path.is_absolute() {
+        return Err(SecurityError::RootNotAuthorized);
+    }
+    let mut filesystem_root = PathBuf::new();
+    let mut components = Vec::new();
+    let mut found_root = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => filesystem_root.push(prefix.as_os_str()),
+            Component::RootDir => {
+                filesystem_root.push(component.as_os_str());
+                found_root = true;
+            }
+            Component::Normal(value) if found_root => components.push(value.to_owned()),
+            Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                return Err(SecurityError::PathEscape);
+            }
+        }
+    }
+    if !found_root {
+        return Err(SecurityError::RootNotAuthorized);
+    }
+    Ok((filesystem_root, components))
+}
+
 pub struct AuthorizedRoot {
     root: PathBuf,
     dir: Dir,
@@ -90,26 +148,8 @@ pub struct AuthorizedRoot {
 
 impl AuthorizedRoot {
     pub fn new(root: PathBuf) -> Result<Self, SecurityError> {
-        let metadata = std::fs::symlink_metadata(&root)?;
-        if metadata.file_type().is_symlink() {
-            return Err(SecurityError::ForbiddenPathClass("symlink"));
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if is_windows_reparse_point(metadata.file_attributes()) {
-                return Err(SecurityError::ForbiddenPathClass("reparse-point"));
-            }
-        }
-        if !root.is_absolute() || !metadata.is_dir() {
-            return Err(SecurityError::RootNotAuthorized);
-        }
-        let canonical_root = dunce::canonicalize(root)?;
-        let dir = Dir::open_ambient_dir(&canonical_root, ambient_authority())?;
-        Ok(Self {
-            root: canonical_root,
-            dir,
-        })
+        let dir = open_directory_nofollow(&root)?;
+        Ok(Self { root, dir })
     }
 
     pub fn root(&self) -> &Path {
@@ -149,7 +189,10 @@ impl AuthorizedRoot {
     pub fn open_regular_file(&self, relative: &Path) -> Result<File, SecurityError> {
         let value = relative.to_str().ok_or(SecurityError::NonUtf8Path)?;
         validate_relative_lexical(value)?;
-        let metadata = self.dir.symlink_metadata(relative)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let filename = relative.file_name().ok_or(SecurityError::PathEscape)?;
+        let parent_dir = self.open_relative_directory_nofollow(parent)?;
+        let metadata = parent_dir.symlink_metadata(filename)?;
         if metadata.file_type().is_symlink() {
             return Err(SecurityError::ForbiddenPathClass("symlink"));
         }
@@ -163,8 +206,8 @@ impl AuthorizedRoot {
         if !metadata.is_file() {
             return Err(SecurityError::NotRegularFile);
         }
-        let file = self.dir.open(relative)?;
-        let after = self.dir.symlink_metadata(relative)?;
+        let file = parent_dir.open(filename)?;
+        let after = parent_dir.symlink_metadata(filename)?;
         if after.file_type().is_symlink() {
             return Err(SecurityError::ForbiddenPathClass("symlink"));
         }
@@ -179,5 +222,16 @@ impl AuthorizedRoot {
             return Err(SecurityError::NotRegularFile);
         }
         Ok(file)
+    }
+
+    fn open_relative_directory_nofollow(&self, relative: &Path) -> Result<Dir, SecurityError> {
+        let mut directory = self.dir.try_clone()?;
+        for component in relative.components() {
+            let Component::Normal(value) = component else {
+                return Err(SecurityError::PathEscape);
+            };
+            directory = open_child_directory_nofollow(&directory, Path::new(value))?;
+        }
+        Ok(directory)
     }
 }

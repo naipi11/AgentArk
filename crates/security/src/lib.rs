@@ -11,6 +11,6 @@ pub use keys::{
 };
 pub use path::{
     AuthorizedRoot, PathClass, classify_windows_path, is_windows_reparse_point,
-    validate_relative_lexical,
+    open_child_directory_nofollow, open_directory_nofollow, validate_relative_lexical,
 };
 pub use secrets::{SanitizedText, SecretClass, SecretFinding, SecretScanner};

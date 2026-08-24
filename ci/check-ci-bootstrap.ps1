@@ -13,8 +13,13 @@ $releaseNode = $release.IndexOf('uses: actions/setup-node@v4')
 if ($releasePnpm -lt 0 -or $releaseNode -lt 0 -or $releasePnpm -gt $releaseNode) {
   throw 'release workflow must install pnpm before actions/setup-node uses cache: pnpm'
 }
-if ($release -notmatch '(?m)^\s+target/release/bundle/\*\*$') {
-  throw 'release workflow must upload Tauri bundles from the workspace target directory'
+foreach ($pattern in @(
+  'target/release/bundle/**/*.msi',
+  'target/release/bundle/**/*.exe'
+)) {
+  if ($release -notmatch [regex]::Escape($pattern)) {
+    throw "release workflow must stage installer assets matching $pattern"
+  }
 }
 if ($release -match 'apps/desktop/src-tauri/target/release/bundle') {
   throw 'release workflow must not upload the obsolete per-package Tauri target directory'
@@ -25,8 +30,11 @@ if ($release -notmatch 'if-no-files-found:\s*error') {
 if ($release -notmatch "! -name 'SHA256SUMS'") {
   throw 'release checksum generation must exclude the manifest itself'
 }
-if ($release -notmatch 'basename "\$file"') {
-  throw 'release checksum generation must use the published asset basename'
+if ($release -notmatch 'Stage uniquely named release assets' -or $release -notmatch 'duplicate release asset name') {
+  throw 'release workflow must reject colliding published asset names before checksumming'
+}
+if ($release -notmatch 'files: release-publish/\*') {
+  throw 'release workflow must publish the flattened uniquely named release assets'
 }
 if ($release -match '(?m)^\s+target/release/agentark(?:\.exe)?\s*$') {
   throw 'release workflow must not upload same-named cross-platform CLI binaries'

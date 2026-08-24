@@ -1,10 +1,33 @@
 use std::{fs, path::Path};
 
+#[cfg(windows)]
+use std::process::Command;
+
 use agentark_security::{
     AuthorizedRoot, PathClass, classify_windows_path, is_windows_reparse_point,
-    validate_relative_lexical,
+    open_directory_nofollow, validate_relative_lexical,
 };
 use tempfile::tempdir;
+
+#[cfg(windows)]
+fn link_directory(link: &Path, target: &Path) {
+    let status = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            link.to_string_lossy().as_ref(),
+            target.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+fn link_directory(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
 
 #[test]
 fn rejects_windows_unc_device_ads_and_traversal_strings_on_every_platform() {
@@ -45,4 +68,15 @@ fn opens_only_regular_files_beneath_the_authorized_root() {
     assert!(root.open_regular_file(Path::new("ok.jsonl")).is_ok());
     assert!(root.open_regular_file(Path::new("nested")).is_err());
     assert!(root.open_regular_file(Path::new("../escape")).is_err());
+}
+
+#[test]
+fn nofollow_directory_open_rejects_linked_root() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let linked = root.path().join("linked");
+    link_directory(&linked, outside.path());
+
+    assert!(open_directory_nofollow(&linked).is_err());
+    assert!(open_directory_nofollow(root.path()).is_ok());
 }
