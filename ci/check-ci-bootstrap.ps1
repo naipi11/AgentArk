@@ -25,6 +25,12 @@ if ($networkScript -match 'unshare\s+--user\s+--map-root-user') {
   throw 'network-silence must not depend on unprivileged user namespaces on hosted runners'
 }
 
+$networkFetch = $workflow.IndexOf('cargo fetch --locked')
+$networkRun = $workflow.IndexOf('bash ci/network-silence.sh')
+if ($networkFetch -lt 0 -or $networkRun -lt 0 -or $networkFetch -gt $networkRun) {
+  throw 'network-silence must prefetch locked dependencies before entering its offline network namespace'
+}
+
 foreach ($fragment in @(
   'CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"',
   'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"',
