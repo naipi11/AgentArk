@@ -1306,7 +1306,7 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        use std::sync::mpsc;
+        use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
         use std::thread;
 
         use tempfile::tempdir;
@@ -1334,6 +1334,11 @@ mod windows {
             }
         }
 
+        fn powershell_test_lock() -> MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
         fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
             let deadline = Instant::now() + timeout;
             loop {
@@ -1349,6 +1354,7 @@ mod windows {
 
         #[test]
         fn snapshot_runner_emits_bomless_utf8_for_non_ascii_owned_process_metadata() {
+            let _powershell_test_lock = powershell_test_lock();
             let command_line_canary = "AgentArk-快照-元数据";
             let script = format!("$metadata = '{command_line_canary}'; Start-Sleep -Seconds 30");
             let mut owned_command = powershell_command(&script);
@@ -1409,6 +1415,7 @@ mod windows {
 
         #[test]
         fn bounded_runner_times_out_and_kills_owned_sleeping_powershell() {
+            let _powershell_test_lock = powershell_test_lock();
             let root = tempdir().unwrap();
             let started_marker = root.path().join("owned-child-started.txt");
             let release_marker = root.path().join("owned-child-release.txt");
@@ -1455,6 +1462,7 @@ mod windows {
 
         #[test]
         fn bounded_runner_propagates_owned_child_nonzero_exit() {
+            let _powershell_test_lock = powershell_test_lock();
             let outcome = run_bounded_command_typed(
                 powershell_command("exit 23"),
                 Duration::from_secs(5),
@@ -1468,6 +1476,7 @@ mod windows {
 
         #[test]
         fn bounded_runner_detects_actual_stdout_and_stderr_overflow() {
+            let _powershell_test_lock = powershell_test_lock();
             let root = tempdir().unwrap();
             for (index, (write, expected)) in [
                 (
