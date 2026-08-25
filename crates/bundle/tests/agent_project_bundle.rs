@@ -85,6 +85,136 @@ fn exports_selected_agent_project_files_without_credentials() {
 }
 
 #[test]
+fn skips_oversized_project_files_without_failing_the_bundle_export() {
+    let root = tempdir().unwrap();
+    std::fs::write(root.path().join("README.md"), "ok").unwrap();
+    std::fs::write(root.path().join("large-build-artifact.bin"), "oversized").unwrap();
+    let workspace = Workspace {
+        id: workspace_id("file:///C:/project"),
+        path_native: root.path().to_string_lossy().into_owned(),
+        canonical_uri: "file:///C:/project".into(),
+        git_commit: None,
+    };
+    let session = CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: Uuid::new_v4(),
+        install_id: Uuid::new_v4(),
+        source_session_id: "s1".into(),
+        source_kind: "codex".into(),
+        workspace: Some(workspace.clone()),
+        title: Some("title".into()),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: None,
+        model_name: None,
+        completeness: Completeness::Complete,
+        messages: vec![],
+        tool_events: vec![],
+        attachments: vec![],
+        raw_extra: BTreeMap::new(),
+    };
+    let bundle_path = root.path().join("export.ahbundle");
+
+    let manifest = write_selected_sessions(
+        &bundle_path,
+        "codex",
+        &[session],
+        &[ProjectSelection {
+            workspace_id: workspace.id,
+            root: root.path().to_path_buf(),
+            include_files: true,
+            max_file_bytes: 4,
+        }],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(manifest.file_count, 1);
+    assert_eq!(manifest.skipped_file_count, 1);
+    let bundle = read_bundle(&bundle_path).unwrap();
+    assert!(
+        bundle
+            .entries
+            .keys()
+            .any(|path| path.ends_with("/files/README.md"))
+    );
+    assert!(
+        !bundle
+            .entries
+            .keys()
+            .any(|path| path.ends_with("/files/large-build-artifact.bin"))
+    );
+}
+
+#[test]
+fn excludes_generated_project_directories_from_file_exports() {
+    let root = tempdir().unwrap();
+    std::fs::write(root.path().join("README.md"), "source").unwrap();
+    for directory in [
+        ".git",
+        ".hg",
+        ".svn",
+        ".worktrees",
+        "target",
+        "node_modules",
+    ] {
+        let generated = root.path().join(directory).join("nested");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("generated.txt"), "generated").unwrap();
+    }
+    let workspace = Workspace {
+        id: workspace_id("file:///C:/project"),
+        path_native: root.path().to_string_lossy().into_owned(),
+        canonical_uri: "file:///C:/project".into(),
+        git_commit: None,
+    };
+    let session = CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: Uuid::new_v4(),
+        install_id: Uuid::new_v4(),
+        source_session_id: "s1".into(),
+        source_kind: "codex".into(),
+        workspace: Some(workspace.clone()),
+        title: Some("title".into()),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: None,
+        model_name: None,
+        completeness: Completeness::Complete,
+        messages: vec![],
+        tool_events: vec![],
+        attachments: vec![],
+        raw_extra: BTreeMap::new(),
+    };
+    let bundle_path = root.path().join("export.ahbundle");
+
+    let manifest = write_selected_sessions(
+        &bundle_path,
+        "codex",
+        &[session],
+        &[ProjectSelection {
+            workspace_id: workspace.id,
+            root: root.path().to_path_buf(),
+            include_files: true,
+            max_file_bytes: 1024 * 1024,
+        }],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(manifest.file_count, 1);
+    let bundle = read_bundle(&bundle_path).unwrap();
+    assert!(bundle.entries.keys().all(|path| !path.contains("/.git/")
+        && !path.contains("/.hg/")
+        && !path.contains("/.svn/")
+        && !path.contains("/.worktrees/")
+        && !path.contains("/target/")
+        && !path.contains("/node_modules/")));
+}
+
+#[test]
 fn exports_and_reads_native_codex_rollout_payloads() {
     let root = tempdir().unwrap();
     let session = CanonicalSession {

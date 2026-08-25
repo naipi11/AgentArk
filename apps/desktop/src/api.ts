@@ -65,6 +65,7 @@ export type BundleReport = {
   entryCount: number;
   workspaceCount: number;
   fileCount: number;
+  skippedFileCount: number;
   conflictCount: number;
   redacted: boolean;
   redactionCount: number;

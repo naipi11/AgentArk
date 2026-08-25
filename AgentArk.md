@@ -2,7 +2,7 @@
 
 ## 执行摘要
 
-## 当前实现增量（AgentArk 0.6.1）
+## 当前实现增量（AgentArk 0.6.2）
 
 在保留本规划书 L0/L1/L2 分层合同的前提下，当前桌面迁移页对 Codex 提供自动
 的同 provider 原生身份恢复和 provider-independent continuation：导出 Codex
@@ -18,7 +18,8 @@ archive-only 成功；live subsequent-turn 验证为 opt-in，正常打包不执
 Hermes、OpenClaw、OpenCode 与 Grok Build 均为 AgentArk archive-only，直到各自
 native continuation writer 完成独立验证。Codex 原生恢复完成后需要重启 Codex
 客户端刷新会话列表。耗时扫描在桌面窗口线程之外执行，建立索引期间客户端仍应保
-持响应。
+持响应。项目文件导出会排除依赖和构建目录，并跳过单个超过 64 MiB 的文件，避免
+非源码构建产物阻断整个会话备份。
 
 本项目建议暂定名为 **Agent History Hub（AHH）**：一个面向 Claude Code、Codex、Hermes、Grok Build、OpenClaw 的 **local-first、跨平台、可审计的 Agent 会话与项目历史管理层**。其核心价值不是再做一个聊天客户端，而是建立一个位于各 Agent 之上的“**Agent 数据控制平面**”：自动发现本机 Agent 与工作区，持续索引会话、消息、工具调用、附件、文件快照、instructions/memory/skills/MCP 等资源，在统一 UI/CLI 中查询，并通过统一中间模型实现 Agent 间、设备间和 Windows/Linux/macOS 间迁移。
 

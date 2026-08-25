@@ -75,7 +75,11 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null); setRestoreReport(null);
     try {
       const report = await api.bundleExport(selectedPath, agentKind === 'all' ? undefined : agentKind, selected, includeFiles);
-      setMessage(`${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
+      const skippedFiles = report.skippedFileCount ?? 0;
+      setMessage([
+        `${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`,
+        skippedFiles > 0 ? t('transfer.filesSkipped').replace('{count}', String(skippedFiles)) : null,
+      ].filter(Boolean).join(' · '));
     } catch { setMessage(t('backup.error')); }
     finally { setBusy(false); setBusyAction(null); }
   }

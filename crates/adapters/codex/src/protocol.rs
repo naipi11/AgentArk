@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::CodexError;
 
 pub const MAX_JSON_LINE: usize = 16 * 1024 * 1024;
-pub const AGENTARK_APP_SERVER_CLIENT_VERSION: &str = "0.6.1";
+pub const AGENTARK_APP_SERVER_CLIENT_VERSION: &str = "0.6.2";
 pub(crate) const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]

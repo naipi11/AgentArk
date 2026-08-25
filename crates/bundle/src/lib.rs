@@ -57,6 +57,8 @@ pub struct BundleManifest {
     pub workspace_count: u64,
     #[serde(default)]
     pub file_count: u64,
+    #[serde(default)]
+    pub skipped_file_count: u64,
     pub redacted: bool,
     pub redaction_count: u64,
     pub entries: Vec<BundleEntryMeta>,
@@ -106,6 +108,7 @@ struct BundleWriteMeta {
     source_root: Option<String>,
     workspace_count: u64,
     file_count: u64,
+    skipped_file_count: u64,
 }
 
 enum RecoveryLabelKind {
@@ -259,6 +262,7 @@ pub fn write_sessions(
             source_root: None,
             workspace_count: 0,
             file_count: 0,
+            skipped_file_count: 0,
         },
     )
 }
@@ -295,6 +299,7 @@ pub fn write_selected_sessions_with_native(
         });
     }
     let mut file_count = 0u64;
+    let mut skipped_file_count = 0u64;
     let mut workspace_count = 0u64;
     for selection in selections {
         let workspace = sessions.iter().find_map(|session| {
@@ -313,6 +318,7 @@ pub fn write_selected_sessions_with_native(
                 .follow_links(false)
                 .max_depth(32)
                 .into_iter()
+                .filter_entry(should_export_project_entry)
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_type().is_file())
             {
@@ -327,10 +333,8 @@ pub fn write_selected_sessions_with_native(
                 let mut source = authorized.open_regular_file(relative)?;
                 let metadata = source.metadata()?;
                 if metadata.len() > selection.max_file_bytes {
-                    return Err(BundleError::InvalidFormat(format!(
-                        "project file {} exceeds the selected size limit",
-                        relative_text
-                    )));
+                    skipped_file_count += 1;
+                    continue;
                 }
                 let mut bytes = Vec::with_capacity(metadata.len() as usize);
                 source.read_to_end(&mut bytes)?;
@@ -405,7 +409,19 @@ pub fn write_selected_sessions_with_native(
             source_root,
             workspace_count,
             file_count,
+            skipped_file_count,
         },
+    )
+}
+
+fn should_export_project_entry(entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return true;
+    }
+
+    !matches!(
+        entry.file_name().to_str(),
+        Some(".git" | ".hg" | ".svn" | ".worktrees" | "node_modules" | "target")
     )
 }
 
@@ -425,6 +441,7 @@ pub fn write_entries(
             source_root: None,
             workspace_count: 0,
             file_count: 0,
+            skipped_file_count: 0,
         },
     )
 }
@@ -467,6 +484,7 @@ fn write_entries_with_meta(
         session_count,
         workspace_count: meta.workspace_count,
         file_count: meta.file_count,
+        skipped_file_count: meta.skipped_file_count,
         redacted: redaction_count > 0,
         redaction_count,
         entries: metadata.clone(),
