@@ -421,7 +421,7 @@ fn should_export_project_entry(entry: &walkdir::DirEntry) -> bool {
 
     !matches!(
         entry.file_name().to_str(),
-        Some(".git" | ".hg" | ".svn" | ".worktrees" | "node_modules" | "target")
+        Some(".git" | ".hg" | ".svn" | ".worktrees" | "build" | "dist" | "node_modules" | "target")
     )
 }
 

@@ -156,6 +156,8 @@ fn excludes_generated_project_directories_from_file_exports() {
         ".hg",
         ".svn",
         ".worktrees",
+        "build",
+        "dist",
         "target",
         "node_modules",
     ] {
@@ -210,6 +212,8 @@ fn excludes_generated_project_directories_from_file_exports() {
         && !path.contains("/.hg/")
         && !path.contains("/.svn/")
         && !path.contains("/.worktrees/")
+        && !path.contains("/build/")
+        && !path.contains("/dist/")
         && !path.contains("/target/")
         && !path.contains("/node_modules/")));
 }
