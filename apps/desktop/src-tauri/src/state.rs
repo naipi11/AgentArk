@@ -717,6 +717,9 @@ impl AppState {
         let recovery_manifest = bundle
             .recovery_manifest()
             .map_err(bundle_verification_error_code)?;
+        bundle
+            .session_records()
+            .map_err(bundle_verification_error_code)?;
         let provider_labels = safe_provider_labels(
             recovery_manifest
                 .iter()
@@ -813,13 +816,13 @@ impl AppState {
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
-        let bundle = read_bundle(&path).map_err(|_| "无法读取 .ahbundle 备份".to_owned())?;
+        let bundle = read_bundle(&path).map_err(bundle_verification_error_code)?;
         let recovery_manifest = bundle
             .recovery_manifest()
-            .map_err(|_| "备份中的恢复清单无效".to_owned())?;
+            .map_err(bundle_verification_error_code)?;
         let mut sessions = bundle
             .session_records()
-            .map_err(|_| "备份中的会话数据无效".to_owned())?;
+            .map_err(bundle_verification_error_code)?;
         let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
         let provider_labels = safe_provider_labels(
             sessions
@@ -829,13 +832,13 @@ impl AppState {
         );
         let workspace_ids = bundle
             .workspace_ids()
-            .map_err(|_| "备份中的项目清单无效".to_owned())?;
+            .map_err(bundle_verification_error_code)?;
         let file_entries = bundle
             .workspace_file_entries()
-            .map_err(|_| "备份中的项目文件清单无效".to_owned())?;
+            .map_err(bundle_verification_error_code)?;
         let native_entries = bundle
             .native_rollout_entries()
-            .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?;
+            .map_err(bundle_verification_error_code)?;
         let native_payload_count = native_entries.len() as u64;
         let mut payloads_by_session = HashMap::<Uuid, Vec<NativeRolloutPayload>>::new();
         for entry in native_entries {
@@ -1888,6 +1891,37 @@ mod bundle_import_tests {
         let state = AppState::for_data_root(root.0.join("fresh-target-data"));
 
         let result = state.bundle_verify(root.0.join("missing.ahbundle"));
+
+        assert_eq!(result.unwrap_err(), "bundle-file-unreadable");
+    }
+
+    #[test]
+    fn rejects_malformed_session_records_during_import_verification() {
+        let root = TempRoot::new("bundle-import-malformed-session");
+        let bundle_path = root.0.join("malformed-session.ahbundle");
+        write_entries(
+            &bundle_path,
+            vec![BundleEntry {
+                path: "sessions/session.ndjson".into(),
+                bytes: b"not-json\n".to_vec(),
+            }],
+            1,
+            0,
+        )
+        .unwrap();
+        let state = AppState::for_data_root(root.0.join("fresh-target-data"));
+
+        let result = state.bundle_verify(bundle_path);
+
+        assert_eq!(result.unwrap_err(), "bundle-invalid-format");
+    }
+
+    #[test]
+    fn restore_reports_a_stable_code_when_the_selected_bundle_is_unreadable() {
+        let root = TempRoot::new("bundle-restore-missing");
+        let state = AppState::for_data_root(root.0.join("fresh-target-data"));
+
+        let result = state.bundle_restore(root.0.join("missing.ahbundle"));
 
         assert_eq!(result.unwrap_err(), "bundle-file-unreadable");
     }

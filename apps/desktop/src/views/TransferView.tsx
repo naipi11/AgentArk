@@ -135,7 +135,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         : `${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
       setRestoreReport(report);
       setPreview(null);
-    } catch { setMessage(t('backup.error')); }
+    } catch (error) { setMessage(importErrorMessage(error)); }
     finally { setBusy(false); setBusyAction(null); }
   }
 
