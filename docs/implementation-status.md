@@ -64,7 +64,7 @@ subsequent-turn validation is opt-in and is not part of normal packaging.
 
 ## Release gate
 
-The 0.6.2 Windows release gate requires workspace tests, clippy, front-end
+The 0.6.3 Windows release gate requires workspace tests, clippy, front-end
 tests, MSI/NSIS build, and SHA-256 capture. Installation, launch, and live
 subsequent-turn validation are separate opt-in operations and are not normal
 packaging steps. Codex recovery is version-gated to the tested Codex App Server

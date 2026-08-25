@@ -23,7 +23,7 @@ use agentark_audit::{
     verify_chain,
 };
 use agentark_bundle::{
-    NativeBundleEntry, ProjectSelection, WorkspaceFileEntry, read_bundle,
+    BundleError, NativeBundleEntry, ProjectSelection, WorkspaceFileEntry, read_bundle,
     write_selected_sessions_with_native,
 };
 use agentark_canonical::AgentKind;
@@ -712,11 +712,11 @@ impl AppState {
     }
 
     pub fn bundle_verify(&self, path: PathBuf) -> Result<BundleReport, String> {
-        let bundle = read_bundle(&path).map_err(|_| "无法验证 .ahbundle 文件".to_owned())?;
+        let bundle = read_bundle(&path).map_err(bundle_verification_error_code)?;
         let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
         let recovery_manifest = bundle
             .recovery_manifest()
-            .map_err(|_| "备份中的恢复清单无效".to_owned())?;
+            .map_err(bundle_verification_error_code)?;
         let provider_labels = safe_provider_labels(
             recovery_manifest
                 .iter()
@@ -728,7 +728,7 @@ impl AppState {
         let restore_root = self.data_root.join("restored-workspaces");
         for entry in bundle
             .workspace_file_entries()
-            .map_err(|_| "备份中的项目文件清单无效".to_owned())?
+            .map_err(bundle_verification_error_code)?
         {
             let destination = restore_root
                 .join(entry.workspace_id.to_string())
@@ -754,7 +754,7 @@ impl AppState {
             restore_scan_id: None,
             native_payload_count: bundle
                 .native_rollout_entries()
-                .map_err(|_| "备份中的 Codex 原生清单无效".to_owned())?
+                .map_err(bundle_verification_error_code)?
                 .len() as u64,
             native_imported_count: 0,
             native_skipped_count: 0,
@@ -1405,6 +1405,17 @@ fn append_audit_event(
         .map_err(|_| "无法写入审计账本".to_owned())
 }
 
+fn bundle_verification_error_code(error: BundleError) -> String {
+    match error {
+        BundleError::Io(_) => "bundle-file-unreadable".into(),
+        BundleError::HashMismatch(_) => "bundle-integrity-check-failed".into(),
+        BundleError::InvalidFormat(_)
+        | BundleError::Security(_)
+        | BundleError::UnsafePath(_)
+        | BundleError::Json(_) => "bundle-invalid-format".into(),
+    }
+}
+
 fn append_vendor_recovery_audit_event(
     root: &Path,
     provider_labels: &[String],
@@ -1782,6 +1793,103 @@ mod restore_lock_tests {
             acquire_restore_lock(&lock).err().as_deref(),
             Some("恢复操作锁不可用")
         );
+    }
+}
+
+#[cfg(test)]
+mod bundle_import_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use agentark_bundle::{BundleEntry, write_entries};
+    use uuid::Uuid;
+
+    use super::AppState;
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("agentark-{label}-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reports_a_stable_code_for_an_invalid_bundle() {
+        let root = TempRoot::new("bundle-import-invalid");
+        let bundle_path = root.0.join("invalid.ahbundle");
+        fs::write(&bundle_path, b"not-an-agentark-bundle").unwrap();
+        let state = AppState::for_data_root(root.0.join("fresh-target-data"));
+
+        let result = state.bundle_verify(bundle_path);
+
+        assert_eq!(result.unwrap_err(), "bundle-invalid-format");
+    }
+
+    #[test]
+    fn verifies_a_valid_bundle_on_a_fresh_target_without_a_local_index() {
+        let root = TempRoot::new("bundle-import-fresh-target");
+        let bundle_path = root.0.join("valid.ahbundle");
+        write_entries(
+            &bundle_path,
+            vec![BundleEntry {
+                path: "notes/session.txt".into(),
+                bytes: b"portable history".to_vec(),
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+        let fresh_data_root = root.0.join("fresh-target-data");
+        let state = AppState::for_data_root(fresh_data_root.clone());
+
+        let report = state.bundle_verify(bundle_path).unwrap();
+
+        assert_eq!(report.format, "1.2");
+        assert_eq!(report.entry_count, 2);
+        assert!(!fresh_data_root.exists());
+    }
+
+    #[test]
+    fn reports_a_stable_code_for_a_corrupted_bundle() {
+        let root = TempRoot::new("bundle-import-corrupted");
+        let bundle_path = root.0.join("corrupted.ahbundle");
+        write_entries(
+            &bundle_path,
+            vec![BundleEntry {
+                path: "notes/session.txt".into(),
+                bytes: b"portable history".to_vec(),
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+        let mut bytes = fs::read(&bundle_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        fs::write(&bundle_path, bytes).unwrap();
+        let state = AppState::for_data_root(root.0.join("fresh-target-data"));
+
+        let result = state.bundle_verify(bundle_path);
+
+        assert_eq!(result.unwrap_err(), "bundle-integrity-check-failed");
+    }
+
+    #[test]
+    fn reports_a_stable_code_when_the_selected_bundle_is_unreadable() {
+        let root = TempRoot::new("bundle-import-missing");
+        let state = AppState::for_data_root(root.0.join("fresh-target-data"));
+
+        let result = state.bundle_verify(root.0.join("missing.ahbundle"));
+
+        assert_eq!(result.unwrap_err(), "bundle-file-unreadable");
     }
 }
 
