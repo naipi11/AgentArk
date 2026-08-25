@@ -6,7 +6,7 @@ import { afterEach, beforeEach } from 'vitest';
 
 afterEach(() => cleanup());
 
-const { invoke, dialog, dialogState, exportResult, restoreResult } = vi.hoisted(() => ({
+const { invoke, dialog, dialogState, exportResult, importError, restoreError, restoreResult } = vi.hoisted(() => ({
   dialogState: {
     exportPath: 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle' as string | null,
     importPath: 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle' as string | null,
@@ -18,6 +18,8 @@ const { invoke, dialog, dialogState, exportResult, restoreResult } = vi.hoisted(
   exportResult: {
     format: '1.2', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, skippedFileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: null, agent: 'codex', nativePayloadCount: 0, nativeImportedCount: 0, nativeSkippedCount: 0, nativeConflictCount: 0, nativeRestartRequired: false, nativeIdentityCount: 0, continuationCount: 0, archiveOnlyCount: 0, restoreMappingCount: 0, manualInterventionCount: 0, providerLabels: [],
   },
+  importError: { value: null as string | null },
+  restoreError: { value: null as string | null },
   restoreResult: {
     format: '1.1', sessionCount: 4, entryCount: 4, workspaceCount: 1, fileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: 'scan-1', agent: 'codex', nativeIdentityCount: 2, continuationCount: 1, archiveOnlyCount: 1, restoreMappingCount: 3, manualInterventionCount: 0, recoveryError: undefined as string | undefined, providerLabels: ['openai'],
   },
@@ -25,9 +27,13 @@ const { invoke, dialog, dialogState, exportResult, restoreResult } = vi.hoisted(
     if (command === 'status') return Promise.resolve({ datasetState: 'ready', capabilities: ['read'], schemaFingerprint: 'sha256:test' });
     if (command === 'sessions_list') return Promise.resolve([]);
     if (command === 'quarantines_list') return Promise.resolve([]);
-    if (command === 'bundle_verify') return Promise.resolve({ format: '1.1', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, conflictCount: 0, redacted: 0, redactionCount: 0, restoreScanId: null, agent: 'codex' });
+    if (command === 'bundle_verify') return importError.value
+      ? Promise.reject(importError.value)
+      : Promise.resolve({ format: '1.1', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, conflictCount: 0, redacted: 0, redactionCount: 0, restoreScanId: null, agent: 'codex' });
     if (command === 'bundle_export') return Promise.resolve(exportResult);
-    if (command === 'bundle_restore') return Promise.resolve(restoreResult);
+    if (command === 'bundle_restore') return restoreError.value
+      ? Promise.reject(restoreError.value)
+      : Promise.resolve(restoreResult);
     return Promise.resolve([]);
   }),
 }));
@@ -43,6 +49,8 @@ beforeEach(() => {
   dialogState.exportPath = 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle';
   dialogState.importPath = 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle';
   exportResult.skippedFileCount = 0;
+  importError.value = null;
+  restoreError.value = null;
   restoreResult.manualInterventionCount = 0;
   restoreResult.recoveryError = undefined;
   restoreResult.nativeIdentityCount = 2;
@@ -152,6 +160,27 @@ test('transfer displays the stable manual-intervention recovery diagnostic', asy
   fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
   expect(await screen.findByText('manual-intervention-required')).toBeInTheDocument();
+});
+
+test('transfer explains an integrity failure when importing a copied backup', async () => {
+  importError.value = 'bundle-integrity-check-failed';
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+
+  expect(await screen.findByText('Backup integrity check failed. Copy the bundle again and retry.')).toBeInTheDocument();
+});
+
+test('transfer preserves an integrity diagnostic if the bundle changes before restore', async () => {
+  restoreError.value = 'bundle-integrity-check-failed';
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
+
+  expect(await screen.findByText('Backup integrity check failed. Copy the bundle again and retry.')).toBeInTheDocument();
 });
 
 test('transfer reports oversized project files skipped during export', async () => {

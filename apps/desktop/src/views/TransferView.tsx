@@ -47,6 +47,20 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
     return t(count === 1 ? singular : plural).replace('{count}', String(count));
   }
 
+  function importErrorMessage(error: unknown): string {
+    const code = typeof error === 'string'
+      ? error
+      : error instanceof Error
+        ? error.message
+        : '';
+    switch (code) {
+      case 'bundle-file-unreadable': return t('transfer.importFileUnreadable');
+      case 'bundle-integrity-check-failed': return t('transfer.importIntegrityFailed');
+      case 'bundle-invalid-format': return t('transfer.importInvalidFormat');
+      default: return t('backup.error');
+    }
+  }
+
   useEffect(() => {
     void api.workspacesList(100, 0, agentKind === 'all' ? undefined : agentKind).then((items) => {
       setProjects(items);
@@ -105,7 +119,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
       const report = await api.bundleVerify(chosenPath);
       setPreview(report);
     }
-    catch { setMessage(t('backup.error')); }
+    catch (error) { setMessage(importErrorMessage(error)); }
     finally { setBusy(false); setBusyAction(null); }
   }
 
@@ -121,7 +135,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         : `${t('backup.success')} · ${report.sessionCount} sessions · ${report.fileCount} files`);
       setRestoreReport(report);
       setPreview(null);
-    } catch { setMessage(t('backup.error')); }
+    } catch (error) { setMessage(importErrorMessage(error)); }
     finally { setBusy(false); setBusyAction(null); }
   }
 

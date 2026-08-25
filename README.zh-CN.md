@@ -33,7 +33,7 @@ AgentArk 将本机编程 Agent 的会话和项目工作区统一整理为可搜�
 - 桌面客户端支持中文和英文
 - 原生 Windows、macOS 与 Linux 桌面安装程序；日常使用无需命令行
 
-## v0.6.2 包含的功能
+## v0.6.3 包含的功能
 
 - 面向 Codex、Claude Code、Hermes、OpenClaw、OpenCode 和 Grok Build 的按 Agent 项目与会话浏览
 - 中文 / 英文桌面界面，以及可携带的 `.ahbundle` 导出/导入流程
@@ -41,6 +41,7 @@ AgentArk 将本机编程 Agent 的会话和项目工作区统一整理为可搜�
 - 面向 Windows、Apple 芯片 macOS 和 Linux 的已发布桌面安装包
 - 耗时扫描会在桌面窗口线程之外执行，建立索引期间 AgentArk 仍可保持响应
 - 项目文件导出会排除依赖/构建目录，并跳过单个超过 64 MiB 的文件，不再令整个会话备份失败
+- 导入校验会明确提示文件不可读、完整性校验失败或备份格式不兼容，而不再只显示通用失败
 
 ## 恢复能力
 
@@ -59,9 +60,9 @@ AgentArk 不会导出提供方凭据、接口密钥、账号标识或隐藏推�
 
 1. 打开 [Releases](https://github.com/naipi11/AgentArk/releases/latest)。
 2. 按平台选择安装包：
-   - **Windows：** `AgentArk_0.6.2_x64-setup.exe`（推荐）或 `AgentArk_0.6.2_x64_en-US.msi`
-   - **Apple 芯片 macOS：** `AgentArk_0.6.2_aarch64.dmg`
-   - **Linux x64：** `AgentArk_0.6.2_amd64.AppImage`、`.deb` 或 `.rpm`
+   - **Windows：** `AgentArk_0.6.3_x64-setup.exe`（推荐）或 `AgentArk_0.6.3_x64_en-US.msi`
+   - **Apple 芯片 macOS：** `AgentArk_0.6.3_aarch64.dmg`
+   - **Linux x64：** `AgentArk_0.6.3_amd64.AppImage`、`.deb` 或 `.rpm`
 3. 如需可复现的安装记录，请核对发布的 SHA-256 校验值。
 4. 运行安装程序，并从开始菜单或系统应用启动器打开 **AgentArk**。
 5. 打开 **扫描**，选择一个 Agent，扫描后即可浏览它的项目和会话。
