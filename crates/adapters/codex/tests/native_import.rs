@@ -112,8 +112,8 @@ fn delete_thread_helper_initializes_and_deletes_exact_target() {
     assert_eq!(sent[1]["method"], "initialized");
     assert_eq!(sent[2]["method"], "thread/delete");
     assert_eq!(sent[2]["params"], json!({"threadId": "target-thread"}));
-    assert_eq!(AGENTARK_APP_SERVER_CLIENT_VERSION, "0.6.1");
-    assert_eq!(sent[0]["params"]["clientInfo"]["version"], "0.6.1");
+    assert_eq!(AGENTARK_APP_SERVER_CLIENT_VERSION, "0.6.2");
+    assert_eq!(sent[0]["params"]["clientInfo"]["version"], "0.6.2");
 }
 
 #[test]

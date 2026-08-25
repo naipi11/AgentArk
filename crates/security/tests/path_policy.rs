@@ -70,6 +70,18 @@ fn opens_only_regular_files_beneath_the_authorized_root() {
     assert!(root.open_regular_file(Path::new("../escape")).is_err());
 }
 
+#[cfg(windows)]
+#[test]
+fn opens_a_canonical_windows_workspace_root() {
+    let workspace = tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), b"workspace").unwrap();
+    let canonical_root = std::fs::canonicalize(workspace.path()).unwrap();
+
+    assert!(canonical_root.to_string_lossy().starts_with(r"\\?\"));
+    let root = AuthorizedRoot::new(canonical_root).unwrap();
+    assert!(root.open_regular_file(Path::new("README.md")).is_ok());
+}
+
 #[test]
 fn nofollow_directory_open_rejects_linked_root() {
     let root = tempdir().unwrap();

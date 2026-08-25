@@ -6,7 +6,7 @@ import { afterEach, beforeEach } from 'vitest';
 
 afterEach(() => cleanup());
 
-const { invoke, dialog, dialogState, restoreResult } = vi.hoisted(() => ({
+const { invoke, dialog, dialogState, exportResult, restoreResult } = vi.hoisted(() => ({
   dialogState: {
     exportPath: 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle' as string | null,
     importPath: 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle' as string | null,
@@ -14,6 +14,9 @@ const { invoke, dialog, dialogState, restoreResult } = vi.hoisted(() => ({
   dialog: {
     save: vi.fn<() => Promise<string | null>>(() => Promise.resolve('C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle')),
     open: vi.fn<() => Promise<string | null>>(() => Promise.resolve('C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle')),
+  },
+  exportResult: {
+    format: '1.2', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, skippedFileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: null, agent: 'codex', nativePayloadCount: 0, nativeImportedCount: 0, nativeSkippedCount: 0, nativeConflictCount: 0, nativeRestartRequired: false, nativeIdentityCount: 0, continuationCount: 0, archiveOnlyCount: 0, restoreMappingCount: 0, manualInterventionCount: 0, providerLabels: [],
   },
   restoreResult: {
     format: '1.1', sessionCount: 4, entryCount: 4, workspaceCount: 1, fileCount: 0, conflictCount: 0, redacted: false, redactionCount: 0, restoreScanId: 'scan-1', agent: 'codex', nativeIdentityCount: 2, continuationCount: 1, archiveOnlyCount: 1, restoreMappingCount: 3, manualInterventionCount: 0, recoveryError: undefined as string | undefined, providerLabels: ['openai'],
@@ -23,7 +26,7 @@ const { invoke, dialog, dialogState, restoreResult } = vi.hoisted(() => ({
     if (command === 'sessions_list') return Promise.resolve([]);
     if (command === 'quarantines_list') return Promise.resolve([]);
     if (command === 'bundle_verify') return Promise.resolve({ format: '1.1', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, conflictCount: 0, redacted: 0, redactionCount: 0, restoreScanId: null, agent: 'codex' });
-    if (command === 'bundle_export') return Promise.resolve({ format: '1.1', sessionCount: 0, entryCount: 0, workspaceCount: 0, fileCount: 0, conflictCount: 0, redacted: 0, redactionCount: 0, restoreScanId: null, agent: 'codex' });
+    if (command === 'bundle_export') return Promise.resolve(exportResult);
     if (command === 'bundle_restore') return Promise.resolve(restoreResult);
     return Promise.resolve([]);
   }),
@@ -39,6 +42,7 @@ beforeEach(() => {
   dialog.open.mockImplementation(() => Promise.resolve(dialogState.importPath));
   dialogState.exportPath = 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle';
   dialogState.importPath = 'C:\\Users\\33384\\Documents\\AgentArk\\agent-history.ahbundle';
+  exportResult.skippedFileCount = 0;
   restoreResult.manualInterventionCount = 0;
   restoreResult.recoveryError = undefined;
   restoreResult.nativeIdentityCount = 2;
@@ -148,6 +152,16 @@ test('transfer displays the stable manual-intervention recovery diagnostic', asy
   fireEvent.click(await screen.findByRole('button', { name: 'Import session history' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Restore imported history' }));
   expect(await screen.findByText('manual-intervention-required')).toBeInTheDocument();
+});
+
+test('transfer reports oversized project files skipped during export', async () => {
+  exportResult.skippedFileCount = 2;
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Transfer' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Export session history' }));
+
+  expect(await screen.findByText(/2 oversized project files were not included\./)).toBeInTheDocument();
 });
 
 test('transfer discloses audit persistence failure without claiming restore success', async () => {
