@@ -21,8 +21,14 @@ jobs:
             build-essential curl file libayatana-appindicator3-dev \
             libgtk-3-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
       - run: cargo install --locked cargo-fuzz --version 0.13.2
-      - run: cargo fuzz run codex_jsonl -- -max_total_time=900
-      - run: cargo fuzz run path_policy -- -max_total_time=900
+      - name: Run codex JSONL fuzz target
+        run: cargo fuzz run codex_jsonl -- -max_total_time=900
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-08-20
+      - name: Run path policy fuzz target
+        run: cargo fuzz run path_policy -- -max_total_time=900
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-08-20
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1

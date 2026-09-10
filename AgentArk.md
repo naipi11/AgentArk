@@ -2,7 +2,7 @@
 
 ## 执行摘要
 
-## 当前实现增量（AgentArk 0.6.3）
+## 当前实现增量（AgentArk 0.6.4）
 
 在保留本规划书 L0/L1/L2 分层合同的前提下，当前桌面迁移页对 Codex 提供自动
 的同 provider 原生身份恢复和 provider-independent continuation：导出 Codex

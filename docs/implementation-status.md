@@ -25,6 +25,11 @@ Vendor databases/files are never opened writable.
   secret redaction.
 - CLI commands: `bundle export`, `bundle verify`, `bundle restore`, and
   `migration plan <bundle> <target> [--handoff]`.
+  CLI bundle verification maps unreadable files, integrity failures, and invalid
+  formats to stable sanitized error codes and validates session records before
+  reporting success.
+  The corresponding CLI exit codes are `5` for unreadable files, `4` for integrity
+  failures, and `2` for invalid or incompatible bundle formats.
 - `migration export <bundle> <target> <output>` writes an L1 structured JSON
   handoff and human-readable Markdown handoff per session.
 - Restoring always writes AgentArk-owned SQLCipher index rows in one transaction.
@@ -64,7 +69,7 @@ subsequent-turn validation is opt-in and is not part of normal packaging.
 
 ## Release gate
 
-The 0.6.3 Windows release gate requires workspace tests, clippy, front-end
+The 0.6.4 Windows release gate requires workspace tests, clippy, front-end
 tests, MSI/NSIS build, and SHA-256 capture. Installation, launch, and live
 subsequent-turn validation are separate opt-in operations and are not normal
 packaging steps. Codex recovery is version-gated to the tested Codex App Server

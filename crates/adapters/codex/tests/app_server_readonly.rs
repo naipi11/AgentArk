@@ -123,10 +123,10 @@ fn client_uses_only_read_methods_and_preserves_raw_responses() {
     assert_eq!(list_params["limit"], json!(100));
     assert_eq!(list_params["sortKey"], json!("created_at"));
     assert_eq!(list_params["sortDirection"], json!("asc"));
-    assert_eq!(AGENTARK_APP_SERVER_CLIENT_VERSION, "0.6.3");
+    assert_eq!(AGENTARK_APP_SERVER_CLIENT_VERSION, "0.6.4");
     assert_eq!(
         transport.sent[0]["params"]["clientInfo"]["version"],
-        "0.6.3"
+        "0.6.4"
     );
 }
 

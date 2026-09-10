@@ -33,7 +33,7 @@ AgentArk consolidates local coding-agent conversations and workspaces into a sea
 - Chinese / English desktop interface
 - Native Windows, macOS, and Linux desktop installers; no terminal required for normal use
 
-## What's included in v0.6.3
+## What's included in v0.6.4
 
 - Agent-scoped project and session browsing for Codex, Claude Code, Hermes, OpenClaw, OpenCode, and Grok Build
 - Chinese / English desktop interface and portable `.ahbundle` export/import workflow
@@ -42,6 +42,7 @@ AgentArk consolidates local coding-agent conversations and workspaces into a sea
 - Long-running scans execute away from the desktop window thread, keeping AgentArk responsive while indexing
 - Project-file exports exclude dependency/build directories and skip individual files over 64 MiB instead of failing the complete history backup
 - Import validation now clearly distinguishes unreadable files, integrity failures, and incompatible bundle formats
+- CLI bundle verification now uses the same sanitized diagnostics and semantic session validation as the desktop importer
 
 ## Recovery capability
 
@@ -60,9 +61,9 @@ AgentArk never exports provider credentials, endpoint secrets, account identifie
 
 1. Open [Releases](https://github.com/naipi11/AgentArk/releases/latest).
 2. Choose the package for your platform:
-   - **Windows:** AgentArk_0.6.3_x64-setup.exe (recommended) or AgentArk_0.6.3_x64_en-US.msi
-   - **macOS Apple silicon:** AgentArk_0.6.3_aarch64.dmg
-   - **Linux x64:** AgentArk_0.6.3_amd64.AppImage, `.deb`, or `.rpm`
+   - **Windows:** AgentArk_0.6.4_x64-setup.exe (recommended) or AgentArk_0.6.4_x64_en-US.msi
+   - **macOS Apple silicon:** AgentArk_0.6.4_aarch64.dmg
+   - **Linux x64:** AgentArk_0.6.4_amd64.AppImage, `.deb`, or `.rpm`
 3. Verify the published SHA-256 checksum if you need a reproducible installation record.
 4. Run the installer and open **AgentArk** from the Start menu or your system application launcher.
 5. Open **Scan**, choose an Agent, then scan and browse its projects/sessions.

@@ -211,6 +211,21 @@ fn print_error(json_mode: bool, command: &'static str, error: RuntimeError) -> E
         RuntimeError::NotInitialized => ("not-initialized", "dataset is not initialized", 5),
         RuntimeError::Probe => ("probe-failed", "Codex probe failed", 3),
         RuntimeError::InvalidInput => ("invalid-arguments", "invalid command arguments", 2),
+        RuntimeError::BundleUnreadable => (
+            "bundle-file-unreadable",
+            "unable to read the AgentArk bundle file",
+            5,
+        ),
+        RuntimeError::BundleIntegrity => (
+            "bundle-integrity-check-failed",
+            "AgentArk bundle integrity verification failed",
+            4,
+        ),
+        RuntimeError::BundleInvalidFormat => (
+            "bundle-invalid-format",
+            "AgentArk bundle format is invalid or incompatible",
+            2,
+        ),
         RuntimeError::Storage => ("storage-failed", "local storage operation failed", 5),
         RuntimeError::App(_) => ("application-failed", "application operation failed", 5),
     };

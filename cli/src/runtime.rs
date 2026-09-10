@@ -10,7 +10,9 @@ use agentark_adapter_opencode::OpenCodeAdapter;
 use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{AppError, ScanReport, ScanRequest, ScanService, VerificationService};
 use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
-use agentark_bundle::{BundleError, ProjectSelection, read_bundle, write_selected_sessions};
+use agentark_bundle::{
+    Bundle, BundleError, ProjectSelection, read_bundle, write_selected_sessions,
+};
 use agentark_canonical::AgentKind;
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
@@ -33,6 +35,12 @@ pub enum RuntimeError {
     Probe,
     #[error("application operation failed")]
     App(#[from] AppError),
+    #[error("bundle file is unreadable")]
+    BundleUnreadable,
+    #[error("bundle integrity verification failed")]
+    BundleIntegrity,
+    #[error("bundle format is invalid or incompatible")]
+    BundleInvalidFormat,
     #[error("storage operation failed")]
     Storage,
     #[error("invalid command input")]
@@ -226,6 +234,7 @@ pub fn export_bundle(
 
 pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
+    validate_bundle_contents(&bundle)?;
     Ok(BundleData {
         format: bundle.manifest.format.clone(),
         agent: bundle.manifest.agent.clone(),
@@ -242,7 +251,7 @@ pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
 
 pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
-    let sessions = bundle.session_records().map_err(bundle_error)?;
+    let sessions = validate_bundle_contents(&bundle)?;
     let (_cas, mut index, _store) = open_storage_existing(root)?;
     let scan_id = index
         .restore_sessions(&sessions)
@@ -269,7 +278,7 @@ pub fn migration_plan(
 ) -> Result<MigrationData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
     let target_kind = parse_target_agent(target)?;
-    let sessions = bundle.session_records().map_err(bundle_error)?;
+    let sessions = validate_bundle_contents(&bundle)?;
     let mut plans = Vec::with_capacity(sessions.len());
     let mut handoffs = Vec::new();
     for session in sessions {
@@ -293,7 +302,7 @@ pub fn migration_export(
 ) -> Result<MigrationExportData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
     let target_kind = parse_target_agent(target)?;
-    let sessions = bundle.session_records().map_err(bundle_error)?;
+    let sessions = validate_bundle_contents(&bundle)?;
     let target_label = agentark_migration::agent_label(&target_kind).to_owned();
     let mut artifacts = Vec::with_capacity(sessions.len());
     for session in sessions {
@@ -321,9 +330,24 @@ fn parse_target_agent(target: &str) -> Result<AgentKind, RuntimeError> {
     }
 }
 
+fn validate_bundle_contents(
+    bundle: &Bundle,
+) -> Result<Vec<agentark_canonical::CanonicalSession>, RuntimeError> {
+    bundle.recovery_manifest().map_err(bundle_error)?;
+    bundle.session_records().map_err(bundle_error)
+}
+
 fn bundle_error(error: BundleError) -> RuntimeError {
-    let _ = error;
-    RuntimeError::Storage
+    // Keep this mapping stable across CLI and desktop clients. Do not expose
+    // the underlying error because it may contain local paths or parser data.
+    match error {
+        BundleError::Io(_) => RuntimeError::BundleUnreadable,
+        BundleError::HashMismatch(_) => RuntimeError::BundleIntegrity,
+        BundleError::InvalidFormat(_)
+        | BundleError::Security(_)
+        | BundleError::UnsafePath(_)
+        | BundleError::Json(_) => RuntimeError::BundleInvalidFormat,
+    }
 }
 
 pub fn verify_audit(root: &Path) -> Result<AuditVerification, RuntimeError> {
