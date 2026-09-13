@@ -5,7 +5,7 @@ use agentark_adapter_sdk::{
     AdapterError, CaptureBatch, CaptureRequest, CapturedRecord, CapturedSource, DetectContext,
     NormalizeOutcome, ProbeReport, SourceAdapter, SourceCapability,
 };
-use agentark_app::{AppError, ScanRequest, ScanService, ScanStatus};
+use agentark_app::{AppError, ScanRequest, ScanService, ScanStatus, VerificationService};
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalSchemaVersion, CanonicalSession, Completeness, Sha256Digest,
     session_id,
