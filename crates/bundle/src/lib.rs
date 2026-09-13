@@ -1390,7 +1390,7 @@ mod tests {
         let mut value = serde_json::to_value(session).unwrap();
         value["messages"][0]["rawRef"] = Value::String("sha256:invalid".into());
         let session: CanonicalSession = serde_json::from_value(value).unwrap();
-        let error = raw_provenance_summary(&[session.clone()]).unwrap_err();
+        let error = raw_provenance_summary(std::slice::from_ref(&session)).unwrap_err();
         assert!(
             matches!(error, BundleError::InvalidFormat(message) if message.contains("raw reference"))
         );
