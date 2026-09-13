@@ -5,7 +5,7 @@ use agentark_adapter_sdk::{
     AdapterError, CaptureBatch, CaptureIssue, CaptureRequest, CapturedRecord, CapturedSource,
     DetectContext, NormalizeOutcome, ProbeReport, SourceAdapter, SourceCapability,
 };
-use agentark_canonical::{AgentInstall, AgentKind, agent_install_id};
+use agentark_canonical::{AgentInstall, AgentKind, agent_install_id, file_uri_for_path};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -46,7 +46,7 @@ impl CodexAdapter {
     }
 
     fn root_uri(&self) -> String {
-        format!("file://{}", self.root.to_string_lossy().replace('\\', "/"))
+        file_uri_for_path(&self.root)
     }
 
     fn install(&self) -> AgentInstall {

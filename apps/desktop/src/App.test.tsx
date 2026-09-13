@@ -26,6 +26,7 @@ const { invoke, dialog, dialogState, exportResult, importError, restoreError, re
   invoke: vi.fn((command: string) => {
     if (command === 'status') return Promise.resolve({ datasetState: 'ready', capabilities: ['read'], schemaFingerprint: 'sha256:test' });
     if (command === 'sessions_list') return Promise.resolve([]);
+    if (command === 'workspaces_list') return Promise.resolve([{ id: 'workspace-1', pathNative: 'C:\\Users\\33384\\project', canonicalUri: 'file:///C:/Users/33384/project', sessionCount: 1 }]);
     if (command === 'quarantines_list') return Promise.resolve([]);
     if (command === 'bundle_verify') return importError.value
       ? Promise.reject(importError.value)
@@ -73,6 +74,16 @@ test('projects expose an Agent selector and pass it to the workspace query', asy
   const selector = await screen.findByRole('combobox', { name: 'Agent' });
   fireEvent.change(selector, { target: { value: 'claudeCode' } });
   await waitFor(() => expect(invoke).toHaveBeenCalledWith('workspaces_list', { limit: 100, offset: 0, agentKind: 'claudeCode' }));
+});
+
+test('search tab exposes full-text archive search', async () => {
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+  const input = await screen.findByRole('textbox', { name: 'Search messages, tools, and titles' });
+  fireEvent.change(input, { target: { value: 'needle' } });
+  fireEvent.click(screen.getAllByRole('button', { name: 'Search' })[1]);
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith('search', { query: 'needle', limit: 50 }));
 });
 
 test('transfer view exposes export and import session history actions', async () => {

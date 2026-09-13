@@ -6,6 +6,7 @@ use agentark_canonical::{
 };
 use agentark_security::{SecretFinding, SecretScanner};
 use rusqlite::{OptionalExtension, params};
+use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -68,6 +69,13 @@ pub trait SessionIndex {
         adapter_id: &str,
         snapshot_id: &str,
     ) -> Result<(), IndexError>;
+    fn update_scan_snapshot(
+        &mut self,
+        _scan_id: Uuid,
+        _snapshot_id: &str,
+    ) -> Result<(), IndexError> {
+        Ok(())
+    }
     fn ingest_session(&mut self, input: SessionIngest<'_>) -> Result<(), IndexError>;
     fn record_quarantine(&mut self, record: QuarantineRecord) -> Result<(), IndexError>;
     fn finish_scan(&mut self, manifest: &ScanManifest) -> Result<(), IndexError>;
@@ -106,6 +114,14 @@ impl SessionIndex for IndexDb {
             params![scan_id.to_string(), adapter_id, snapshot_id, now_string(),],
         )?;
         self.set_active_scan_id(Some(scan_id));
+        Ok(())
+    }
+
+    fn update_scan_snapshot(&mut self, scan_id: Uuid, snapshot_id: &str) -> Result<(), IndexError> {
+        self.connection_mut().execute(
+            "UPDATE scan_runs SET snapshot_id = ?1 WHERE id = ?2",
+            params![snapshot_id, scan_id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -445,7 +461,10 @@ impl IndexDb {
                 now_string()
             ],
         )?;
-        for session in sessions {
+        for source_session in sessions {
+            let (sanitized_value, _) =
+                sanitize_json_value(serde_json::to_value(source_session)?, &scanner);
+            let session: CanonicalSession = serde_json::from_value(sanitized_value)?;
             let install_json = serde_json::to_string(&agent_kind(&session.source_kind))?;
             let capabilities_json = serde_json::to_string(&vec!["bundle-restore"])?;
             tx.execute(
@@ -481,6 +500,25 @@ impl IndexDb {
                 .sanitize(session.title.as_deref().unwrap_or(""))
                 .text;
             let sanitized_body = scanner.sanitize(&session.searchable_text()).text;
+            let raw_bytes = serde_json::to_vec(&session)?;
+            let raw_hash = Sha256Digest::from_bytes(&raw_bytes);
+            let object_id = format!("bundle:{}", session.id);
+            tx.execute(
+                "INSERT INTO verification_records(
+                   scan_id, object_id, object_type, plaintext_hash, size,
+                   session_json, canonical_hash, sanitized_title, sanitized_body
+                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    scan_id.to_string(),
+                    object_id,
+                    raw_hash.as_str(),
+                    raw_bytes.len() as i64,
+                    serde_json::to_string(&session)?,
+                    canonical_hash,
+                    sanitized_title,
+                    sanitized_body,
+                ],
+            )?;
             let prior_revision: Option<i64> = tx
                 .query_row(
                     "SELECT revision FROM sessions WHERE id = ?1",
@@ -570,6 +608,43 @@ impl IndexDb {
         )?;
         tx.commit()?;
         Ok(scan_id)
+    }
+}
+
+fn sanitize_json_value(value: Value, scanner: &SecretScanner) -> (Value, u64) {
+    match value {
+        Value::String(text) => {
+            let sanitized = scanner.sanitize(&text);
+            (
+                Value::String(sanitized.text),
+                sanitized.findings.len() as u64,
+            )
+        }
+        Value::Array(values) => {
+            let mut count = 0;
+            let values = values
+                .into_iter()
+                .map(|value| {
+                    let (value, found) = sanitize_json_value(value, scanner);
+                    count += found;
+                    value
+                })
+                .collect();
+            (Value::Array(values), count)
+        }
+        Value::Object(values) => {
+            let mut count = 0;
+            let values = values
+                .into_iter()
+                .map(|(key, value)| {
+                    let (value, found) = sanitize_json_value(value, scanner);
+                    count += found;
+                    (key, value)
+                })
+                .collect();
+            (Value::Object(values), count)
+        }
+        other => (other, 0),
     }
 }
 

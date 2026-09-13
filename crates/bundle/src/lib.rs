@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
-use agentark_canonical::CanonicalSession;
+use agentark_canonical::{CanonicalSession, file_uri_for_path};
 use agentark_security::{AuthorizedRoot, SecretScanner};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -142,7 +142,9 @@ impl Bundle {
             if !path.starts_with("sessions/") || !path.ends_with(".ndjson") {
                 continue;
             }
-            for line in String::from_utf8_lossy(bytes).lines() {
+            let text = String::from_utf8(bytes.clone())
+                .map_err(|_| BundleError::InvalidFormat(format!("entry {path} is not UTF-8")))?;
+            for line in text.lines() {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -153,7 +155,19 @@ impl Bundle {
     }
 
     pub fn verify(&self) -> Result<(), BundleError> {
+        let mut manifest_paths = BTreeSet::new();
         for meta in &self.manifest.entries {
+            if meta.path == "manifest.json" {
+                return Err(BundleError::InvalidFormat(
+                    "manifest.json must not be listed in its own manifest".into(),
+                ));
+            }
+            if !manifest_paths.insert(meta.path.clone()) {
+                return Err(BundleError::InvalidFormat(format!(
+                    "duplicate manifest entry {}",
+                    meta.path
+                )));
+            }
             let bytes = self.entries.get(&meta.path).ok_or_else(|| {
                 BundleError::InvalidFormat(format!("missing entry {}", meta.path))
             })?;
@@ -165,7 +179,277 @@ impl Bundle {
                 return Err(BundleError::HashMismatch(meta.path.clone()));
             }
         }
+
+        let actual_paths = self
+            .entries
+            .keys()
+            .filter(|path| path.as_str() != "manifest.json")
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(path) = actual_paths.difference(&manifest_paths).next() {
+            return Err(BundleError::InvalidFormat(format!(
+                "entry {path} is not listed in manifest"
+            )));
+        }
+        if let Some(path) = manifest_paths.difference(&actual_paths).next() {
+            return Err(BundleError::InvalidFormat(format!(
+                "manifest entry {path} is missing"
+            )));
+        }
+
+        let strict_semantics = self.manifest.format == FORMAT_VERSION;
+        let scanner = SecretScanner::v1().map_err(BundleError::from)?;
+        let sessions = self.session_records()?;
+        let mut session_ids = BTreeSet::new();
+        for session in &sessions {
+            if !session_ids.insert(session.id) {
+                return Err(BundleError::InvalidFormat(
+                    "duplicate canonical session ID".into(),
+                ));
+            }
+            if strict_semantics {
+                let (_, redaction_count) = redact_value(serde_json::to_value(session)?, &scanner);
+                if redaction_count > 0 {
+                    return Err(BundleError::InvalidFormat(
+                        "bundle contains unsanitized session data".into(),
+                    ));
+                }
+            }
+        }
+        if self.manifest.session_count != sessions.len() as u64 {
+            return Err(BundleError::InvalidFormat(format!(
+                "session count is inconsistent: manifest={}, entries={}",
+                self.manifest.session_count,
+                sessions.len()
+            )));
+        }
+
+        if strict_semantics {
+            let workspace_ids = self.workspace_ids()?;
+            if self.manifest.workspace_count != workspace_ids.len() as u64 {
+                return Err(BundleError::InvalidFormat(format!(
+                    "workspace count is inconsistent: manifest={}, entries={}",
+                    self.manifest.workspace_count,
+                    workspace_ids.len()
+                )));
+            }
+            let workspace_id_set = workspace_ids.iter().copied().collect::<BTreeSet<_>>();
+            let workspace_files = self.workspace_file_entries()?;
+            for entry in &workspace_files {
+                let text = String::from_utf8(entry.bytes.clone()).map_err(|_| {
+                    BundleError::InvalidFormat("bundle contains an unscannable project file".into())
+                })?;
+                let (_, redaction_count) = redact_value(Value::String(text), &scanner);
+                if redaction_count > 0 {
+                    return Err(BundleError::InvalidFormat(
+                        "bundle contains unsanitized project-file data".into(),
+                    ));
+                }
+            }
+            if self.manifest.file_count != workspace_files.len() as u64 {
+                return Err(BundleError::InvalidFormat(format!(
+                    "file count is inconsistent: manifest={}, entries={}",
+                    self.manifest.file_count,
+                    workspace_files.len()
+                )));
+            }
+            if workspace_files
+                .iter()
+                .any(|entry| !workspace_id_set.contains(&entry.workspace_id))
+            {
+                return Err(BundleError::InvalidFormat(
+                    "workspace file entry has no workspace manifest".into(),
+                ));
+            }
+            self.verify_workspace_manifests(&workspace_ids, &workspace_files)?;
+        }
+
+        let native_entries = self.native_rollout_entries()?;
+        if strict_semantics {
+            for entry in &native_entries {
+                let text = String::from_utf8(entry.bytes.clone()).map_err(|_| {
+                    BundleError::InvalidFormat(
+                        "bundle contains an unscannable native payload".into(),
+                    )
+                })?;
+                let (_, redaction_count) = redact_value(Value::String(text), &scanner);
+                if redaction_count > 0 {
+                    return Err(BundleError::InvalidFormat(
+                        "bundle contains unsanitized native payload data".into(),
+                    ));
+                }
+            }
+            let mut native_session_ids = BTreeSet::new();
+            for entry in &native_entries {
+                if !session_ids.contains(&entry.session_id) {
+                    return Err(BundleError::InvalidFormat(
+                        "native rollout entry has no session record".into(),
+                    ));
+                }
+                if !native_session_ids.insert(entry.session_id) {
+                    return Err(BundleError::InvalidFormat(
+                        "multiple native rollout entries reference one session".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(recovery) = self.recovery_manifest()? {
+            if recovery.version != "1" {
+                return Err(BundleError::InvalidFormat(
+                    "unsupported recovery manifest version".into(),
+                ));
+            }
+            let mut recovery_ids = BTreeSet::new();
+            for entry in &recovery.sessions {
+                if !recovery_ids.insert(entry.canonical_session_id)
+                    || !session_ids.contains(&entry.canonical_session_id)
+                {
+                    return Err(BundleError::InvalidFormat(
+                        "recovery manifest does not match session records".into(),
+                    ));
+                }
+                let native_count = native_entries
+                    .iter()
+                    .filter(|native| native.session_id == entry.canonical_session_id)
+                    .count() as u64;
+                if entry.native_payload_count != native_count {
+                    return Err(BundleError::InvalidFormat(
+                        "recovery manifest native payload count is inconsistent".into(),
+                    ));
+                }
+            }
+            if strict_semantics && recovery_ids != session_ids {
+                return Err(BundleError::InvalidFormat(
+                    "recovery manifest does not cover all session records".into(),
+                ));
+            }
+        }
+        if strict_semantics && self.manifest.redacted != (self.manifest.redaction_count > 0) {
+            return Err(BundleError::InvalidFormat(
+                "redaction metadata is inconsistent".into(),
+            ));
+        }
         Ok(())
+    }
+
+    fn verify_workspace_manifests(
+        &self,
+        workspace_ids: &[uuid::Uuid],
+        workspace_files: &[WorkspaceFileEntry],
+    ) -> Result<(), BundleError> {
+        for workspace_id in workspace_ids {
+            let path = format!("workspaces/{workspace_id}/manifest.json");
+            let bytes = self
+                .entries
+                .get(&path)
+                .ok_or_else(|| BundleError::InvalidFormat(format!("missing entry {path}")))?;
+            let value: Value = serde_json::from_slice(bytes)?;
+            let manifest_id = value
+                .get("workspaceId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BundleError::InvalidFormat(format!("workspace manifest {path} is invalid"))
+                })?;
+            if manifest_id != workspace_id.to_string() {
+                return Err(BundleError::InvalidFormat(format!(
+                    "workspace manifest {path} has the wrong workspace ID"
+                )));
+            }
+            let listed = value
+                .get("files")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    BundleError::InvalidFormat(format!("workspace manifest {path} is invalid"))
+                })?;
+            let mut listed_paths = BTreeSet::new();
+            for file in listed {
+                let relative = file.get("path").and_then(Value::as_str).ok_or_else(|| {
+                    BundleError::InvalidFormat(format!("workspace manifest {path} is invalid"))
+                })?;
+                validate_relative_path(relative)?;
+                if !listed_paths.insert(relative.to_owned()) {
+                    return Err(BundleError::InvalidFormat(format!(
+                        "workspace manifest {path} contains a duplicate file"
+                    )));
+                }
+                let entry = workspace_files.iter().find(|entry| {
+                    entry.workspace_id == *workspace_id && entry.relative_path == relative
+                });
+                let Some(entry) = entry else {
+                    return Err(BundleError::InvalidFormat(format!(
+                        "workspace manifest {path} references a missing file"
+                    )));
+                };
+                let size = file.get("size").and_then(Value::as_u64).ok_or_else(|| {
+                    BundleError::InvalidFormat(format!("workspace manifest {path} is invalid"))
+                })?;
+                let hash = file.get("sha256").and_then(Value::as_str).ok_or_else(|| {
+                    BundleError::InvalidFormat(format!("workspace manifest {path} is invalid"))
+                })?;
+                if size != entry.bytes.len() as u64
+                    || hash != hex::encode(Sha256::digest(&entry.bytes))
+                {
+                    return Err(BundleError::HashMismatch(format!("{path}::{relative}")));
+                }
+            }
+            let actual_paths = workspace_files
+                .iter()
+                .filter(|entry| entry.workspace_id == *workspace_id)
+                .map(|entry| entry.relative_path.as_str())
+                .collect::<BTreeSet<_>>();
+            if listed_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                != actual_paths
+            {
+                return Err(BundleError::InvalidFormat(format!(
+                    "workspace manifest {path} does not match file entries"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn workspace_manifest(&self, workspace_id: uuid::Uuid) -> Result<Value, BundleError> {
+        let path = format!("workspaces/{workspace_id}/manifest.json");
+        let bytes = self
+            .entries
+            .get(&path)
+            .ok_or_else(|| BundleError::InvalidFormat(format!("missing entry {path}")))?;
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn workspace_manifest_entries(
+        &self,
+        restore_root: &Path,
+    ) -> Result<Vec<WorkspaceFileEntry>, BundleError> {
+        self.workspace_ids()?
+            .into_iter()
+            .map(|workspace_id| {
+                let value = self.workspace_manifest(workspace_id)?;
+                let mut value = value;
+                let destination = restore_root.join(workspace_id.to_string());
+                let object = value.as_object_mut().ok_or_else(|| {
+                    BundleError::InvalidFormat("workspace manifest must be an object".into())
+                })?;
+                object.insert(
+                    "pathNative".into(),
+                    Value::String(destination.to_string_lossy().into_owned()),
+                );
+                object.insert(
+                    "canonicalUri".into(),
+                    Value::String(file_uri_for_path(&destination)),
+                );
+                Ok(WorkspaceFileEntry {
+                    workspace_id,
+                    // Keep AgentArk metadata outside the user's project namespace.
+                    // A project may legitimately contain its own manifest.json.
+                    relative_path: ".agentark/manifest.json".into(),
+                    bytes: serde_json::to_vec_pretty(&value)?,
+                })
+            })
+            .collect()
     }
 
     pub fn workspace_file_entries(&self) -> Result<Vec<WorkspaceFileEntry>, BundleError> {
@@ -198,6 +482,12 @@ impl Bundle {
             let Some(id) = rest.strip_suffix("/manifest.json") else {
                 continue;
             };
+            // Only the workspace metadata entry is an immediate child. A
+            // project file named manifest.json lives below `files/` and must
+            // not be mistaken for another workspace manifest.
+            if id.contains('/') {
+                continue;
+            }
             ids.push(uuid::Uuid::parse_str(id).map_err(|_| BundleError::UnsafePath(path.clone()))?);
         }
         ids.sort();
@@ -232,6 +522,15 @@ impl Bundle {
         }
         Ok(entries)
     }
+}
+
+pub fn sanitize_session(
+    session: &CanonicalSession,
+    scanner: &SecretScanner,
+) -> Result<(CanonicalSession, u64), BundleError> {
+    let value = serde_json::to_value(session)?;
+    let (value, count) = redact_value(value, scanner);
+    Ok((serde_json::from_value(value)?, count))
 }
 
 pub fn write_sessions(
@@ -301,7 +600,11 @@ pub fn write_selected_sessions_with_native(
     let mut file_count = 0u64;
     let mut skipped_file_count = 0u64;
     let mut workspace_count = 0u64;
+    let mut selected_workspace_ids = BTreeSet::new();
     for selection in selections {
+        if !selected_workspace_ids.insert(selection.workspace_id) {
+            continue;
+        }
         let workspace = sessions.iter().find_map(|session| {
             session
                 .workspace
@@ -338,7 +641,10 @@ pub fn write_selected_sessions_with_native(
                 }
                 let mut bytes = Vec::with_capacity(metadata.len() as usize);
                 source.read_to_end(&mut bytes)?;
-                let (bytes, count) = redact_bytes(bytes, scanner);
+                let Some((bytes, count)) = redact_bytes(bytes, scanner) else {
+                    skipped_file_count += 1;
+                    continue;
+                };
                 redaction_count += count;
                 file_count += 1;
                 entries.push(BundleEntry {
@@ -358,7 +664,19 @@ pub fn write_selected_sessions_with_native(
         });
         workspace_count += 1;
     }
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<BTreeSet<_>>();
+    let mut native_session_ids = BTreeSet::new();
     for native in native_entries {
+        if !session_ids.contains(&native.session_id)
+            || !native_session_ids.insert(native.session_id)
+        {
+            return Err(BundleError::InvalidFormat(
+                "native rollout entry does not identify exactly one session".into(),
+            ));
+        }
         validate_relative_path(&native.relative_path)?;
         redaction_count += native.redaction_count;
         entries.push(BundleEntry {
@@ -455,6 +773,11 @@ fn write_entries_with_meta(
 ) -> Result<BundleManifest, BundleError> {
     for entry in &entries {
         validate_relative_path(&entry.path)?;
+        if entry.path == "manifest.json" {
+            return Err(BundleError::InvalidFormat(
+                "manifest.json is reserved for the bundle manifest".into(),
+            ));
+        }
         if entry.bytes.len() as u64 > MAX_ENTRY_BYTES {
             return Err(BundleError::InvalidFormat(format!(
                 "entry {} is too large",
@@ -462,10 +785,19 @@ fn write_entries_with_meta(
             )));
         }
     }
-    if entries.len() as u32 >= MAX_ENTRIES {
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    if let Some(window) = entries
+        .windows(2)
+        .find(|window| window[0].path == window[1].path)
+    {
+        return Err(BundleError::InvalidFormat(format!(
+            "duplicate entry {}",
+            window[0].path
+        )));
+    }
+    if entries.len().saturating_add(1) > MAX_ENTRIES as usize {
         return Err(BundleError::InvalidFormat("too many bundle entries".into()));
     }
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
     let metadata = entries
         .iter()
         .map(|entry| BundleEntryMeta {
@@ -572,6 +904,12 @@ pub fn read_bundle(path: &Path) -> Result<Bundle, BundleError> {
             )));
         }
     }
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(BundleError::InvalidFormat(
+            "trailing data after bundle entries".into(),
+        ));
+    }
     let manifest_bytes = entries
         .get("manifest.json")
         .ok_or_else(|| BundleError::InvalidFormat("manifest.json is missing".into()))?;
@@ -584,6 +922,147 @@ pub fn read_bundle(path: &Path) -> Result<Bundle, BundleError> {
     let bundle = Bundle { manifest, entries };
     bundle.verify()?;
     Ok(bundle)
+}
+
+pub fn restore_workspace(bundle: &Bundle, root: &Path) -> Result<(), BundleError> {
+    let mut entries = bundle.workspace_manifest_entries(root)?;
+    entries.extend(bundle.workspace_file_entries()?);
+    restore_workspace_files(root, &entries)
+}
+
+pub fn restore_workspace_files(
+    root: &Path,
+    entries: &[WorkspaceFileEntry],
+) -> Result<(), BundleError> {
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    let root_dir = agentark_security::open_or_create_directory_nofollow(&root)?;
+    let mut planned = BTreeSet::new();
+    for entry in entries {
+        validate_relative_path(&entry.relative_path)?;
+        let relative_path =
+            PathBuf::from(entry.workspace_id.to_string()).join(&entry.relative_path);
+        if !planned.insert(relative_path.clone()) {
+            return Err(BundleError::InvalidFormat(
+                "duplicate workspace restore path".into(),
+            ));
+        }
+        let parent = relative_path.parent().ok_or_else(|| {
+            BundleError::InvalidFormat("workspace restore path is invalid".into())
+        })?;
+        let filename = relative_path.file_name().ok_or_else(|| {
+            BundleError::InvalidFormat("workspace restore path is invalid".into())
+        })?;
+        let parent_dir = open_or_create_relative_directory(&root_dir, parent)?;
+        match parent_dir.symlink_metadata(filename) {
+            Ok(metadata) => {
+                if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                    return Err(BundleError::UnsafePath(entry.relative_path.clone()));
+                }
+                let mut existing_file = parent_dir.open(filename)?;
+                let mut existing = Vec::new();
+                existing_file.read_to_end(&mut existing)?;
+                if existing != entry.bytes {
+                    return Err(BundleError::InvalidFormat(format!(
+                        "workspace file conflict: {}",
+                        entry.relative_path
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BundleError::Io(error)),
+        }
+    }
+
+    let mut created = Vec::<(cap_std::fs::Dir, PathBuf)>::new();
+    for entry in entries {
+        let relative_path =
+            PathBuf::from(entry.workspace_id.to_string()).join(&entry.relative_path);
+        let parent = relative_path.parent().ok_or_else(|| {
+            BundleError::InvalidFormat("workspace restore path is invalid".into())
+        })?;
+        let filename = relative_path.file_name().ok_or_else(|| {
+            BundleError::InvalidFormat("workspace restore path is invalid".into())
+        })?;
+        let parent_dir = open_or_create_relative_directory(&root_dir, parent)?;
+        if parent_dir.symlink_metadata(filename).is_ok() {
+            continue;
+        }
+        let committed_parent = parent_dir.try_clone()?;
+        let temporary = PathBuf::from(format!(
+            ".{}.{}.tmp",
+            filename.to_str().ok_or_else(|| {
+                BundleError::InvalidFormat("workspace restore path is invalid".into())
+            })?,
+            uuid::Uuid::new_v4()
+        ));
+        let write_result = (|| {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            let mut temporary_file = parent_dir.open_with(&temporary, &options)?;
+            temporary_file.write_all(&entry.bytes)?;
+            temporary_file.sync_all()?;
+            drop(temporary_file);
+            if parent_dir.symlink_metadata(filename).is_ok() {
+                return Err(BundleError::InvalidFormat(format!(
+                    "workspace file conflict: {}",
+                    entry.relative_path
+                )));
+            }
+            parent_dir.rename(&temporary, &parent_dir, filename)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = parent_dir.remove_file(&temporary);
+            for (created_parent, created_name) in created.iter().rev() {
+                let _ = created_parent.remove_file(created_name);
+            }
+        }
+        write_result?;
+        created.push((committed_parent, PathBuf::from(filename)));
+    }
+    Ok(())
+}
+
+fn open_or_create_relative_directory(
+    root: &cap_std::fs::Dir,
+    path: &Path,
+) -> Result<cap_std::fs::Dir, BundleError> {
+    let mut current = root.try_clone()?;
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            return Err(BundleError::UnsafePath(path.to_string_lossy().into_owned()));
+        };
+        let child = Path::new(value);
+        match current.symlink_metadata(child) {
+            Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+            Ok(_) => return Err(BundleError::UnsafePath(path.to_string_lossy().into_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                current.create_dir(child)?;
+            }
+            Err(error) => return Err(BundleError::Io(error)),
+        }
+        current = agentark_security::open_child_directory_nofollow(&current, child)?;
+    }
+    Ok(current)
+}
+
+fn is_link_or_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        metadata.file_attributes() & 0x0000_0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn redact_value(value: Value, scanner: &SecretScanner) -> (Value, u64) {
@@ -650,28 +1129,30 @@ fn safe_recovery_label(
     }
 }
 
-fn redact_bytes(bytes: Vec<u8>, scanner: &SecretScanner) -> (Vec<u8>, u64) {
-    match String::from_utf8(bytes) {
-        Ok(text) => {
-            let sanitized = scanner.sanitize(&text);
-            (sanitized.text.into_bytes(), sanitized.findings.len() as u64)
-        }
-        Err(error) => (error.into_bytes(), 0),
-    }
+fn redact_bytes(bytes: Vec<u8>, scanner: &SecretScanner) -> Option<(Vec<u8>, u64)> {
+    let text = String::from_utf8(bytes).ok()?;
+    let sanitized = scanner.sanitize(&text);
+    Some((sanitized.text.into_bytes(), sanitized.findings.len() as u64))
 }
 
 fn is_credential_filename(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        ".env"
-            | ".env.local"
-            | "auth.json"
-            | "auth.toml"
-            | "credentials.json"
-            | "mcp-auth.json"
-            | "token.json"
-    ) || name.ends_with(".pem")
+    name.starts_with(".env")
+        || matches!(
+            name.as_str(),
+            "auth.json"
+                | "auth.toml"
+                | "credentials"
+                | "credentials.json"
+                | "mcp-auth.json"
+                | "token.json"
+                | "aws_credentials"
+                | "application_default_credentials.json"
+        )
+        || name.starts_with("service-account")
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.ends_with(".pem")
         || name.ends_with(".key")
         || name.ends_with(".p12")
 }
@@ -769,6 +1250,450 @@ mod tests {
             .values()
             .find(|bytes| String::from_utf8_lossy(bytes).contains("[REDACTED:"));
         assert!(session_entry.is_some());
+    }
+
+    #[test]
+    fn rejects_duplicate_entries() {
+        let root = tempdir().unwrap();
+        let error = write_entries(
+            root.path().join("duplicate.ahbundle").as_path(),
+            vec![
+                BundleEntry {
+                    path: "notes/session.txt".into(),
+                    bytes: b"one".to_vec(),
+                },
+                BundleEntry {
+                    path: "notes/session.txt".into(),
+                    bytes: b"two".to_vec(),
+                },
+            ],
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("duplicate entry"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_caller_supplied_manifest_entry() {
+        let root = tempdir().unwrap();
+        let error = write_entries(
+            root.path().join("manifest.ahbundle").as_path(),
+            vec![BundleEntry {
+                path: "manifest.json".into(),
+                bytes: b"not-the-manifest".to_vec(),
+            }],
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("reserved"))
+        );
+    }
+
+    #[test]
+    fn deduplicates_repeated_workspace_selections() {
+        let root = tempdir().unwrap();
+        let workspace = agentark_canonical::Workspace {
+            id: agentark_canonical::workspace_id("file:///fixture"),
+            path_native: root.path().to_string_lossy().into_owned(),
+            canonical_uri: "file:///fixture".into(),
+            git_commit: None,
+        };
+        let session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "workspace-session".into(),
+            source_kind: "fixture".into(),
+            workspace: Some(workspace.clone()),
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: BTreeMap::new(),
+        };
+        let path = root.path().join("repeated-workspace.ahbundle");
+        let selection = ProjectSelection {
+            workspace_id: workspace.id,
+            root: root.path().to_path_buf(),
+            include_files: false,
+            max_file_bytes: 1024,
+        };
+        let manifest = write_selected_sessions(
+            &path,
+            "fixture",
+            std::slice::from_ref(&session),
+            &[selection.clone(), selection],
+            &SecretScanner::v1().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.workspace_count, 1);
+        assert!(read_bundle(&path).is_ok());
+    }
+
+    #[test]
+    fn rejects_multiple_native_entries_for_one_session() {
+        let root = tempdir().unwrap();
+        let session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "native-duplicate".into(),
+            source_kind: "codex".into(),
+            workspace: None,
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: BTreeMap::new(),
+        };
+        let entries = [
+            NativeBundleEntry {
+                session_id: session.id,
+                relative_path: "one.jsonl".into(),
+                bytes: b"one".to_vec(),
+                redaction_count: 0,
+            },
+            NativeBundleEntry {
+                session_id: session.id,
+                relative_path: "two.jsonl".into(),
+                bytes: b"two".to_vec(),
+                redaction_count: 0,
+            },
+        ];
+        let error = write_selected_sessions_with_native(
+            &root.path().join("duplicate-native.ahbundle"),
+            "codex",
+            std::slice::from_ref(&session),
+            &[],
+            &entries,
+            &SecretScanner::v1().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("exactly one session"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_utf8_session_entry() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("non-utf8.ahbundle");
+        write_entries(
+            &path,
+            vec![BundleEntry {
+                path: "sessions/non-utf8.ndjson".into(),
+                bytes: vec![0xff, b'\n'],
+            }],
+            1,
+            0,
+        )
+        .unwrap();
+        let error = read_bundle(&path).unwrap_err();
+        assert!(matches!(error, BundleError::InvalidFormat(message) if message.contains("UTF-8")));
+    }
+
+    #[test]
+    fn rejects_trailing_bundle_data() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("trailing.ahbundle");
+        write_entries(
+            &path,
+            vec![BundleEntry {
+                path: "notes/session.txt".into(),
+                bytes: b"portable history".to_vec(),
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"trailing-data");
+        fs::write(&path, bytes).unwrap();
+        let error = read_bundle(&path).unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("trailing"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_entry_not_listed_in_the_manifest() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("unlisted.ahbundle");
+        write_entries(
+            &path,
+            vec![BundleEntry {
+                path: "notes/session.txt".into(),
+                bytes: b"portable history".to_vec(),
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let count = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
+        bytes[9..13].copy_from_slice(&(count + 1).to_le_bytes());
+        let mut extra = Vec::new();
+        write_entry(
+            &mut extra,
+            &BundleEntry {
+                path: "notes/unlisted.txt".into(),
+                bytes: b"unlisted".to_vec(),
+            },
+        )
+        .unwrap();
+        bytes.extend_from_slice(&extra);
+        fs::write(&path, bytes).unwrap();
+        let error = read_bundle(&path).unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("not listed"))
+        );
+    }
+
+    #[test]
+    fn fail_closed_file_policy_skips_binary_and_credential_variants() {
+        let scanner = SecretScanner::v1().unwrap();
+        assert!(is_credential_filename(".env.production"));
+        assert!(is_credential_filename("service-account.json"));
+        assert!(is_credential_filename("id_ed25519"));
+        assert!(redact_bytes(vec![0xff, b'a'], &scanner).is_none());
+        let sanitized =
+            redact_bytes(b"AWS_SECRET_ACCESS_KEY=super-secret".to_vec(), &scanner).unwrap();
+        assert!(
+            !String::from_utf8(sanitized.0)
+                .unwrap()
+                .contains("super-secret")
+        );
+    }
+
+    #[test]
+    fn rejects_an_orphan_native_payload_in_a_strict_bundle() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("orphan-native.ahbundle");
+        let session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "native-orphan".into(),
+            source_kind: "fixture".into(),
+            workspace: None,
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: BTreeMap::new(),
+        };
+        let orphan = NativeBundleEntry {
+            session_id: uuid::Uuid::new_v4(),
+            relative_path: "rollout.jsonl".into(),
+            bytes: b"{}
+"
+            .to_vec(),
+            redaction_count: 0,
+        };
+        let error = write_selected_sessions_with_native(
+            &path,
+            "fixture",
+            std::slice::from_ref(&session),
+            &[],
+            &[orphan],
+            &SecretScanner::v1().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("exactly one"))
+        );
+    }
+
+    #[test]
+    fn restores_workspace_manifest_and_files_under_the_destination_root() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        let workspace_id = uuid::Uuid::new_v4();
+        fs::write(source.path().join("README.md"), b"portable").unwrap();
+        let session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "workspace-restore".into(),
+            source_kind: "fixture".into(),
+            workspace: Some(agentark_canonical::Workspace {
+                id: workspace_id,
+                path_native: source.path().to_string_lossy().into_owned(),
+                canonical_uri: "file:///source".into(),
+                git_commit: None,
+            }),
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: BTreeMap::new(),
+        };
+        let bundle_path = source.path().join("workspace.ahbundle");
+        write_selected_sessions(
+            &bundle_path,
+            "fixture",
+            std::slice::from_ref(&session),
+            &[ProjectSelection {
+                workspace_id,
+                root: source.path().to_path_buf(),
+                include_files: true,
+                max_file_bytes: 1024,
+            }],
+            &SecretScanner::v1().unwrap(),
+        )
+        .unwrap();
+        let bundle = read_bundle(&bundle_path).unwrap();
+        restore_workspace(&bundle, destination.path()).unwrap();
+        assert_eq!(
+            fs::read(
+                destination
+                    .path()
+                    .join(workspace_id.to_string())
+                    .join("README.md")
+            )
+            .unwrap(),
+            b"portable"
+        );
+        restore_workspace(&bundle, destination.path()).unwrap();
+    }
+
+    #[test]
+    fn workspace_metadata_does_not_collide_with_a_project_manifest_file() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        let workspace_id = uuid::Uuid::new_v4();
+        fs::write(source.path().join("manifest.json"), b"project manifest").unwrap();
+        let session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "manifest-collision".into(),
+            source_kind: "fixture".into(),
+            workspace: Some(agentark_canonical::Workspace {
+                id: workspace_id,
+                path_native: source.path().to_string_lossy().into_owned(),
+                canonical_uri: "file:///source".into(),
+                git_commit: None,
+            }),
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: BTreeMap::new(),
+        };
+        let bundle_path = source.path().join("collision.ahbundle");
+        write_selected_sessions(
+            &bundle_path,
+            "fixture",
+            std::slice::from_ref(&session),
+            &[ProjectSelection {
+                workspace_id,
+                root: source.path().to_path_buf(),
+                include_files: true,
+                max_file_bytes: 1024,
+            }],
+            &SecretScanner::v1().unwrap(),
+        )
+        .unwrap();
+        let bundle = read_bundle(&bundle_path).unwrap();
+        restore_workspace(&bundle, destination.path()).unwrap();
+        let workspace_root = destination.path().join(workspace_id.to_string());
+        assert_eq!(
+            fs::read(workspace_root.join("manifest.json")).unwrap(),
+            b"project manifest"
+        );
+        assert!(workspace_root.join(".agentark/manifest.json").is_file());
+    }
+
+    #[test]
+    fn legacy_bundle_without_new_semantic_sections_remains_readable() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("legacy.ahbundle");
+        let session = serde_json::json!({
+            "schemaVersion": "0.1.0",
+            "id": uuid::Uuid::new_v4(),
+            "installId": uuid::Uuid::new_v4(),
+            "sourceSessionId": "legacy",
+            "sourceKind": "fixture",
+            "workspace": null,
+            "title": "legacy",
+            "archived": false,
+            "createdAtRaw": null,
+            "updatedAtRaw": null,
+            "modelProvider": null,
+            "modelName": null,
+            "completeness": "complete",
+            "messages": [],
+            "toolEvents": [],
+            "attachments": [],
+            "rawExtra": {}
+        });
+        let session_bytes = format!("{}\n", session).into_bytes();
+        let manifest = serde_json::json!({
+            "format": "1.1",
+            "createdAt": "2026-08-23T00:00:00Z",
+            "sessionCount": 1,
+            "redacted": false,
+            "redactionCount": 0,
+            "entries": [{"path": "sessions/legacy.ndjson", "size": session_bytes.len(), "sha256": hex::encode(Sha256::digest(&session_bytes))}]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        write_u32(&mut file, 2).unwrap();
+        write_entry(
+            &mut file,
+            &BundleEntry {
+                path: "manifest.json".into(),
+                bytes: manifest_bytes,
+            },
+        )
+        .unwrap();
+        write_entry(
+            &mut file,
+            &BundleEntry {
+                path: "sessions/legacy.ndjson".into(),
+                bytes: session_bytes,
+            },
+        )
+        .unwrap();
+        drop(file);
+        assert!(read_bundle(&path).is_ok());
     }
 
     #[test]

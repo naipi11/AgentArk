@@ -28,6 +28,7 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   const { t } = useI18n();
   const [agentKind, setAgentKind] = useState<AgentFilter>('codex');
   const [projects, setProjects] = useState<WorkspaceDto[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [includeFiles, setIncludeFiles] = useState(true);
   const [path, setPath] = useState('');
@@ -62,16 +63,32 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   }
 
   useEffect(() => {
+    let current = true;
+    setProjectsLoaded(false);
+    setProjects([]);
+    setSelected([]);
     void api.workspacesList(100, 0, agentKind === 'all' ? undefined : agentKind).then((items) => {
+      if (!current) return;
       setProjects(items);
       setSelected(items.map((item) => item.id));
-    }).catch(() => setProjects([]));
+      setProjectsLoaded(true);
+    }).catch(() => {
+      if (!current) return;
+      setProjects([]);
+      setSelected([]);
+      setProjectsLoaded(true);
+    });
+    return () => { current = false; };
   }, [agentKind, refreshToken]);
 
   const selectedSet = useMemo(() => new Set(selected), [selected]);
   const toggleProject = (id: string) => setSelected((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
 
   async function exportHistory() {
+    if (busy) return;
+    setBusy(true);
+    setBusyAction('export');
+    setMessage(null);
     let selectedPath: string | null;
     try {
       selectedPath = await save({
@@ -81,12 +98,18 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
       });
     } catch {
       setMessage(t('backup.error'));
+      setBusy(false);
+      setBusyAction(null);
       return;
     }
-    if (!selectedPath) return;
+    if (!selectedPath) {
+      setBusy(false);
+      setBusyAction(null);
+      return;
+    }
     if (!selectedPath.toLowerCase().endsWith('.ahbundle')) selectedPath += '.ahbundle';
     setPath(selectedPath);
-    setBusy(true); setBusyAction('export'); setMessage(null); setPreview(null); setRestoreReport(null);
+    setPreview(null); setRestoreReport(null);
     try {
       const report = await api.bundleExport(selectedPath, agentKind === 'all' ? undefined : agentKind, selected, includeFiles);
       const skippedFiles = report.skippedFileCount ?? 0;
@@ -99,6 +122,12 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
   }
 
   async function inspectHistory() {
+    if (busy) return;
+    setBusy(true);
+    setBusyAction('import');
+    setMessage(null);
+    setPreview(null);
+    setRestoreReport(null);
     let selectedPath: string | string[] | null;
     try {
       selectedPath = await open({
@@ -109,21 +138,27 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
       });
     } catch {
       setMessage(t('backup.error'));
+      setBusy(false);
+      setBusyAction(null);
       return;
     }
     const chosenPath = Array.isArray(selectedPath) ? selectedPath[0] : selectedPath;
-    if (!chosenPath) return;
+    if (!chosenPath) {
+      setBusy(false);
+      setBusyAction(null);
+      return;
+    }
     setPath(chosenPath);
-    setBusy(true); setBusyAction('import'); setMessage(null); setRestoreReport(null);
     try {
       const report = await api.bundleVerify(chosenPath);
       setPreview(report);
     }
-    catch (error) { setMessage(importErrorMessage(error)); }
+    catch (error) { setPreview(null); setMessage(importErrorMessage(error)); }
     finally { setBusy(false); setBusyAction(null); }
   }
 
   async function restoreHistory() {
+    if (busy || !preview || !path) return;
     setBusy(true); setBusyAction('restore'); setMessage(null);
     try {
       const report = await api.bundleRestore(path);
@@ -141,17 +176,17 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
 
   return (
     <section className="card transfer-view" aria-label={t('transfer.title')}>
-      <div className="section-heading"><div><p className="eyebrow">{t('transfer.title')}</p><h2>{t('transfer.title')}</h2></div><AgentSelector value={agentKind} onChange={(value) => { setAgentKind(value); setPreview(null); }} /></div>
+      <div className="section-heading"><div><p className="eyebrow">{t('transfer.title')}</p><h2>{t('transfer.title')}</h2></div><AgentSelector value={agentKind} onChange={(value) => { if (busy) return; setAgentKind(value); setSelected([]); setPath(''); setPreview(null); setRestoreReport(null); setMessage(null); }} /></div>
       <label className="field-label" htmlFor="transfer-path">{t('transfer.path')}</label>
       <input id="transfer-path" value={path} placeholder={t('transfer.placeholder')} readOnly aria-readonly="true" disabled={busy} />
       <p className="field-label">{t('transfer.projects')}</p>
       <div className="transfer-projects">
         {projects.length === 0 && <p className="muted">{t('transfer.noProjects')}</p>}
-        {projects.map((project) => <label key={project.id} className="transfer-project"><input type="checkbox" checked={selectedSet.has(project.id)} onChange={() => toggleProject(project.id)} /><span>{project.pathNative}</span><small>{project.sessionCount} {t('projects.sessions')}</small></label>)}
+        {projects.map((project) => <label key={project.id} className="transfer-project"><input type="checkbox" checked={selectedSet.has(project.id)} onChange={() => toggleProject(project.id)} disabled={busy} /><span>{project.pathNative}</span><small>{project.sessionCount} {t('projects.sessions')}</small></label>)}
       </div>
-      <label className="transfer-files"><input type="checkbox" checked={includeFiles} onChange={(event) => setIncludeFiles(event.target.checked)} />{t('transfer.files')}</label>
+      <label className="transfer-files"><input type="checkbox" checked={includeFiles} onChange={(event) => setIncludeFiles(event.target.checked)} disabled={busy} />{t('transfer.files')}</label>
       <div className="button-row">
-        <button className="primary-button" type="button" disabled={busy} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
+        <button className="primary-button" type="button" disabled={busy || !projectsLoaded || projects.length === 0 || selected.length === 0} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
         <button type="button" disabled={busy} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
       </div>
       {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><span className="muted">{t('transfer.automaticRecovery')}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}

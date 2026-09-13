@@ -63,8 +63,10 @@ pub enum BundleCommand {
         path: PathBuf,
         #[arg(long, value_enum)]
         agent: Option<AgentArg>,
-        #[arg(long = "project")]
+        #[arg(long = "project", conflicts_with = "all_projects")]
         workspace_ids: Vec<Uuid>,
+        #[arg(long = "all-projects", conflicts_with = "workspace_ids")]
+        all_projects: bool,
         #[arg(long)]
         include_files: bool,
     },

@@ -62,10 +62,18 @@ impl EncryptedCas {
     }
 
     pub fn object_path(&self, object_id: &str) -> PathBuf {
-        self.root
-            .join("v1")
-            .join(&object_id[..2.min(object_id.len())])
-            .join(object_id)
+        if is_valid_object_id(object_id) {
+            self.root.join("v1").join(&object_id[..2]).join(object_id)
+        } else {
+            self.root.join("v1").join("__invalid__").join("object")
+        }
+    }
+
+    fn validated_object_path(&self, object_id: &str) -> Result<PathBuf, CasError> {
+        if !is_valid_object_id(object_id) {
+            return Err(CasError::InvalidFormat);
+        }
+        Ok(self.object_path(object_id))
     }
 
     fn object_id(&self, digest: &[u8; 32]) -> Result<String, CasError> {
@@ -86,7 +94,7 @@ impl EncryptedCas {
     }
 
     fn read_verified(&self, object: &StoredObject) -> Result<Zeroizing<Vec<u8>>, CasError> {
-        let bytes = Zeroizing::new(fs::read(self.object_path(&object.object_id))?);
+        let bytes = Zeroizing::new(fs::read(self.validated_object_path(&object.object_id)?)?);
         if bytes.len() < MAGIC.len() + 1 + 24 + 16 || &bytes[..MAGIC.len()] != MAGIC {
             return Err(CasError::InvalidFormat);
         }
@@ -126,6 +134,13 @@ impl EncryptedCas {
     }
 }
 
+fn is_valid_object_id(object_id: &str) -> bool {
+    object_id.len() == 64
+        && object_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl ArtifactStore for EncryptedCas {
     fn put(&self, object_type: ObjectType, plaintext: &[u8]) -> Result<StoredObject, CasError> {
         let digest = Sha256::digest(plaintext);
@@ -141,7 +156,7 @@ impl ArtifactStore for EncryptedCas {
             plaintext_hash,
             size: plaintext.len() as u64,
         };
-        let final_path = self.object_path(&object_id);
+        let final_path = self.validated_object_path(&object_id)?;
         if final_path.exists() {
             let existing = self.read_verified(&object)?;
             if existing.as_slice() != plaintext {

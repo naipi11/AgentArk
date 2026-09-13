@@ -10,7 +10,7 @@ use agentark_adapter_sdk::{
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalRole, CanonicalSchemaVersion,
     CanonicalSession, Completeness, ContentPart, ContentPartKind, Sha256Digest, ToolEvent,
-    agent_install_id, message_id, session_id,
+    agent_install_id, file_uri_for_path, message_id, session_id,
 };
 use agentark_security::AuthorizedRoot;
 use serde_json::Value;
@@ -90,7 +90,7 @@ impl SyntheticAdapter {
     }
 
     fn root_uri(&self) -> String {
-        format!("file://{}", self.root.to_string_lossy().replace('\\', "/"))
+        file_uri_for_path(&self.root)
     }
 
     fn install(&self) -> AgentInstall {

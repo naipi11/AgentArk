@@ -30,6 +30,10 @@ Vendor databases/files are never opened writable.
   reporting success.
   The corresponding CLI exit codes are `5` for unreadable files, `4` for integrity
   failures, and `2` for invalid or incompatible bundle formats.
+  The unreleased 0.6.5 work also filters selected workspaces through sessions and
+  native payload collection, sanitizes imported sessions, and moves desktop bundle
+  operations to a blocking worker.
+- CLI `bundle export` requires explicit `--project` selections; use `--all-projects` for an intentional full archive export.
 - `migration export <bundle> <target> <output>` writes an L1 structured JSON
   handoff and human-readable Markdown handoff per session.
 - Restoring always writes AgentArk-owned SQLCipher index rows in one transaction.
@@ -79,7 +83,7 @@ fall back to the verified AgentArk archive. Cloud relay, multi-user server mode,
 and L3 credential migration remain deliberately disabled for the local-first
 release.
 
-The transfer UI now exposes Agent-scoped project selection, an optional project
+The unreleased 0.6.5 candidate extends the transfer UI and runtime with Agent-scoped project selection, an optional project
 file checkbox, bundle verification/preview, conflict blocking, and restore into
 `restored-workspaces` on the destination device.
 
@@ -99,3 +103,12 @@ target `CODEX_HOME`, rewrites only workspace path fields, creates an
 `agentark-backups` manifest, and reports original-ID, continuation, archive-only,
 and manual-intervention outcomes separately. Restart Codex after a successful
 native recovery to refresh its session list.
+
+## 0.6.5 readiness
+
+The unreleased 0.6.5 candidate adds strict bundle framing and manifest checks,
+selected-workspace filtering, fail-closed project-file export, recursive import
+sanitation, safe CAS object paths, atomic first-run bootstrap creation, background
+desktop bundle operations, full-text search, and an executable Playwright timeline
+fixture. The release remains gated on the full cross-platform CI run and a clean
+release build.

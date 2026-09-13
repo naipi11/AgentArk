@@ -97,6 +97,55 @@ impl SourceAdapter for FixtureAdapter {
 }
 
 #[derive(Clone)]
+struct EmptyAdapter {
+    install: AgentInstall,
+}
+
+impl SourceAdapter for EmptyAdapter {
+    fn id(&self) -> &'static str {
+        "empty"
+    }
+    fn detect(&self, _ctx: &DetectContext) -> Result<Vec<AgentInstall>, AdapterError> {
+        Ok(vec![self.install.clone()])
+    }
+    fn probe(&self, _install: &AgentInstall) -> Result<ProbeReport, AdapterError> {
+        Ok(ProbeReport {
+            adapter_id: self.id().into(),
+            executable_version: "fixture".into(),
+            schema_fingerprint: "fixture".into(),
+            capabilities: BTreeSet::new(),
+            quarantine_reason: None,
+        })
+    }
+    fn capture(&self, _request: &CaptureRequest) -> Result<CaptureBatch, AdapterError> {
+        Ok(CaptureBatch {
+            snapshot_id: "empty-snapshot".into(),
+            records: Vec::new(),
+            issues: Vec::new(),
+        })
+    }
+    fn normalize(&self, _record: &CapturedRecord) -> Result<NormalizeOutcome, AdapterError> {
+        Err(AdapterError::ContractViolation(
+            "empty adapter has no records".into(),
+        ))
+    }
+    fn capabilities(&self, _install: &AgentInstall) -> BTreeSet<SourceCapability> {
+        BTreeSet::new()
+    }
+}
+
+#[derive(Clone)]
+struct EmptyCas;
+impl ArtifactStore for EmptyCas {
+    fn put(&self, _object_type: ObjectType, _plaintext: &[u8]) -> Result<StoredObject, CasError> {
+        Err(CasError::InvalidFormat)
+    }
+    fn get(&self, _object: &StoredObject) -> Result<Zeroizing<Vec<u8>>, CasError> {
+        Err(CasError::InvalidFormat)
+    }
+}
+
+#[derive(Clone)]
 struct FixtureCas {
     events: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -244,6 +293,37 @@ fn fixture_request() -> ScanRequest {
         install: install(),
         snapshot_hint: None,
     }
+}
+
+#[test]
+fn empty_successful_scan_is_complete_and_verifiable() {
+    let install = install();
+    let mut service = ScanService::new(
+        EmptyAdapter {
+            install: install.clone(),
+        },
+        EmptyCas,
+        FixtureIndex {
+            events: Arc::new(Mutex::new(Vec::new())),
+            status: Arc::new(Mutex::new(None)),
+            stale_sources: Arc::new(Mutex::new(Vec::new())),
+            fail_ingest: false,
+        },
+        SecretScanner::v1().unwrap(),
+    );
+    let report = service
+        .run(ScanRequest {
+            install,
+            snapshot_hint: None,
+        })
+        .unwrap();
+    assert_eq!(report.status, ScanStatus::Complete);
+    assert!(
+        VerificationService::new(EmptyCas, service.verification_journal())
+            .verify_scan(report.scan_id)
+            .unwrap()
+            .passed
+    );
 }
 
 #[test]

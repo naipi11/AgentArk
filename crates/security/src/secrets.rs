@@ -52,6 +52,18 @@ pub struct SanitizedText {
     pub findings: Vec<SecretFinding>,
 }
 
+fn structured_placeholder(value: &str) -> bool {
+    let Some(separator) = value.find([':', '=']) else {
+        return false;
+    };
+    let value = value[separator + 1..].trim().trim_matches(['"', '\'']);
+    value.starts_with("[REDACTED:") && value.ends_with(']')
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "null" | "true" | "false"
+        )
+}
+
 impl SecretScanner {
     pub fn v1() -> Result<Self, SecurityError> {
         let definitions = [
@@ -64,15 +76,15 @@ impl SecretScanner {
                 SecretClass::Authorization,
             ),
             (
-                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*"(?:\\.|[^"\\])*""#,
+                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization|aws_secret_access_key|aws_session_token|aws_access_key_id|secret_access_key|private_key|client_secret)["']?\s*[:=]\s*"(?:\\.|[^"\\])*""#,
                 SecretClass::StructuredValue,
             ),
             (
-                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*'(?:\\.|[^'\\])*'"#,
+                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization|aws_secret_access_key|aws_session_token|aws_access_key_id|secret_access_key|private_key|client_secret)["']?\s*[:=]\s*'(?:\\.|[^'\\])*'"#,
                 SecretClass::StructuredValue,
             ),
             (
-                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization)["']?\s*[:=]\s*[^\s"',}]+"#,
+                r#"(?i)["']?(token|access_token|refresh_token|api_key|secret|password|authorization|aws_secret_access_key|aws_session_token|aws_access_key_id|secret_access_key|private_key|client_secret)["']?\s*[:=]\s*[^\s"',}]+"#,
                 SecretClass::StructuredValue,
             ),
             (
@@ -102,9 +114,11 @@ impl SecretScanner {
             .rules
             .iter()
             .flat_map(|rule| {
-                rule.pattern
-                    .find_iter(input)
-                    .map(move |matched| (matched.start(), matched.end(), rule.class))
+                rule.pattern.find_iter(input).filter_map(move |matched| {
+                    let text = &input[matched.start()..matched.end()];
+                    (rule.class != SecretClass::StructuredValue || !structured_placeholder(text))
+                        .then_some((matched.start(), matched.end(), rule.class))
+                })
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));

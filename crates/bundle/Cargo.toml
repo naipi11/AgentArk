@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 agentark-canonical = { path = "../canonical" }
 agentark-security = { path = "../security" }
+cap-std.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

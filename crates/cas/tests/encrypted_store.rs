@@ -43,3 +43,20 @@ fn rejects_tampered_ciphertext() {
     fs::write(path, bytes).unwrap();
     assert!(cas.get(&object).is_err());
 }
+
+#[test]
+fn malformed_object_ids_fail_closed_without_path_escape_or_panic() {
+    let (dir, cas) = store();
+    let object = agentark_cas::StoredObject {
+        object_id: "../outside".into(),
+        object_type: ObjectType::AgentRawRecord,
+        plaintext_hash: agentark_canonical::Sha256Digest::from_bytes(b"record"),
+        size: 6,
+    };
+    assert!(cas.get(&object).is_err());
+    assert!(
+        cas.object_path("../outside")
+            .starts_with(dir.path().join("objects"))
+    );
+    assert!(cas.object_path("€").starts_with(dir.path().join("objects")));
+}

@@ -11,9 +11,9 @@ use agentark_adapter_sdk::{DetectContext, SourceAdapter};
 use agentark_app::{AppError, ScanReport, ScanRequest, ScanService, VerificationService};
 use agentark_audit::{AuditEvent, AuditVerification, append_event, verify_chain};
 use agentark_bundle::{
-    Bundle, BundleError, ProjectSelection, read_bundle, write_selected_sessions,
+    Bundle, BundleError, ProjectSelection, read_bundle, restore_workspace, write_selected_sessions,
 };
-use agentark_canonical::AgentKind;
+use agentark_canonical::{AgentKind, file_uri_for_path};
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, SessionQuery};
 use agentark_migration::{
@@ -186,22 +186,42 @@ pub fn export_bundle(
     root: &Path,
     path: &Path,
     agent: Option<String>,
-    workspace_ids: Vec<Uuid>,
+    workspace_ids: Option<Vec<Uuid>>,
     include_files: bool,
 ) -> Result<BundleData, RuntimeError> {
     let (_cas, index, _store) = open_storage_existing(root)?;
     let agent_kind = agent.as_deref().map(parse_target_agent).transpose()?;
-    let sessions = index
+    let all_sessions = index
         .all_sessions_filtered(agent_kind.clone())
         .map_err(|_| RuntimeError::Storage)?;
     let scanner = SecretScanner::v1().map_err(|_| RuntimeError::Storage)?;
-    let selected = workspace_ids
+    let selected =
+        workspace_ids.map(|ids| ids.into_iter().collect::<std::collections::BTreeSet<_>>());
+    if selected
+        .as_ref()
+        .is_some_and(std::collections::BTreeSet::is_empty)
+    {
+        return Err(RuntimeError::InvalidInput);
+    }
+    let sessions = all_sessions
         .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
+        .filter(|session| {
+            selected.as_ref().is_none_or(|selected| {
+                session
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| selected.contains(&workspace.id))
+            })
+        })
+        .collect::<Vec<_>>();
     let selections = sessions
         .iter()
         .filter_map(|session| session.workspace.as_ref())
-        .filter(|workspace| selected.is_empty() || selected.contains(&workspace.id))
+        .filter(|workspace| {
+            selected
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&workspace.id))
+        })
         .map(|workspace| ProjectSelection {
             workspace_id: workspace.id,
             root: PathBuf::from(&workspace.path_native),
@@ -251,7 +271,22 @@ pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
 
 pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
-    let sessions = validate_bundle_contents(&bundle)?;
+    let mut sessions = validate_bundle_contents(&bundle)?;
+    agentark_audit::verify_chain(&root.join("audit.jsonl")).map_err(|_| RuntimeError::Storage)?;
+    let restore_root = root.join("restored-workspaces");
+    if bundle.manifest.workspace_count > 0 {
+        restore_workspace(&bundle, &restore_root).map_err(bundle_error)?;
+        let workspace_ids = bundle.workspace_ids().map_err(bundle_error)?;
+        for session in &mut sessions {
+            if let Some(workspace) = session.workspace.as_mut()
+                && workspace_ids.contains(&workspace.id)
+            {
+                let path = restore_root.join(workspace.id.to_string());
+                workspace.path_native = path.to_string_lossy().into_owned();
+                workspace.canonical_uri = file_uri_for_path(&path);
+            }
+        }
+    }
     let (_cas, mut index, _store) = open_storage_existing(root)?;
     let scan_id = index
         .restore_sessions(&sessions)
@@ -334,7 +369,17 @@ fn validate_bundle_contents(
     bundle: &Bundle,
 ) -> Result<Vec<agentark_canonical::CanonicalSession>, RuntimeError> {
     bundle.recovery_manifest().map_err(bundle_error)?;
-    bundle.session_records().map_err(bundle_error)
+    let scanner = SecretScanner::v1().map_err(|_| RuntimeError::Storage)?;
+    bundle
+        .session_records()
+        .map_err(bundle_error)?
+        .into_iter()
+        .map(|session| {
+            agentark_bundle::sanitize_session(&session, &scanner)
+                .map(|(session, _)| session)
+                .map_err(bundle_error)
+        })
+        .collect()
 }
 
 fn bundle_error(error: BundleError) -> RuntimeError {
@@ -833,19 +878,8 @@ fn open_storage(root: &Path) -> Result<(EncryptedCas, IndexDb, OsMasterKeyStore)
     let bootstrap_path = root.join("bootstrap.json");
     let machine_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.to_string_lossy().as_bytes());
     let store = OsMasterKeyStore::new(machine_id).map_err(|_| RuntimeError::Storage)?;
-    let bootstrap = if bootstrap_path.is_file() {
-        serde_json::from_slice(&fs::read(&bootstrap_path).map_err(|_| RuntimeError::Storage)?)
-            .map_err(|_| RuntimeError::Storage)?
-    } else {
-        let bootstrap =
-            DatasetBootstrap::create(Uuid::new_v4(), &store).map_err(|_| RuntimeError::Storage)?;
-        fs::write(
-            &bootstrap_path,
-            serde_json::to_vec_pretty(&bootstrap).map_err(|_| RuntimeError::Storage)?,
-        )
+    let bootstrap = DatasetBootstrap::load_or_create(&bootstrap_path, Uuid::new_v4(), &store)
         .map_err(|_| RuntimeError::Storage)?;
-        bootstrap
-    };
     let keys = bootstrap
         .unlock(&store)
         .map_err(|_| RuntimeError::Storage)?;

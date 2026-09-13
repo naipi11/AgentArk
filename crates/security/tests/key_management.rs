@@ -29,6 +29,19 @@ fn creates_and_unlocks_wrapped_dataset_keys_without_plaintext_metadata() {
 }
 
 #[test]
+fn load_or_create_is_atomic_and_reuses_existing_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bootstrap.json");
+    let store = MemoryMasterKeyStore::empty();
+    let dataset_id = Uuid::new_v4();
+    let first = DatasetBootstrap::load_or_create(&path, dataset_id, &store).unwrap();
+    let first_bytes = std::fs::read(&path).unwrap();
+    let second = DatasetBootstrap::load_or_create(&path, Uuid::new_v4(), &store).unwrap();
+    assert_eq!(first.dataset_id, second.dataset_id);
+    assert_eq!(first_bytes, std::fs::read(path).unwrap());
+}
+
+#[test]
 fn missing_master_key_never_falls_back_to_plaintext() {
     let creator = MemoryMasterKeyStore::empty();
     let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &creator).unwrap();

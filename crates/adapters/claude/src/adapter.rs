@@ -9,7 +9,7 @@ use agentark_adapter_sdk::{
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalRole, CanonicalSchemaVersion,
     CanonicalSession, Completeness, ContentPart, ContentPartKind, Sha256Digest, ToolEvent,
-    Workspace, agent_install_id, message_id, session_id, workspace_id,
+    Workspace, agent_install_id, file_uri_for_path, message_id, session_id, workspace_id,
 };
 use agentark_security::AuthorizedRoot;
 use serde_json::Value;
@@ -42,7 +42,7 @@ impl ClaudeCodeAdapter {
     }
 
     fn root_uri(&self) -> String {
-        format!("file://{}", self.root.to_string_lossy().replace('\\', "/"))
+        file_uri_for_path(&self.root)
     }
 
     fn install(&self) -> AgentInstall {
@@ -421,7 +421,7 @@ fn workspace_from_line(value: &Value) -> Option<Workspace> {
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_owned());
-    let canonical_uri = format!("file://{}", canonical_path.replace('\\', "/"));
+    let canonical_uri = file_uri_for_path(Path::new(&canonical_path));
     Some(Workspace {
         id: workspace_id(&canonical_uri),
         path_native: canonical_path,

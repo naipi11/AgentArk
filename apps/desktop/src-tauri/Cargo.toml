@@ -40,4 +40,5 @@ tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+url.workspace = true
 directories.workspace = true

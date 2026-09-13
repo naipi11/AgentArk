@@ -281,6 +281,17 @@ impl SessionQuery for IndexDb {
 }
 
 impl IndexDb {
+    pub fn authorized_root_uri(&self, install_id: Uuid) -> Result<Option<String>, IndexError> {
+        self.connection()
+            .query_row(
+                "SELECT authorized_root_uri FROM agent_installs WHERE id = ?1",
+                params![install_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(IndexError::from)
+    }
+
     /// Returns every canonical session for portable backup/export.
     pub fn all_sessions(&self) -> Result<Vec<CanonicalSession>, IndexError> {
         self.all_sessions_filtered(None)

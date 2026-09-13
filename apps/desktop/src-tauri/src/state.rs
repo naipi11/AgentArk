@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use agentark_bundle::{
     BundleError, NativeBundleEntry, ProjectSelection, WorkspaceFileEntry, read_bundle,
     write_selected_sessions_with_native,
 };
-use agentark_canonical::AgentKind;
+use agentark_canonical::{AgentKind, file_uri_for_path};
 use agentark_cas::EncryptedCas;
 use agentark_index::{IndexDb, RestoreMapping};
 use agentark_migration::{RestoreOutcome, agent_label};
@@ -610,23 +610,36 @@ impl AppState {
         if path.as_os_str().is_empty() {
             return Err("备份路径不能为空".into());
         }
+        if workspace_ids.is_empty() {
+            return Err("请至少选择一个项目后再导出".into());
+        }
         self.release_query_index()?;
         let result = (|| {
             let index = open_index(&self.data_root, &self.key_store)
                 .ok_or_else(|| "本地数据集尚未初始化".to_owned())?;
-            let sessions = index
+            let all_sessions = index
                 .all_sessions_filtered(agent_kind.clone())
                 .map_err(|_| "无法读取本地会话".to_owned())?;
             let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+            let selected = workspace_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            let sessions = all_sessions
+                .into_iter()
+                .filter(|session| {
+                    selected.is_empty()
+                        || session
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|workspace| selected.contains(&workspace.id))
+                })
+                .collect::<Vec<_>>();
             let provider_labels = safe_provider_labels(
                 sessions
                     .iter()
                     .filter_map(|session| session.model_provider.as_deref()),
                 &scanner,
             );
-            let selected = workspace_ids
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>();
             let selections = sessions
                 .iter()
                 .filter_map(|session| session.workspace.as_ref())
@@ -640,25 +653,40 @@ impl AppState {
                 .collect::<Vec<_>>();
             let agent = agent_kind.as_ref().map(agent_label).unwrap_or("all");
             let native_entries = if agent_kind == Some(AgentKind::Codex) {
-                detected_codex_home()
-                    .filter(|root| root.is_dir())
-                    .map(|root| {
-                        agentark_adapter_codex::collect_native_rollouts(&root, &sessions, &scanner)
-                            .map(|payloads| {
-                                payloads
-                                    .into_iter()
-                                    .map(|payload| NativeBundleEntry {
-                                        session_id: payload.session_id,
-                                        relative_path: payload.relative_path,
-                                        bytes: payload.bytes,
-                                        redaction_count: payload.redaction_count,
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                    })
-                    .transpose()
-                    .map_err(|_| "无法读取 Codex 原生会话文件".to_owned())?
-                    .unwrap_or_default()
+                let mut sessions_by_root = BTreeMap::<String, Vec<_>>::new();
+                for session in &sessions {
+                    if let Some(root_uri) = index
+                        .authorized_root_uri(session.install_id)
+                        .map_err(|_| "无法读取 Codex 授权目录".to_owned())?
+                    {
+                        sessions_by_root
+                            .entry(root_uri)
+                            .or_default()
+                            .push(session.clone());
+                    }
+                }
+                let mut native_entries = Vec::new();
+                for (root_uri, root_sessions) in sessions_by_root {
+                    let Some(root) = path_from_file_uri(&root_uri) else {
+                        continue;
+                    };
+                    if !root.is_dir() {
+                        continue;
+                    }
+                    let payloads = agentark_adapter_codex::collect_native_rollouts(
+                        &root,
+                        &root_sessions,
+                        &scanner,
+                    )
+                    .map_err(|_| "无法读取 Codex 原生会话文件".to_owned())?;
+                    native_entries.extend(payloads.into_iter().map(|payload| NativeBundleEntry {
+                        session_id: payload.session_id,
+                        relative_path: payload.relative_path,
+                        bytes: payload.bytes,
+                        redaction_count: payload.redaction_count,
+                    }));
+                }
+                native_entries
             } else {
                 Vec::new()
             };
@@ -824,6 +852,11 @@ impl AppState {
             .session_records()
             .map_err(bundle_verification_error_code)?;
         let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
+        for session in &mut sessions {
+            *session = agentark_bundle::sanitize_session(session, &scanner)
+                .map_err(bundle_verification_error_code)?
+                .0;
+        }
         let provider_labels = safe_provider_labels(
             sessions
                 .iter()
@@ -840,19 +873,31 @@ impl AppState {
             .native_rollout_entries()
             .map_err(bundle_verification_error_code)?;
         let native_payload_count = native_entries.len() as u64;
+        let restore_root = self.data_root.join("restored-workspaces");
+        agentark_audit::verify_chain(&self.data_root.join("audit.jsonl"))
+            .map_err(|_| "无法写入审计账本".to_owned())?;
         let mut payloads_by_session = HashMap::<Uuid, Vec<NativeRolloutPayload>>::new();
         for entry in native_entries {
+            let (bytes, redaction_count) =
+                agentark_adapter_codex::sanitize_rollout_bytes(&entry.bytes, &scanner)
+                    .map_err(|_| "备份中的 Codex 原生会话格式无效".to_owned())?;
             let payload = NativeRolloutPayload {
                 session_id: entry.session_id,
                 relative_path: entry.relative_path,
-                source_hash: agentark_canonical::Sha256Digest::from_bytes(&entry.bytes),
-                bytes: entry.bytes,
-                redaction_count: entry.redaction_count,
+                source_hash: agentark_canonical::Sha256Digest::from_bytes(&bytes),
+                bytes,
+                redaction_count: entry.redaction_count + redaction_count,
             };
             payloads_by_session
                 .entry(payload.session_id)
                 .or_default()
                 .push(payload);
+        }
+        if payloads_by_session
+            .values()
+            .any(|payloads| payloads.len() > 1)
+        {
+            return Err("备份包含同一会话的多个原生载荷".into());
         }
         let recovery_sources = recovery_manifest
             .map(|manifest| {
@@ -863,7 +908,14 @@ impl AppState {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
-        let restore_root = self.data_root.join("restored-workspaces");
+        let workspace_manifest_entries = bundle
+            .workspace_manifest_entries(&restore_root)
+            .map_err(bundle_verification_error_code)?;
+        let mut project_entries = workspace_manifest_entries;
+        project_entries.extend(file_entries);
+        validate_project_file_restore_plan(&restore_root, &project_entries)?;
+        let project_restore_receipt =
+            restore_project_files_with_receipt(&restore_root, &project_entries)?;
         let workspace_mappings = sessions
             .iter()
             .filter_map(|session| {
@@ -878,18 +930,19 @@ impl AppState {
                 })
             })
             .collect::<Vec<_>>();
-        restore_project_files(&restore_root, &file_entries)?;
         for session in &mut sessions {
             if let Some(workspace) = session.workspace.as_mut()
                 && workspace_ids.contains(&workspace.id)
             {
                 let path = restore_root.join(workspace.id.to_string());
                 workspace.path_native = path.to_string_lossy().into_owned();
-                workspace.canonical_uri =
-                    format!("file://{}", workspace.path_native.replace('\\', "/"));
+                workspace.canonical_uri = file_uri_for_path(&path);
             }
         }
-        self.release_query_index()?;
+        if let Err(error) = self.release_query_index() {
+            project_restore_receipt.rollback();
+            return Err(error);
+        }
         let result = (|| {
             let (_cas, mut index) = open_storage(&self.data_root, &self.key_store)?;
             let scan_id = index
@@ -1216,6 +1269,9 @@ impl AppState {
             }
             Ok(report)
         })();
+        if result.is_err() {
+            project_restore_receipt.rollback();
+        }
         let _ = self.refresh_query_index();
         result
     }
@@ -1478,18 +1534,25 @@ fn safe_provider_labels<'a>(
         .collect()
 }
 
-fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
-    restore_project_files_guarded(root, entries, &|| Ok(()))
+fn path_from_file_uri(value: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        url.to_file_path().ok()
+    }
+    #[cfg(not(windows))]
+    {
+        url.to_file_path().ok()
+    }
 }
 
-fn restore_project_files_guarded<G>(
+fn validate_project_file_restore_plan(
     root: &Path,
     entries: &[WorkspaceFileEntry],
-    guard: &G,
-) -> Result<(), String>
-where
-    G: Fn() -> Result<(), String> + ?Sized,
-{
+) -> Result<(), String> {
     let root_dir = project_restore_dir(root)?;
     for entry in entries {
         validate_project_relative_path(&entry.relative_path)?;
@@ -1519,38 +1582,83 @@ where
                 {
                     return Err(format!("项目文件冲突：{}", entry.relative_path));
                 }
-                continue;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err("项目恢复路径无效".into()),
         }
-        guard()?;
-        ensure_current_project_relative_directory_is_safe(&root_dir, parent)?;
-        match parent_dir.symlink_metadata(filename) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
-            Err(_) => return Err("项目恢复路径无效".into()),
+    }
+    Ok(())
+}
+
+struct ProjectRestoreReceipt {
+    created_files: Vec<(Dir, PathBuf)>,
+}
+
+impl ProjectRestoreReceipt {
+    fn rollback(&self) {
+        for (parent, filename) in self.created_files.iter().rev() {
+            let _ = parent.remove_file(filename);
         }
-        let temporary = PathBuf::from(format!(
-            ".{}.{}.tmp",
-            filename
-                .to_str()
-                .ok_or_else(|| "项目恢复路径无效".to_owned())?,
-            Uuid::new_v4()
-        ));
-        let write_result = (|| {
-            let mut options = CapOpenOptions::new();
-            options.create_new(true).write(true);
-            let mut temporary_file = parent_dir
-                .open_with(&temporary, &options)
-                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
-            temporary_file
-                .write_all(&entry.bytes)
-                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
-            temporary_file
-                .sync_all()
-                .map_err(|_| "无法写入恢复项目文件".to_owned())?;
-            drop(temporary_file);
+    }
+}
+
+fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
+    restore_project_files_guarded(root, entries, &|| Ok(())).map(|_| ())
+}
+
+fn restore_project_files_with_receipt(
+    root: &Path,
+    entries: &[WorkspaceFileEntry],
+) -> Result<ProjectRestoreReceipt, String> {
+    restore_project_files_guarded(root, entries, &|| Ok(()))
+}
+
+fn restore_project_files_guarded<G>(
+    root: &Path,
+    entries: &[WorkspaceFileEntry],
+    guard: &G,
+) -> Result<ProjectRestoreReceipt, String>
+where
+    G: Fn() -> Result<(), String> + ?Sized,
+{
+    let root_dir = project_restore_dir(root)?;
+    let mut receipt = ProjectRestoreReceipt {
+        created_files: Vec::new(),
+    };
+    for entry in entries {
+        let entry_result = (|| -> Result<Option<(Dir, PathBuf)>, String> {
+            validate_project_relative_path(&entry.relative_path)?;
+            let relative_path =
+                PathBuf::from(entry.workspace_id.to_string()).join(&entry.relative_path);
+            let parent = relative_path
+                .parent()
+                .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+            let filename = relative_path
+                .file_name()
+                .ok_or_else(|| "项目恢复路径无效".to_owned())?;
+            let parent_dir = open_or_create_project_relative_directory(&root_dir, parent)?;
+            match parent_dir.symlink_metadata(filename) {
+                Ok(metadata) => {
+                    if is_cap_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                        return Err("项目恢复路径无效".into());
+                    }
+                    let mut existing_file = parent_dir
+                        .open(filename)
+                        .map_err(|_| "无法读取恢复项目文件".to_owned())?;
+                    let mut existing = Vec::new();
+                    existing_file
+                        .read_to_end(&mut existing)
+                        .map_err(|_| "无法读取恢复项目文件".to_owned())?;
+                    if agentark_canonical::Sha256Digest::from_bytes(&existing)
+                        != agentark_canonical::Sha256Digest::from_bytes(&entry.bytes)
+                    {
+                        return Err(format!("项目文件冲突：{}", entry.relative_path));
+                    }
+                    return Ok(None);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("项目恢复路径无效".into()),
+            }
             guard()?;
             ensure_current_project_relative_directory_is_safe(&root_dir, parent)?;
             match parent_dir.symlink_metadata(filename) {
@@ -1558,16 +1666,56 @@ where
                 Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
                 Err(_) => return Err("项目恢复路径无效".into()),
             }
-            parent_dir
-                .rename(&temporary, &parent_dir, filename)
-                .map_err(|_| "无法提交恢复项目文件".to_owned())
+            let committed_parent = parent_dir
+                .try_clone()
+                .map_err(|_| "项目恢复路径无效".to_owned())?;
+            let temporary = PathBuf::from(format!(
+                ".{}.{}.tmp",
+                filename
+                    .to_str()
+                    .ok_or_else(|| "项目恢复路径无效".to_owned())?,
+                Uuid::new_v4()
+            ));
+            let write_result = (|| {
+                let mut options = CapOpenOptions::new();
+                options.create_new(true).write(true);
+                let mut temporary_file = parent_dir
+                    .open_with(&temporary, &options)
+                    .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+                temporary_file
+                    .write_all(&entry.bytes)
+                    .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+                temporary_file
+                    .sync_all()
+                    .map_err(|_| "无法写入恢复项目文件".to_owned())?;
+                drop(temporary_file);
+                guard()?;
+                ensure_current_project_relative_directory_is_safe(&root_dir, parent)?;
+                match parent_dir.symlink_metadata(filename) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(format!("项目文件冲突：{}", entry.relative_path)),
+                    Err(_) => return Err("项目恢复路径无效".into()),
+                }
+                parent_dir
+                    .rename(&temporary, &parent_dir, filename)
+                    .map_err(|_| "无法提交恢复项目文件".to_owned())
+            })();
+            if write_result.is_err() {
+                let _ = parent_dir.remove_file(&temporary);
+            }
+            write_result?;
+            Ok(Some((committed_parent, PathBuf::from(filename))))
         })();
-        if write_result.is_err() {
-            let _ = parent_dir.remove_file(&temporary);
+        match entry_result {
+            Ok(Some(created)) => receipt.created_files.push(created),
+            Ok(None) => {}
+            Err(error) => {
+                receipt.rollback();
+                return Err(error);
+            }
         }
-        write_result?;
     }
-    Ok(())
+    Ok(receipt)
 }
 
 fn project_restore_dir(root: &Path) -> Result<Dir, String> {
@@ -1720,22 +1868,8 @@ fn open_storage_with_store(
 ) -> Result<(EncryptedCas, IndexDb), String> {
     fs::create_dir_all(root).map_err(|_| "无法创建 AgentArk 数据目录".to_owned())?;
     let bootstrap_path = root.join("bootstrap.json");
-    let bootstrap = if bootstrap_path.is_file() {
-        serde_json::from_slice(
-            &fs::read(&bootstrap_path).map_err(|_| "无法读取本地数据密钥".to_owned())?,
-        )
-        .map_err(|_| "本地数据密钥格式无效".to_owned())?
-    } else {
-        let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), store)
-            .map_err(|_| "无法创建本地数据密钥".to_owned())?;
-        fs::write(
-            &bootstrap_path,
-            serde_json::to_vec_pretty(&bootstrap)
-                .map_err(|_| "无法序列化本地数据密钥".to_owned())?,
-        )
-        .map_err(|_| "无法保存本地数据密钥".to_owned())?;
-        bootstrap
-    };
+    let bootstrap = DatasetBootstrap::load_or_create(&bootstrap_path, Uuid::new_v4(), store)
+        .map_err(|_| "无法保存或读取本地数据密钥".to_owned())?;
     let keys = bootstrap
         .unlock(store)
         .map_err(|_| "无法解锁本地数据密钥".to_owned())?;
@@ -1939,7 +2073,7 @@ mod project_restore_tests {
     use agentark_bundle::WorkspaceFileEntry;
     use uuid::Uuid;
 
-    use super::{restore_project_files, restore_project_files_guarded};
+    use super::{path_from_file_uri, restore_project_files, restore_project_files_guarded};
 
     struct TempRoot(PathBuf);
 
@@ -1975,6 +2109,26 @@ mod project_restore_tests {
     #[cfg(unix)]
     fn link_directory(link: &Path, target: &Path) {
         std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn file_uri_parser_handles_windows_and_posix_forms() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                path_from_file_uri("file:///C:/AgentArk/workspace").unwrap(),
+                PathBuf::from(r"C:\AgentArk\workspace")
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                path_from_file_uri("file:///tmp/AgentArk/workspace").unwrap(),
+                PathBuf::from("/tmp/AgentArk/workspace")
+            );
+        }
+        assert!(path_from_file_uri("https://example.invalid/root").is_none());
+        assert!(path_from_file_uri("file:///tmp/root?query=1").is_none());
     }
 
     #[test]

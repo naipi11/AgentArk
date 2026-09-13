@@ -28,6 +28,7 @@ pub struct VerificationReport {
 pub struct VerificationJournal {
     objects:
         Arc<std::sync::Mutex<std::collections::BTreeMap<Uuid, Vec<VerificationEvidenceRecord>>>>,
+    statuses: Arc<std::sync::Mutex<std::collections::BTreeMap<Uuid, String>>>,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,24 @@ pub struct IndexedSessionEvidence {
 }
 
 impl VerificationJournal {
+    pub(crate) fn begin(&self, scan_id: Uuid) {
+        if let Ok(mut guard) = self.statuses.lock() {
+            guard.insert(scan_id, "running".into());
+        }
+    }
+
+    pub(crate) fn finish(&self, scan_id: Uuid, status: &str) {
+        if let Ok(mut guard) = self.statuses.lock() {
+            guard.insert(scan_id, status.into());
+        }
+    }
+
+    pub(crate) fn fail(&self, scan_id: Uuid) {
+        if let Ok(mut guard) = self.statuses.lock() {
+            guard.insert(scan_id, "failed".into());
+        }
+    }
+
     pub fn record(&self, scan_id: Uuid, object: StoredObject) {
         if let Ok(mut guard) = self.objects.lock() {
             guard
@@ -119,17 +138,47 @@ impl VerificationJournal {
 impl VerificationEvidence for VerificationJournal {
     fn snapshot(&self, scan_id: Uuid) -> Result<VerificationEvidenceSnapshot, AppError> {
         let records = self.objects(scan_id);
+        let status = self
+            .statuses
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&scan_id).cloned())
+            .or_else(|| records.is_empty().then(|| "missing".into()));
+        let mut indexed_sessions = std::collections::BTreeMap::new();
+        for record in &records {
+            let (Some(session), Some(canonical_hash)) =
+                (record.session.as_ref(), record.canonical_hash.as_ref())
+            else {
+                continue;
+            };
+            indexed_sessions.insert(
+                session.id,
+                IndexedSessionEvidence {
+                    id: session.id,
+                    canonical_json: serde_json::to_string(session)?,
+                    canonical_hash: canonical_hash.clone(),
+                    search_title: record.sanitized_title.clone().unwrap_or_default(),
+                    search_body: record.sanitized_body.clone().unwrap_or_default(),
+                    fts_title: Some(record.sanitized_title.clone().unwrap_or_default()),
+                    fts_body: Some(record.sanitized_body.clone().unwrap_or_default()),
+                    message_ordinals: session
+                        .messages
+                        .iter()
+                        .map(|message| message.ordinal)
+                        .collect(),
+                    tool_event_ordinals: session
+                        .tool_events
+                        .iter()
+                        .map(|event| event.ordinal)
+                        .collect(),
+                },
+            );
+        }
         Ok(VerificationEvidenceSnapshot {
-            status: if records.is_empty() {
-                Some("missing".into())
-            } else {
-                None
-            },
-            indexed_count: records
-                .iter()
-                .filter(|record| record.session.is_some())
-                .count() as u64,
+            status,
+            indexed_count: indexed_sessions.len() as u64,
             records,
+            sessions: indexed_sessions.into_values().collect(),
             ..VerificationEvidenceSnapshot::default()
         })
     }
@@ -270,11 +319,8 @@ impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
         if snapshot.status.is_some()
             && !(allow_running && snapshot.status.as_deref() == Some("running"))
         {
-            let expected_records = snapshot.indexed_count
-                + snapshot.quarantined_count
-                + snapshot.retryable_count
-                + snapshot.rejected_count;
-            if expected_records != snapshot.records.len() as u64
+            let expected_archived_records = snapshot.indexed_count + snapshot.quarantined_count;
+            if (snapshot.records.len() as u64) < expected_archived_records
                 || snapshot.sessions.len() as u64 != snapshot.indexed_count
             {
                 failures.push(VerificationFailure {
@@ -297,23 +343,45 @@ impl<C: ArtifactStore, E: VerificationEvidence> VerificationService<C, E> {
             }
         }
         for entry in &snapshot.records {
-            let plaintext = match self.cas.get(&entry.object) {
-                Ok(plaintext) => plaintext,
-                Err(_) => {
+            let inline_bundle_evidence = entry.object.object_id.starts_with("bundle:");
+            if inline_bundle_evidence {
+                let valid_identity = entry
+                    .object
+                    .object_id
+                    .strip_prefix("bundle:")
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .zip(entry.session.as_ref().map(|session| session.id))
+                    .is_some_and(|(object_session_id, session_id)| object_session_id == session_id);
+                let valid_size_and_hash = entry.session.as_ref().is_some_and(|session| {
+                    let bytes = serde_json::to_vec(session).unwrap_or_default();
+                    bytes.len() as u64 == entry.object.size
+                        && Sha256Digest::from_bytes(&bytes) == entry.object.plaintext_hash
+                });
+                if !valid_identity || !valid_size_and_hash {
                     failures.push(VerificationFailure {
-                        code: "cas-authentication-failed".into(),
+                        code: "bundle-evidence-mismatch".into(),
                         object_id: Some(entry.object.object_id.clone()),
                     });
-                    continue;
                 }
-            };
-            if plaintext.len() as u64 != entry.object.size
-                || Sha256Digest::from_bytes(&plaintext) != entry.object.plaintext_hash
-            {
-                failures.push(VerificationFailure {
-                    code: "cas-plaintext-hash-mismatch".into(),
-                    object_id: Some(entry.object.object_id.clone()),
-                });
+            } else {
+                let plaintext = match self.cas.get(&entry.object) {
+                    Ok(plaintext) => plaintext,
+                    Err(_) => {
+                        failures.push(VerificationFailure {
+                            code: "cas-authentication-failed".into(),
+                            object_id: Some(entry.object.object_id.clone()),
+                        });
+                        continue;
+                    }
+                };
+                if plaintext.len() as u64 != entry.object.size
+                    || Sha256Digest::from_bytes(&plaintext) != entry.object.plaintext_hash
+                {
+                    failures.push(VerificationFailure {
+                        code: "cas-plaintext-hash-mismatch".into(),
+                        object_id: Some(entry.object.object_id.clone()),
+                    });
+                }
             }
             if let (Some(session), Some(expected_hash)) =
                 (entry.session.as_ref(), entry.canonical_hash.as_ref())

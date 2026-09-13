@@ -1,9 +1,11 @@
+use std::path::Path;
+
 use std::collections::BTreeMap;
 
 use agentark_canonical::{
     CanonicalMessage, CanonicalRole, CanonicalSchemaVersion, CanonicalSession, Completeness,
-    ContentPart, ContentPartKind, Sha256Digest, ToolEvent, Workspace, message_id, session_id,
-    workspace_id,
+    ContentPart, ContentPartKind, Sha256Digest, ToolEvent, Workspace, file_uri_for_path,
+    message_id, session_id, workspace_id,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -164,7 +166,7 @@ fn workspace_from_thread(thread: &Value) -> Option<Workspace> {
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| path_native.to_owned());
-    let canonical_uri = format!("file://{}", canonical_path.replace('\\', "/"));
+    let canonical_uri = file_uri_for_path(Path::new(&canonical_path));
     let git_commit = thread
         .get("gitInfo")
         .and_then(|git| git.get("sha"))

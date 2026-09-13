@@ -85,6 +85,75 @@ fn exports_selected_agent_project_files_without_credentials() {
 }
 
 #[test]
+fn excludes_environment_variants_and_binary_files_from_file_exports() {
+    let root = tempdir().unwrap();
+    std::fs::write(
+        root.path().join(".env.production"),
+        "AWS_SECRET_ACCESS_KEY=super-secret",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("binary.bin"),
+        [0xff, b'a', b'p', b'i', b'_', b'k', b'e', b'y'],
+    )
+    .unwrap();
+    let workspace = Workspace {
+        id: workspace_id("file:///C:/project-binary"),
+        path_native: root.path().to_string_lossy().into_owned(),
+        canonical_uri: "file:///C:/project-binary".into(),
+        git_commit: None,
+    };
+    let session = CanonicalSession {
+        schema_version: CanonicalSchemaVersion::V0_1_0,
+        id: Uuid::new_v4(),
+        install_id: Uuid::new_v4(),
+        source_session_id: "s-binary".into(),
+        source_kind: "codex".into(),
+        workspace: Some(workspace.clone()),
+        title: Some("title".into()),
+        archived: false,
+        created_at_raw: None,
+        updated_at_raw: None,
+        model_provider: None,
+        model_name: None,
+        completeness: Completeness::Complete,
+        messages: vec![],
+        tool_events: vec![],
+        attachments: vec![],
+        raw_extra: BTreeMap::new(),
+    };
+    let path = root.path().join("export.ahbundle");
+    let manifest = write_selected_sessions(
+        &path,
+        "codex",
+        &[session],
+        &[ProjectSelection {
+            workspace_id: workspace.id,
+            root: root.path().to_path_buf(),
+            include_files: true,
+            max_file_bytes: 1024 * 1024,
+        }],
+        &SecretScanner::v1().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.file_count, 0);
+    assert_eq!(manifest.skipped_file_count, 1);
+    let bundle = read_bundle(&path).unwrap();
+    assert!(
+        !bundle
+            .entries
+            .values()
+            .any(|bytes| { String::from_utf8_lossy(bytes).contains("super-secret") })
+    );
+    assert!(
+        !bundle
+            .entries
+            .keys()
+            .any(|path| path.ends_with("/.env.production"))
+    );
+}
+
+#[test]
 fn skips_oversized_project_files_without_failing_the_bundle_export() {
     let root = tempdir().unwrap();
     std::fs::write(root.path().join("README.md"), "ok").unwrap();

@@ -48,6 +48,18 @@ fn canary_fixture_values_are_redacted() {
 }
 
 #[test]
+fn redacts_common_cloud_credentials_and_env_variants() {
+    let scanner = SecretScanner::v1().unwrap();
+    let input = "AWS_SECRET_ACCESS_KEY=super-secret AWS_SESSION_TOKEN=temporary AWS_ACCESS_KEY_ID=public-looking";
+    let sanitized = scanner.sanitize(input);
+    assert!(!sanitized.text.contains("super-secret"));
+    assert!(!sanitized.text.contains("temporary"));
+    assert_eq!(sanitized.findings.len(), 3);
+    let quoted = scanner.sanitize(r#"AWS_SECRET_ACCESS_KEY="quoted-secret""#);
+    assert!(!quoted.text.contains("quoted-secret"));
+}
+
+#[test]
 fn serialized_diagnostic_contains_no_original_secret_value() {
     let input = "Authorization: Bearer AgentArkDiagnosticCanary";
     let sanitized = SecretScanner::v1().unwrap().sanitize(input);

@@ -230,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "agentark-canonical",
  "agentark-security",
+ "cap-std",
  "hex",
  "serde",
  "serde_json",
@@ -252,6 +253,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+ "url",
  "uuid",
 ]
 
@@ -301,6 +303,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tracing",
+ "url",
  "uuid",
 ]
 

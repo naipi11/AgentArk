@@ -124,6 +124,22 @@ pub struct CheckpointFile {
     pub sha256: Sha256Digest,
 }
 
+pub fn ensure_appendable(path: &Path) -> Result<(), AuditError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let verification = verify_chain(path)?;
+    if !verification.valid {
+        return Err(AuditError::InvalidChain(
+            verification
+                .error
+                .unwrap_or_else(|| "audit chain is invalid".into()),
+        ));
+    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 pub fn append_event(path: &Path, mut event: AuditEvent) -> Result<AuditEvent, AuditError> {
     let previous = last_event(path)?;
     event.previous_hash = previous.as_ref().map(|value| value.event_hash.clone());
@@ -271,6 +287,15 @@ mod tests {
             previous_hash: None,
             event_hash: Sha256Digest::from_bytes(b"pending"),
         }
+    }
+
+    #[test]
+    fn ensure_appendable_accepts_a_missing_or_valid_audit_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        ensure_appendable(&path).unwrap();
+        append_event(&path, event("test")).unwrap();
+        ensure_appendable(&path).unwrap();
     }
 
     #[test]

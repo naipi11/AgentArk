@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs};
 
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession,
-    Completeness, Workspace, canonical_hash, workspace_id,
+    Completeness, ContentPart, ContentPartKind, Workspace, canonical_hash, workspace_id,
 };
 use agentark_index::{IndexDb, SessionIndex, SessionIngest, SessionQuery};
 use agentark_security::{DatasetBootstrap, MemoryMasterKeyStore, SanitizedText};
@@ -109,10 +109,37 @@ fn restores_bundle_sessions_into_searchable_archive() {
     let scan_id = db.restore_sessions(std::slice::from_ref(&session)).unwrap();
     assert!(db.show_session(session.id).is_ok());
     assert_eq!(db.search("CanonicalVisibleCanary", 10).unwrap().len(), 1);
-    assert_eq!(
-        db.verification_snapshot(scan_id).unwrap().status,
-        "complete"
-    );
+    let snapshot = db.verification_snapshot(scan_id).unwrap();
+    assert_eq!(snapshot.status, "complete");
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.indexed_count, 1);
+}
+
+#[test]
+fn restore_sanitizes_all_persisted_session_text() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let mut db = IndexDb::open(&dir.path().join("agentark.db"), keys.sqlcipher_key()).unwrap();
+    let (install, mut session, _) = fixture();
+    let secret = "api_key=sk-proj-abcdefghijklmnopqrstuvwxyz";
+    session.title = Some(secret.into());
+    session.messages[0].content = vec![ContentPart {
+        kind: ContentPartKind::Text,
+        text: Some(secret.into()),
+        attachment_id: None,
+        raw_extra: Default::default(),
+    }];
+    session
+        .raw_extra
+        .insert("credentials".into(), serde_json::json!({"token": secret}));
+    db.restore_sessions(std::slice::from_ref(&session)).unwrap();
+    let detail = db.show_session(session.id).unwrap();
+    let serialized = serde_json::to_string(&detail.session).unwrap();
+    assert!(!serialized.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(serialized.contains("[REDACTED:"));
+    let _ = install;
 }
 
 #[test]

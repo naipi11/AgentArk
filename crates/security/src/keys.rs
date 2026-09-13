@@ -1,4 +1,8 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -89,6 +93,45 @@ pub struct DatasetBootstrap {
     pub wrapped_dataset_key_hex: String,
 }
 
+struct BootstrapLock {
+    path: PathBuf,
+}
+
+impl Drop for BootstrapLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_bootstrap_lock(path: &Path) -> Result<BootstrapLock, SecurityError> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(SecurityError::KeyOperationFailed)?;
+    let lock_path = path.with_file_name(format!("{file_name}.lock"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock) => {
+                let _ = writeln!(lock, "{}", std::process::id());
+                let _ = lock.sync_all();
+                return Ok(BootstrapLock { path: lock_path });
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(SecurityError::Io(error)),
+        }
+    }
+}
+
 pub struct DatasetKeys {
     dataset_id: Uuid,
     sqlcipher_key: Zeroizing<[u8; 32]>,
@@ -115,6 +158,54 @@ impl DatasetKeys {
 }
 
 impl DatasetBootstrap {
+    pub fn load_or_create(
+        path: &Path,
+        dataset_id: Uuid,
+        store: &dyn MasterKeyStore,
+    ) -> Result<Self, SecurityError> {
+        if path.is_file() {
+            return serde_json::from_slice(&fs::read(path)?)
+                .map_err(|_| SecurityError::KeyOperationFailed);
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let _lock = acquire_bootstrap_lock(path)?;
+        if path.is_file() {
+            return serde_json::from_slice(&fs::read(path)?)
+                .map_err(|_| SecurityError::KeyOperationFailed);
+        }
+        let bootstrap = Self::create(dataset_id, store)?;
+        let bytes =
+            serde_json::to_vec_pretty(&bootstrap).map_err(|_| SecurityError::KeyOperationFailed)?;
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(SecurityError::KeyOperationFailed)?;
+        let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            match fs::rename(&temporary, path) {
+                Ok(()) => Ok(bootstrap.clone()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&temporary);
+                    serde_json::from_slice(&fs::read(path)?)
+                        .map_err(|_| SecurityError::KeyOperationFailed)
+                }
+                Err(error) => Err(SecurityError::Io(error)),
+            }
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result
+    }
+
     pub fn create(dataset_id: Uuid, store: &dyn MasterKeyStore) -> Result<Self, SecurityError> {
         let master = match load_master_key(store) {
             Ok(key) => key,

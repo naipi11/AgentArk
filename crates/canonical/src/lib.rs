@@ -3,6 +3,7 @@
 mod hash;
 mod ids;
 mod model;
+mod uri;
 
 pub use hash::{CanonicalHashError, Sha256Digest, canonical_hash};
 pub use ids::{agent_install_id, message_id, session_id, workspace_id};
@@ -11,3 +12,4 @@ pub use model::{
     CanonicalSchemaVersion, CanonicalSession, Completeness, ContentPart, ContentPartKind,
     SourceRecord, ToolEvent, Workspace,
 };
+pub use uri::file_uri_for_path;

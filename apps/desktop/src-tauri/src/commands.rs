@@ -196,35 +196,41 @@ pub fn grok_build_default_root() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn bundle_export(
+pub async fn bundle_export(
     state: State<'_, AppState>,
     path: String,
     agent_kind: Option<AgentKind>,
     workspace_ids: Vec<Uuid>,
     include_files: bool,
 ) -> Result<crate::state::BundleReport, String> {
-    state.bundle_export(
-        std::path::PathBuf::from(path.trim()),
-        agent_kind,
-        workspace_ids,
-        include_files,
-    )
+    let state = state.inner().clone();
+    run_blocking_command(move || {
+        state.bundle_export(
+            std::path::PathBuf::from(path.trim()),
+            agent_kind,
+            workspace_ids,
+            include_files,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn bundle_verify(
+pub async fn bundle_verify(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<crate::state::BundleReport, String> {
-    state.bundle_verify(std::path::PathBuf::from(path.trim()))
+    let state = state.inner().clone();
+    run_blocking_command(move || state.bundle_verify(std::path::PathBuf::from(path.trim()))).await
 }
 
 #[tauri::command]
-pub fn bundle_restore(
+pub async fn bundle_restore(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<crate::state::BundleReport, String> {
-    state.bundle_restore(std::path::PathBuf::from(path.trim()))
+    let state = state.inner().clone();
+    run_blocking_command(move || state.bundle_restore(std::path::PathBuf::from(path.trim()))).await
 }
 
 #[tauri::command]

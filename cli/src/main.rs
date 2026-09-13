@@ -95,6 +95,7 @@ fn main() -> ExitCode {
                 path,
                 agent,
                 workspace_ids,
+                all_projects,
                 include_files,
             } => print_result(
                 cli.json,
@@ -102,8 +103,19 @@ fn main() -> ExitCode {
                 runtime::export_bundle(
                     &data_root,
                     &path,
-                    agent.map(|value| format!("{value:?}")),
-                    workspace_ids,
+                    agent.map(|value| match value {
+                        args::AgentArg::Codex => "codex".to_owned(),
+                        args::AgentArg::Claude => "claude-code".to_owned(),
+                        args::AgentArg::Hermes => "hermes".to_owned(),
+                        args::AgentArg::OpenClaw => "openclaw".to_owned(),
+                        args::AgentArg::OpenCode => "opencode".to_owned(),
+                        args::AgentArg::GrokBuild => "grok-build".to_owned(),
+                    }),
+                    if all_projects {
+                        None
+                    } else {
+                        Some(workspace_ids)
+                    },
                     include_files,
                 ),
             ),

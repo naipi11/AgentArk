@@ -98,11 +98,23 @@ where
             .unwrap_or("pending");
         self.index
             .begin_scan(scan_id, self.adapter.id(), initial_snapshot)?;
+        self.journal.begin(scan_id);
 
         let result = self.run_started(scan_id, request);
         match result {
-            Ok(report) => Ok(report),
+            Ok(report) => {
+                self.journal.finish(
+                    scan_id,
+                    match report.status {
+                        ScanStatus::Complete => "complete",
+                        ScanStatus::Partial => "partial",
+                        ScanStatus::Failed => "failed",
+                    },
+                );
+                Ok(report)
+            }
             Err(error) => {
+                self.journal.fail(scan_id);
                 let _ = self.index.mark_sessions_stale(&self.pending_session_ids);
                 if let Some(install_id) = self.pending_install_id {
                     let _ = self
@@ -123,6 +135,8 @@ where
             install: request.install.clone(),
             snapshot_hint: request.snapshot_hint.clone(),
         })?;
+        self.index
+            .update_scan_snapshot(scan_id, &batch.snapshot_id)?;
         let mut indexed = 0;
         let mut quarantined = 0;
         let mut retryable = 0;
