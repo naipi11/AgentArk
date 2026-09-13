@@ -19,6 +19,7 @@ export type SessionSummary = {
   archived: boolean;
   completeness: string;
   stale: boolean;
+  rawProvenanceStatus?: 'none' | 'available' | 'unresolved' | 'unknown';
 };
 
 export type PublicMessage = { ordinal: number; role: string; text: string };
@@ -34,6 +35,7 @@ export type PublicSessionDetail = {
   title?: string;
   archived: boolean;
   completeness: string;
+  rawProvenanceStatus?: 'none' | 'available' | 'unresolved' | 'unknown';
   messages: PublicMessage[];
   toolEvents: PublicToolEvent[];
 };
@@ -69,6 +71,8 @@ export type BundleReport = {
   conflictCount: number;
   redacted: boolean;
   redactionCount: number;
+  unresolvedProvenanceCount?: number;
+  unresolvedProvenanceRefs?: number;
   restoreScanId?: string;
   nativePayloadCount: number;
   nativeImportedCount: number;

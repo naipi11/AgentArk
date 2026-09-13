@@ -2,7 +2,7 @@ use agentark_canonical::{AgentKind, CanonicalSession, Completeness};
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::{IndexDb, IndexError};
+use crate::{IndexDb, IndexError, RawProvenanceStatus};
 
 pub trait SessionQuery {
     fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, IndexError>;
@@ -76,6 +76,7 @@ pub struct SessionSummary {
     pub archived: bool,
     pub completeness: Completeness,
     pub stale: bool,
+    pub raw_provenance_status: RawProvenanceStatus,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -92,6 +93,7 @@ pub struct WorkspaceSummary {
 #[serde(rename_all = "camelCase")]
 pub struct SessionDetail {
     pub session: CanonicalSession,
+    pub raw_provenance_status: RawProvenanceStatus,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -125,7 +127,8 @@ impl SessionQuery for IndexDb {
     ) -> Result<Vec<SessionSummary>, IndexError> {
         let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let mut statement = self.connection().prepare(
-            "SELECT s.id, s.search_title, s.source_kind, s.archived, s.completeness, s.stale
+            "SELECT s.id, s.search_title, s.source_kind, s.archived, s.completeness, s.stale,
+                    s.raw_provenance_status
              FROM sessions s JOIN agent_installs ai ON ai.id = s.install_id
              WHERE (?1 IS NULL OR ai.kind = ?1)
              ORDER BY s.rowid DESC LIMIT ?2 OFFSET ?3",
@@ -138,6 +141,7 @@ impl SessionQuery for IndexDb {
                 archived: row.get::<_, i64>(3)? != 0,
                 completeness: parse_completeness(&row.get::<_, String>(4)?)?,
                 stale: row.get::<_, i64>(5)? != 0,
+                raw_provenance_status: parse_raw_provenance_status(&row.get::<_, String>(6)?)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -161,7 +165,8 @@ impl SessionQuery for IndexDb {
     ) -> Result<Vec<SessionSummary>, IndexError> {
         let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let mut statement = self.connection().prepare(
-            "SELECT s.id, s.search_title, s.source_kind, s.archived, s.completeness, s.stale
+            "SELECT s.id, s.search_title, s.source_kind, s.archived, s.completeness, s.stale,
+                    s.raw_provenance_status
              FROM sessions s JOIN agent_installs ai ON ai.id = s.install_id
              WHERE s.workspace_id = ?1 AND (?2 IS NULL OR ai.kind = ?2)
              ORDER BY s.rowid DESC LIMIT ?3 OFFSET ?4",
@@ -176,6 +181,7 @@ impl SessionQuery for IndexDb {
                     archived: row.get::<_, i64>(3)? != 0,
                     completeness: parse_completeness(&row.get::<_, String>(4)?)?,
                     stale: row.get::<_, i64>(5)? != 0,
+                    raw_provenance_status: parse_raw_provenance_status(&row.get::<_, String>(6)?)?,
                 })
             },
         )?;
@@ -227,14 +233,15 @@ impl SessionQuery for IndexDb {
         let json: String = self
             .connection()
             .query_row(
-                "SELECT canonical_json FROM sessions WHERE id = ?1",
+                "SELECT canonical_json, raw_provenance_status FROM sessions WHERE id = ?1",
                 params![id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
             .ok_or(IndexError::NotFound)?;
         Ok(SessionDetail {
-            session: serde_json::from_str(&json)?,
+            session: serde_json::from_str(&json.0)?,
+            raw_provenance_status: parse_raw_provenance_status(&json.1)?,
         })
     }
 
@@ -347,6 +354,16 @@ fn agent_kind_storage_label(agent_kind: Option<&AgentKind>) -> Result<Option<Str
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn parse_raw_provenance_status(value: &str) -> rusqlite::Result<RawProvenanceStatus> {
+    RawProvenanceStatus::parse_storage(value).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            0,
+            "raw_provenance_status".into(),
+            rusqlite::types::Type::Text,
+        )
     })
 }
 

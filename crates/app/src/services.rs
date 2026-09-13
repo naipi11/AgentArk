@@ -1,5 +1,7 @@
 use agentark_canonical::{AgentKind, CanonicalRole, Completeness};
-use agentark_index::{SearchHit, SessionQuery, SessionSummary, WorkspaceSummary};
+use agentark_index::{
+    RawProvenanceStatus, SearchHit, SessionQuery, SessionSummary, WorkspaceSummary,
+};
 use agentark_security::SecretScanner;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -97,6 +99,7 @@ pub struct PublicSessionDetail {
     pub title: Option<String>,
     pub archived: bool,
     pub completeness: Completeness,
+    pub raw_provenance_status: RawProvenanceStatus,
     pub messages: Vec<PublicMessage>,
     pub tool_events: Vec<PublicToolEvent>,
 }
@@ -427,6 +430,7 @@ fn public_detail_from_index<I: SessionQuery>(
         title,
         archived: detail.session.archived,
         completeness: detail.session.completeness,
+        raw_provenance_status: detail.raw_provenance_status,
         messages: detail
             .session
             .messages

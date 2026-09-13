@@ -28,7 +28,7 @@ use agentark_bundle::{
 };
 use agentark_canonical::{AgentKind, file_uri_for_path};
 use agentark_cas::EncryptedCas;
-use agentark_index::{IndexDb, RestoreMapping};
+use agentark_index::{IndexDb, RawProvenanceStatus, RestoreMapping};
 use agentark_migration::{RestoreOutcome, agent_label};
 use agentark_security::{
     DatasetBootstrap, MasterKeyStore, MemoryMasterKeyStore, OsMasterKeyStore, SecretScanner,
@@ -60,6 +60,8 @@ pub struct BundleReport {
     pub conflict_count: u64,
     pub redacted: bool,
     pub redaction_count: u64,
+    pub unresolved_provenance_count: u64,
+    pub unresolved_provenance_refs: u64,
     pub restore_scan_id: Option<Uuid>,
     pub native_payload_count: u64,
     pub native_imported_count: u64,
@@ -691,6 +693,8 @@ impl AppState {
                 Vec::new()
             };
             let native_payload_count = native_entries.len() as u64;
+            let provenance = agentark_bundle::raw_provenance_summary(&sessions)
+                .map_err(bundle_verification_error_code)?;
             let manifest = write_selected_sessions_with_native(
                 &path,
                 agent,
@@ -718,6 +722,8 @@ impl AppState {
                 conflict_count: 0,
                 redacted: manifest.redacted,
                 redaction_count: manifest.redaction_count,
+                unresolved_provenance_count: provenance.sessions_with_references,
+                unresolved_provenance_refs: provenance.reference_count,
                 restore_scan_id: None,
                 native_payload_count,
                 native_imported_count: 0,
@@ -741,6 +747,9 @@ impl AppState {
 
     pub fn bundle_verify(&self, path: PathBuf) -> Result<BundleReport, String> {
         let bundle = read_bundle(&path).map_err(bundle_verification_error_code)?;
+        let provenance = bundle
+            .raw_provenance_summary()
+            .map_err(bundle_verification_error_code)?;
         let scanner = SecretScanner::v1().map_err(|_| "安全扫描器初始化失败".to_owned())?;
         let recovery_manifest = bundle
             .recovery_manifest()
@@ -782,6 +791,8 @@ impl AppState {
             conflict_count,
             redacted: bundle.manifest.redacted,
             redaction_count: bundle.manifest.redaction_count,
+            unresolved_provenance_count: provenance.sessions_with_references,
+            unresolved_provenance_refs: provenance.reference_count,
             restore_scan_id: None,
             native_payload_count: bundle
                 .native_rollout_entries()
@@ -845,6 +856,9 @@ impl AppState {
             return Err("备份路径不能为空".into());
         }
         let bundle = read_bundle(&path).map_err(bundle_verification_error_code)?;
+        let provenance = bundle
+            .raw_provenance_summary()
+            .map_err(bundle_verification_error_code)?;
         let recovery_manifest = bundle
             .recovery_manifest()
             .map_err(bundle_verification_error_code)?;
@@ -946,7 +960,7 @@ impl AppState {
         let result = (|| {
             let (_cas, mut index) = open_storage(&self.data_root, &self.key_store)?;
             let scan_id = index
-                .restore_sessions(&sessions)
+                .restore_sessions_with_provenance(&sessions, RawProvenanceStatus::Unresolved)
                 .map_err(|_| "无法恢复会话到本地索引".to_owned())?;
             append_audit_event(
                 &self.data_root,
@@ -1240,6 +1254,8 @@ impl AppState {
                 conflict_count: 0,
                 redacted: bundle.manifest.redacted,
                 redaction_count: bundle.manifest.redaction_count,
+                unresolved_provenance_count: provenance.sessions_with_references,
+                unresolved_provenance_refs: provenance.reference_count,
                 restore_scan_id: Some(scan_id),
                 native_payload_count,
                 native_imported_count,

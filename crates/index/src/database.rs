@@ -92,11 +92,20 @@ impl IndexDb {
                         connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     transaction
                         .execute_batch(include_str!("../migrations/0002_restore_mappings.sql"))?;
+                    transaction
+                        .execute_batch(include_str!("../migrations/0003_raw_provenance.sql"))?;
                     #[cfg(test)]
                     fail_migration_at(MigrationFault::BeforeCommit)?;
                     transaction.commit()?;
                 }
-                Some(2) => {}
+                Some(2) => {
+                    let transaction =
+                        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    transaction
+                        .execute_batch(include_str!("../migrations/0003_raw_provenance.sql"))?;
+                    transaction.commit()?;
+                }
+                Some(3) => {}
                 _ => return Err(IndexError::UnsupportedStorageBuild),
             }
         } else {
@@ -106,6 +115,7 @@ impl IndexDb {
             #[cfg(test)]
             fail_migration_at(MigrationFault::AfterV1)?;
             transaction.execute_batch(include_str!("../migrations/0002_restore_mappings.sql"))?;
+            transaction.execute_batch(include_str!("../migrations/0003_raw_provenance.sql"))?;
             #[cfg(test)]
             fail_migration_at(MigrationFault::BeforeCommit)?;
             transaction.commit()?;
@@ -258,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_v1_to_v2_migration_rolls_back_before_normal_reopen() {
+    fn failed_v1_to_v3_migration_rolls_back_before_normal_reopen() {
         let fixture = TempIndex::new();
         let connection = fixture.raw_connection();
         connection
@@ -327,9 +337,55 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "2"
+            "3"
         );
         assert!(table_exists(&connection, "session_restore_mappings"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT raw_provenance_status FROM sessions WHERE id = ?1",
+                    [&session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_raw_provenance_schema() {
+        let fixture = TempIndex::new();
+        let connection = fixture.raw_connection();
+        connection
+            .execute_batch(include_str!("../migrations/0001_init.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/0002_restore_mappings.sql"))
+            .unwrap();
+        drop(connection);
+
+        drop(IndexDb::open(&fixture.path(), &fixture.key).unwrap());
+        let connection = fixture.raw_connection();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "3"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'raw_provenance_status'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -354,10 +410,20 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "2"
+            "3"
         );
         assert!(table_exists(&connection, "sessions"));
         assert!(table_exists(&connection, "session_restore_mappings"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'raw_provenance_status'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
         drop(connection);
 
         drop(IndexDb::open(&fixture.path(), &fixture.key).unwrap());

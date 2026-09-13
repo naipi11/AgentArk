@@ -189,13 +189,14 @@ export function TransferView({ refreshToken }: { refreshToken: number }) {
         <button className="primary-button" type="button" disabled={busy || !projectsLoaded || projects.length === 0 || selected.length === 0} onClick={() => void exportHistory()}>{busyAction === 'export' ? t('transfer.exporting') : t('transfer.export')}</button>
         <button type="button" disabled={busy} onClick={() => void inspectHistory()}>{busyAction === 'import' ? t('transfer.importing') : t('transfer.import')}</button>
       </div>
-      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span><span className="muted">{t('transfer.automaticRecovery')}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
+      {preview && <div className="transfer-preview" role="status"><strong>{t('transfer.preview')}</strong><span>{preview.sessionCount} sessions · {preview.fileCount} files · {t('transfer.conflicts')}: {preview.conflictCount}</span>{(preview.unresolvedProvenanceCount ?? 0) > 0 && <span className="muted">{t('transfer.provenanceUnresolved').replace('{sessions}', String(preview.unresolvedProvenanceCount)).replace('{refs}', String(preview.unresolvedProvenanceRefs ?? 0))}</span>}<span className="muted">{t('transfer.automaticRecovery')}</span><button type="button" className="primary-button" disabled={busy || preview.conflictCount > 0} onClick={() => void restoreHistory()}>{busyAction === 'restore' ? t('transfer.restoring') : t('transfer.restore')}</button></div>}
       {message && <p className="muted" role="status">{message}</p>}
       {restoreReport && <div className="transfer-preview" role="status">
         <strong>{t('transfer.outcomeSummary')}</strong>
         <span>{recoveryOutcomeSummary(restoreReport.nativeIdentityCount, 'transfer.nativeIdentitySummaryOne', 'transfer.nativeIdentitySummaryMany')}</span>
         <span>{recoveryOutcomeSummary(restoreReport.continuationCount, 'transfer.continuationSummaryOne', 'transfer.continuationSummaryMany')}</span>
         <span>{recoveryOutcomeSummary(restoreReport.archiveOnlyCount, 'transfer.archiveOnlySummaryOne', 'transfer.archiveOnlySummaryMany')}</span>
+        {(restoreReport.unresolvedProvenanceCount ?? 0) > 0 && <span className="muted">{t('transfer.provenanceUnresolved').replace('{sessions}', String(restoreReport.unresolvedProvenanceCount)).replace('{refs}', String(restoreReport.unresolvedProvenanceRefs ?? 0))}</span>}
         {restoreReport.manualInterventionCount > 0 && <span>{recoveryOutcomeSummary(restoreReport.manualInterventionCount, 'transfer.manualInterventionSummaryOne', 'transfer.manualInterventionSummaryMany')}</span>}
         {restoreReport.recoveryError && <details><summary>{t('transfer.recoveryDiagnostics')}</summary><span className="muted">{safeRecoveryDiagnostic(restoreReport.recoveryError)}</span></details>}
       </div>}

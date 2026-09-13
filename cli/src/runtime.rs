@@ -15,7 +15,7 @@ use agentark_bundle::{
 };
 use agentark_canonical::{AgentKind, file_uri_for_path};
 use agentark_cas::EncryptedCas;
-use agentark_index::{IndexDb, SessionQuery};
+use agentark_index::{IndexDb, RawProvenanceStatus, SessionQuery};
 use agentark_migration::{
     ContextHandoff, HandoffArtifact, MigrationPlan, build_plan, context_handoff, write_handoff,
 };
@@ -88,6 +88,8 @@ pub struct BundleData {
     pub conflict_count: u64,
     pub redacted: bool,
     pub redaction_count: u64,
+    pub unresolved_provenance_count: u64,
+    pub unresolved_provenance_refs: u64,
     pub restore_scan_id: Option<Uuid>,
 }
 
@@ -229,6 +231,7 @@ pub fn export_bundle(
             max_file_bytes: 64 * 1024 * 1024,
         })
         .collect::<Vec<_>>();
+    let provenance = agentark_bundle::raw_provenance_summary(&sessions).map_err(bundle_error)?;
     let manifest = write_selected_sessions(
         path,
         agent.as_deref().unwrap_or("all"),
@@ -248,6 +251,8 @@ pub fn export_bundle(
         conflict_count: 0,
         redacted: manifest.redacted,
         redaction_count: manifest.redaction_count,
+        unresolved_provenance_count: provenance.sessions_with_references,
+        unresolved_provenance_refs: provenance.reference_count,
         restore_scan_id: None,
     })
 }
@@ -255,6 +260,7 @@ pub fn export_bundle(
 pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
     validate_bundle_contents(&bundle)?;
+    let provenance = bundle.raw_provenance_summary().map_err(bundle_error)?;
     Ok(BundleData {
         format: bundle.manifest.format.clone(),
         agent: bundle.manifest.agent.clone(),
@@ -265,12 +271,15 @@ pub fn verify_bundle(path: &Path) -> Result<BundleData, RuntimeError> {
         conflict_count: 0,
         redacted: bundle.manifest.redacted,
         redaction_count: bundle.manifest.redaction_count,
+        unresolved_provenance_count: provenance.sessions_with_references,
+        unresolved_provenance_refs: provenance.reference_count,
         restore_scan_id: None,
     })
 }
 
 pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeError> {
     let bundle = read_bundle(path).map_err(bundle_error)?;
+    let provenance = bundle.raw_provenance_summary().map_err(bundle_error)?;
     let mut sessions = validate_bundle_contents(&bundle)?;
     agentark_audit::verify_chain(&root.join("audit.jsonl")).map_err(|_| RuntimeError::Storage)?;
     // Open the destination before materializing project files. Otherwise a
@@ -292,7 +301,7 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
         }
     }
     let scan_id = index
-        .restore_sessions(&sessions)
+        .restore_sessions_with_provenance(&sessions, RawProvenanceStatus::Unresolved)
         .map_err(|_| RuntimeError::Storage)?;
     append_audit(root, "bundle.restored", path, Some(scan_id))?;
     Ok(BundleData {
@@ -305,6 +314,8 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
         conflict_count: 0,
         redacted: bundle.manifest.redacted,
         redaction_count: bundle.manifest.redaction_count,
+        unresolved_provenance_count: provenance.sessions_with_references,
+        unresolved_provenance_refs: provenance.reference_count,
         restore_scan_id: Some(scan_id),
     })
 }
@@ -821,6 +832,7 @@ pub fn show_session(
             .map(|value| scanner.sanitize(value).text),
         archived: detail.session.archived,
         completeness: detail.session.completeness,
+        raw_provenance_status: detail.raw_provenance_status,
         messages: detail
             .session
             .messages

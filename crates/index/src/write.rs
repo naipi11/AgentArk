@@ -10,7 +10,10 @@ use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{IndexDb, IndexError};
+use crate::{
+    IndexDb, IndexError, RawProvenanceStatus, session_has_raw_references,
+    session_raw_provenance_status,
+};
 
 pub struct SessionIngest<'a> {
     pub install: &'a AgentInstall,
@@ -164,6 +167,8 @@ impl SessionIndex for IndexDb {
         let canonical_json = serde_json::to_string(input.session)?;
         let capabilities_json = serde_json::to_string(&input.install.capabilities)?;
         let install_json = serde_json::to_string(&input.install.kind)?;
+        let raw_provenance_status =
+            session_raw_provenance_status(input.session, input.source_records);
         let active_scan_id = self.active_scan_id().map(|scan_id| scan_id.to_string());
         let tx = self.connection_mut().transaction()?;
         let workspace_id = if let Some(workspace) = input.session.workspace.as_ref() {
@@ -224,15 +229,17 @@ impl SessionIndex for IndexDb {
         tx.execute(
             "INSERT INTO sessions(id, install_id, workspace_id, source_session_id, source_kind,
              title, archived, completeness, canonical_hash, canonical_json, search_title,
-             search_body, model_provider, model_name, revision, stale, last_scan_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)
+             search_body, model_provider, model_name, revision, stale, last_scan_id,
+             raw_provenance_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET install_id=excluded.install_id,
                workspace_id=excluded.workspace_id, title=excluded.title, archived=excluded.archived,
                completeness=excluded.completeness, canonical_hash=excluded.canonical_hash,
                canonical_json=excluded.canonical_json, search_title=excluded.search_title,
                search_body=excluded.search_body, model_provider=excluded.model_provider,
                model_name=excluded.model_name, revision=excluded.revision, stale=0,
-               last_scan_id=excluded.last_scan_id",
+               last_scan_id=excluded.last_scan_id,
+               raw_provenance_status=excluded.raw_provenance_status",
             params![
                 input.session.id.to_string(),
                 input.install.id.to_string(),
@@ -250,6 +257,7 @@ impl SessionIndex for IndexDb {
                 input.session.model_name,
                 prior_revision.unwrap_or(0) + 1,
                 active_scan_id,
+                raw_provenance_status.as_str(),
             ],
         )?;
         for message in &input.session.messages {
@@ -449,6 +457,48 @@ impl IndexDb {
     /// Restore canonical sessions from a verified portable bundle in one transaction.
     /// Vendor state is never touched; restored rows remain AgentArk-owned archive data.
     pub fn restore_sessions(&mut self, sessions: &[CanonicalSession]) -> Result<Uuid, IndexError> {
+        self.restore_sessions_with_statuses(sessions, |session| {
+            if session_has_raw_references(session) {
+                RawProvenanceStatus::Unresolved
+            } else {
+                RawProvenanceStatus::None
+            }
+        })
+    }
+
+    /// Restore sessions with an explicit provenance state. This is used by
+    /// callers that have validated a bundle but intentionally do not carry
+    /// source CAS bytes across devices.
+    pub fn restore_sessions_with_provenance(
+        &mut self,
+        sessions: &[CanonicalSession],
+        status: RawProvenanceStatus,
+    ) -> Result<Uuid, IndexError> {
+        if matches!(
+            status,
+            RawProvenanceStatus::Available | RawProvenanceStatus::Unknown
+        ) || (status == RawProvenanceStatus::None
+            && sessions.iter().any(session_has_raw_references))
+        {
+            // This restore API does not accept source CAS records. Never let a
+            // caller claim that canonical-only data has durable raw evidence,
+            // or that referenced data has no provenance at all.
+            return Err(IndexError::InvariantViolation);
+        }
+        self.restore_sessions_with_statuses(sessions, |session| {
+            if session_has_raw_references(session) {
+                status
+            } else {
+                RawProvenanceStatus::None
+            }
+        })
+    }
+
+    fn restore_sessions_with_statuses(
+        &mut self,
+        sessions: &[CanonicalSession],
+        status_for: impl Fn(&CanonicalSession) -> RawProvenanceStatus,
+    ) -> Result<Uuid, IndexError> {
         let scan_id = Uuid::new_v4();
         let scanner = SecretScanner::v1().map_err(|_| IndexError::InvariantViolation)?;
         let tx = self.connection_mut().transaction()?;
@@ -462,6 +512,7 @@ impl IndexDb {
             ],
         )?;
         for source_session in sessions {
+            let raw_provenance_status = status_for(source_session);
             let (sanitized_value, _) =
                 sanitize_json_value(serde_json::to_value(source_session)?, &scanner);
             let session: CanonicalSession = serde_json::from_value(sanitized_value)?;
@@ -545,21 +596,26 @@ impl IndexDb {
             tx.execute(
                 "INSERT INTO sessions(id, install_id, workspace_id, source_session_id, source_kind,
                  title, archived, completeness, canonical_hash, canonical_json, search_title,
-                 search_body, model_provider, model_name, revision, stale, last_scan_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)
+                 search_body, model_provider, model_name, revision, stale, last_scan_id,
+                 raw_provenance_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET install_id=excluded.install_id,
                    workspace_id=excluded.workspace_id, title=excluded.title, archived=excluded.archived,
                    completeness=excluded.completeness, canonical_hash=excluded.canonical_hash,
                    canonical_json=excluded.canonical_json, search_title=excluded.search_title,
                    search_body=excluded.search_body, model_provider=excluded.model_provider,
                    model_name=excluded.model_name, revision=excluded.revision, stale=0,
-                   last_scan_id=excluded.last_scan_id",
+                   last_scan_id=excluded.last_scan_id,
+                   raw_provenance_status=excluded.raw_provenance_status",
                 params![
                     session.id.to_string(), session.install_id.to_string(), workspace_id,
                     session.source_session_id, session.source_kind, sanitized_title,
                     session.archived, completeness_label(&session.completeness), canonical_hash,
                     canonical_json, sanitized_title, sanitized_body, session.model_provider,
-                    session.model_name, prior_revision.unwrap_or(0) + 1, scan_id.to_string(),
+                    session.model_name,
+                    prior_revision.unwrap_or(0) + 1,
+                    scan_id.to_string(),
+                    raw_provenance_status.as_str(),
                 ],
             )?;
             for message in &session.messages {

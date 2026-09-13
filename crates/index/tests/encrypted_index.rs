@@ -2,9 +2,10 @@ use std::{collections::BTreeSet, fs};
 
 use agentark_canonical::{
     AgentInstall, AgentKind, CanonicalMessage, CanonicalSchemaVersion, CanonicalSession,
-    Completeness, ContentPart, ContentPartKind, Workspace, canonical_hash, workspace_id,
+    Completeness, ContentPart, ContentPartKind, SourceRecord, Workspace, canonical_hash,
+    workspace_id,
 };
-use agentark_index::{IndexDb, SessionIndex, SessionIngest, SessionQuery};
+use agentark_index::{IndexDb, RawProvenanceStatus, SessionIndex, SessionIngest, SessionQuery};
 use agentark_security::{DatasetBootstrap, MemoryMasterKeyStore, SanitizedText};
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -108,6 +109,10 @@ fn restores_bundle_sessions_into_searchable_archive() {
     let (_install, session, _) = fixture();
     let scan_id = db.restore_sessions(std::slice::from_ref(&session)).unwrap();
     assert!(db.show_session(session.id).is_ok());
+    assert_eq!(
+        db.show_session(session.id).unwrap().raw_provenance_status,
+        RawProvenanceStatus::Unresolved
+    );
     assert_eq!(db.search("CanonicalVisibleCanary", 10).unwrap().len(), 1);
     let snapshot = db.verification_snapshot(scan_id).unwrap();
     assert_eq!(snapshot.status, "complete");
@@ -140,6 +145,89 @@ fn restore_sanitizes_all_persisted_session_text() {
     assert!(!serialized.contains("abcdefghijklmnopqrstuvwxyz"));
     assert!(serialized.contains("[REDACTED:"));
     let _ = install;
+}
+
+#[test]
+fn raw_provenance_status_distinguishes_none_and_available() {
+    let dir = tempdir().unwrap();
+    let store = MemoryMasterKeyStore::empty();
+    let bootstrap = DatasetBootstrap::create(Uuid::new_v4(), &store).unwrap();
+    let keys = bootstrap.unlock(&store).unwrap();
+    let mut db = IndexDb::open(&dir.path().join("agentark.db"), keys.sqlcipher_key()).unwrap();
+    let (install, mut empty, _) = fixture();
+    empty.messages.clear();
+    empty.id = Uuid::from_u128(101);
+    empty.source_session_id = "empty-provenance".into();
+    let empty_hash = canonical_hash("session", &empty).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &install,
+        session: &empty,
+        source_records: &[],
+        sanitized_title: "empty",
+        sanitized_body: "empty",
+        findings: &[],
+        canonical_hash: &empty_hash,
+    })
+    .unwrap();
+    assert_eq!(
+        db.show_session(empty.id).unwrap().raw_provenance_status,
+        RawProvenanceStatus::None
+    );
+
+    let (available_install, mut available_session, _) = fixture();
+    let source_record = SourceRecord {
+        source_locator: "fixture.jsonl".into(),
+        source_record_id: Some("record-1".into()),
+        ordinal: 0,
+        raw_sha256: available_session.messages[0].raw_ref.clone(),
+        cas_object_id: "dataset-object".into(),
+        adapter_version: "fixture".into(),
+        snapshot_id: "snapshot-1".into(),
+    };
+    available_session.id = Uuid::from_u128(102);
+    available_session.source_session_id = "available-provenance".into();
+    let session_hash = canonical_hash("session", &available_session).unwrap();
+    db.ingest_session(SessionIngest {
+        install: &available_install,
+        session: &available_session,
+        source_records: std::slice::from_ref(&source_record),
+        sanitized_title: "available",
+        sanitized_body: "available",
+        findings: &[],
+        canonical_hash: &session_hash,
+    })
+    .unwrap();
+    assert_eq!(
+        db.show_session(available_session.id)
+            .unwrap()
+            .raw_provenance_status,
+        RawProvenanceStatus::Available
+    );
+    assert!(db.list_sessions(10, 0).unwrap().iter().any(|summary| {
+        summary.id == available_session.id
+            && summary.raw_provenance_status == RawProvenanceStatus::Available
+    }));
+
+    let (_, unresolved_session, _) = fixture();
+    assert!(
+        db.restore_sessions_with_provenance(
+            std::slice::from_ref(&unresolved_session),
+            RawProvenanceStatus::Available,
+        )
+        .is_err()
+    );
+    assert!(
+        db.restore_sessions_with_provenance(
+            std::slice::from_ref(&unresolved_session),
+            RawProvenanceStatus::None,
+        )
+        .is_err()
+    );
+    db.restore_sessions_with_provenance(
+        std::slice::from_ref(&unresolved_session),
+        RawProvenanceStatus::Unresolved,
+    )
+    .unwrap();
 }
 
 #[test]

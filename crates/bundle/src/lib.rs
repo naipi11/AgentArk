@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use agentark_canonical::{CanonicalSession, file_uri_for_path};
+use agentark_canonical::{CanonicalSession, Sha256Digest, file_uri_for_path};
 use agentark_security::{AuthorizedRoot, SecretScanner};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -103,6 +103,13 @@ pub struct NativeBundleEntry {
     pub redaction_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawProvenanceSummary {
+    pub sessions_with_references: u64,
+    pub reference_count: u64,
+}
+
 struct BundleWriteMeta {
     agent: Option<String>,
     source_root: Option<String>,
@@ -154,6 +161,18 @@ impl Bundle {
         Ok(sessions)
     }
 
+    pub fn raw_provenance_summary(&self) -> Result<RawProvenanceSummary, BundleError> {
+        let sessions = self.session_records()?;
+        if self.manifest.format == FORMAT_VERSION {
+            raw_provenance_summary(&sessions)
+        } else {
+            // Legacy bundles remain readable even when their historical rawRef
+            // value was not normalized as a `sha256:` digest. Such references
+            // are reported as unresolved by callers, without exposing bytes.
+            Ok(count_raw_references(&sessions))
+        }
+    }
+
     pub fn verify(&self) -> Result<(), BundleError> {
         let mut manifest_paths = BTreeSet::new();
         for meta in &self.manifest.entries {
@@ -200,6 +219,9 @@ impl Bundle {
         let strict_semantics = self.manifest.format == FORMAT_VERSION;
         let scanner = SecretScanner::v1().map_err(BundleError::from)?;
         let sessions = self.session_records()?;
+        if strict_semantics {
+            raw_provenance_summary(&sessions)?;
+        }
         let mut session_ids = BTreeSet::new();
         for session in &sessions {
             if !session_ids.insert(session.id) {
@@ -521,6 +543,51 @@ impl Bundle {
             });
         }
         Ok(entries)
+    }
+}
+
+pub fn raw_provenance_summary(
+    sessions: &[CanonicalSession],
+) -> Result<RawProvenanceSummary, BundleError> {
+    let summary = count_raw_references(sessions);
+    let references = sessions.iter().flat_map(|session| {
+        session
+            .messages
+            .iter()
+            .map(|message| &message.raw_ref)
+            .chain(session.tool_events.iter().map(|event| &event.raw_ref))
+            .chain(
+                session
+                    .attachments
+                    .iter()
+                    .map(|attachment| &attachment.raw_ref),
+            )
+    });
+    for reference in references {
+        if Sha256Digest::parse(reference.as_str()).is_none() {
+            return Err(BundleError::InvalidFormat(
+                "session contains an invalid raw reference".into(),
+            ));
+        }
+    }
+    Ok(summary)
+}
+
+fn count_raw_references(sessions: &[CanonicalSession]) -> RawProvenanceSummary {
+    let mut sessions_with_references = 0u64;
+    let mut reference_count = 0u64;
+    for session in sessions {
+        let session_reference_count = session.messages.len() as u64
+            + session.tool_events.len() as u64
+            + session.attachments.len() as u64;
+        if session_reference_count > 0 {
+            sessions_with_references = sessions_with_references.saturating_add(1);
+            reference_count = reference_count.saturating_add(session_reference_count);
+        }
+    }
+    RawProvenanceSummary {
+        sessions_with_references,
+        reference_count,
     }
 }
 
@@ -1250,6 +1317,200 @@ mod tests {
             .values()
             .find(|bytes| String::from_utf8_lossy(bytes).contains("[REDACTED:"));
         assert!(session_entry.is_some());
+    }
+
+    #[test]
+    fn raw_provenance_summary_counts_messages_tools_and_attachments() {
+        let mut session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "raw-provenance".into(),
+            source_kind: "fixture".into(),
+            workspace: None,
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: vec![agentark_canonical::CanonicalMessage::text_fixture(
+                1, "now", "message",
+            )],
+            tool_events: vec![agentark_canonical::ToolEvent {
+                id: "tool".into(),
+                ordinal: 2,
+                tool_name: "fixture".into(),
+                status: "ok".into(),
+                visible_input: Some("input".into()),
+                visible_output: Some("output".into()),
+                raw_ref: agentark_canonical::Sha256Digest::from_bytes(b"raw"),
+            }],
+            attachments: vec![agentark_canonical::Attachment {
+                id: uuid::Uuid::new_v4(),
+                source_locator: "file.bin".into(),
+                media_type: None,
+                size: 3,
+                sha256: agentark_canonical::Sha256Digest::from_bytes(b"bin"),
+                raw_ref: agentark_canonical::Sha256Digest::from_bytes(b"raw"),
+            }],
+            raw_extra: BTreeMap::new(),
+        };
+        let raw = agentark_canonical::Sha256Digest::from_bytes(b"raw");
+        session.messages[0].raw_ref = raw.clone();
+        let summary = raw_provenance_summary(std::slice::from_ref(&session)).unwrap();
+        assert_eq!(summary.sessions_with_references, 1);
+        assert_eq!(summary.reference_count, 3);
+    }
+
+    #[test]
+    fn raw_provenance_summary_rejects_malformed_digest() {
+        let session = CanonicalSession {
+            schema_version: agentark_canonical::CanonicalSchemaVersion::V0_1_0,
+            id: uuid::Uuid::new_v4(),
+            install_id: uuid::Uuid::new_v4(),
+            source_session_id: "raw-provenance-invalid".into(),
+            source_kind: "fixture".into(),
+            workspace: None,
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: agentark_canonical::Completeness::Complete,
+            messages: vec![agentark_canonical::CanonicalMessage::text_fixture(
+                1, "now", "message",
+            )],
+            tool_events: Vec::new(),
+            attachments: Vec::new(),
+            raw_extra: BTreeMap::new(),
+        };
+        let mut value = serde_json::to_value(session).unwrap();
+        value["messages"][0]["rawRef"] = Value::String("sha256:invalid".into());
+        let session: CanonicalSession = serde_json::from_value(value).unwrap();
+        let error = raw_provenance_summary(&[session.clone()]).unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("raw reference"))
+        );
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("malformed-raw-ref.ahbundle");
+        let mut session_bytes =
+            serde_json::to_vec(&serde_json::to_value(session).unwrap()).unwrap();
+        session_bytes.push(b'\n');
+        let manifest = serde_json::json!({
+            "format": "1.2",
+            "createdAt": "2026-09-13T00:00:00Z",
+            "sessionCount": 1,
+            "workspaceCount": 0,
+            "fileCount": 0,
+            "redacted": false,
+            "redactionCount": 0,
+            "entries": [{
+                "path": "sessions/malformed.ndjson",
+                "size": session_bytes.len(),
+                "sha256": hex::encode(Sha256::digest(&session_bytes))
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        write_u32(&mut file, 2).unwrap();
+        write_entry(
+            &mut file,
+            &BundleEntry {
+                path: "manifest.json".into(),
+                bytes: manifest_bytes,
+            },
+        )
+        .unwrap();
+        write_entry(
+            &mut file,
+            &BundleEntry {
+                path: "sessions/malformed.ndjson".into(),
+                bytes: session_bytes,
+            },
+        )
+        .unwrap();
+        drop(file);
+        let error = read_bundle(&path).unwrap_err();
+        assert!(
+            matches!(error, BundleError::InvalidFormat(message) if message.contains("raw reference"))
+        );
+    }
+
+    #[test]
+    fn legacy_raw_reference_values_remain_readable_and_are_counted() {
+        let session = serde_json::json!({
+            "schemaVersion": "0.1.0",
+            "id": uuid::Uuid::new_v4(),
+            "installId": uuid::Uuid::new_v4(),
+            "sourceSessionId": "legacy-raw-ref",
+            "sourceKind": "fixture",
+            "workspace": null,
+            "title": null,
+            "archived": false,
+            "createdAtRaw": null,
+            "updatedAtRaw": null,
+            "modelProvider": null,
+            "modelName": null,
+            "completeness": "complete",
+            "messages": [{
+                "id": uuid::Uuid::new_v4(),
+                "sourceRecordId": null,
+                "ordinal": 1,
+                "role": "assistant",
+                "rawRole": "assistant",
+                "createdAtRaw": null,
+                "content": [{"kind": "text", "text": "legacy", "attachmentId": null, "rawExtra": {}}],
+                "rawRef": "legacy-ref"
+            }],
+            "toolEvents": [],
+            "attachments": [],
+            "rawExtra": {}
+        });
+        let session_bytes = format!("{}\n", session).into_bytes();
+        let manifest = serde_json::json!({
+            "format": "1.1",
+            "createdAt": "2026-09-13T00:00:00Z",
+            "sessionCount": 1,
+            "redacted": false,
+            "redactionCount": 0,
+            "entries": [{
+                "path": "sessions/legacy-raw.ndjson",
+                "size": session_bytes.len(),
+                "sha256": hex::encode(Sha256::digest(&session_bytes))
+            }]
+        });
+        let root = tempdir().unwrap();
+        let path = root.path().join("legacy-raw-ref.ahbundle");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        write_u32(&mut file, 2).unwrap();
+        write_entry(
+            &mut file,
+            &BundleEntry {
+                path: "manifest.json".into(),
+                bytes: serde_json::to_vec(&manifest).unwrap(),
+            },
+        )
+        .unwrap();
+        write_entry(
+            &mut file,
+            &BundleEntry {
+                path: "sessions/legacy-raw.ndjson".into(),
+                bytes: session_bytes,
+            },
+        )
+        .unwrap();
+        drop(file);
+
+        let bundle = read_bundle(&path).unwrap();
+        let summary = bundle.raw_provenance_summary().unwrap();
+        assert_eq!(summary.sessions_with_references, 1);
+        assert_eq!(summary.reference_count, 1);
     }
 
     #[test]

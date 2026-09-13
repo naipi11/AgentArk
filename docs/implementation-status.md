@@ -22,7 +22,10 @@ Vendor databases/files are never opened writable.
 
 - `.ahbundle` is a framed, path-safe container with entry and total-size limits,
   per-entry SHA-256 verification, deterministic session entries, and recursive
-  secret redaction.
+  secret redaction. Canonical-only transfers do not copy source CAS bytes or
+  destination-keyed CAS object IDs; the encrypted index records raw provenance
+  as `none`, `available`, `unresolved`, or `unknown`, and the UI reports when
+  original source evidence is unavailable on the destination device.
 - CLI commands: `bundle export`, `bundle verify`, `bundle restore`, and
   `migration plan <bundle> <target> [--handoff]`.
   CLI bundle verification maps unreadable files, integrity failures, and invalid
@@ -109,6 +112,8 @@ native recovery to refresh its session list.
 The unreleased 0.6.5 candidate adds strict bundle framing and manifest checks,
 selected-workspace filtering, fail-closed project-file export, recursive import
 sanitation, safe CAS object paths, atomic first-run bootstrap creation, background
-desktop bundle operations, full-text search, and an executable Playwright timeline
-fixture. The release remains gated on the full cross-platform CI run and a clean
-release build.
+desktop bundle operations, full-text search, explicit raw provenance status
+reporting, and an executable Playwright timeline fixture. Canonical-only bundle
+transfers report unresolved original source evidence instead of copying source
+CAS bytes or destination-keyed object IDs. The release remains gated on the
+full cross-platform CI run and a clean release build.
