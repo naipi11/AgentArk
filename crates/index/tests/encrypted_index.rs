@@ -208,7 +208,8 @@ fn raw_provenance_status_distinguishes_none_and_available() {
             && summary.raw_provenance_status == RawProvenanceStatus::Available
     }));
 
-    let (_, unresolved_session, _) = fixture();
+    let (_, mut unresolved_session, _) = fixture();
+    unresolved_session.messages[0].id = Uuid::from_u128(103);
     assert!(
         db.restore_sessions_with_provenance(
             std::slice::from_ref(&unresolved_session),
