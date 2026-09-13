@@ -273,6 +273,10 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
     let bundle = read_bundle(path).map_err(bundle_error)?;
     let mut sessions = validate_bundle_contents(&bundle)?;
     agentark_audit::verify_chain(&root.join("audit.jsonl")).map_err(|_| RuntimeError::Storage)?;
+    // Open the destination before materializing project files. Otherwise a
+    // locked/corrupt dataset can leave restored-workspaces behind even though
+    // the restore failed before publishing any indexed session.
+    let (_cas, mut index, _store) = open_storage_existing(root)?;
     let restore_root = root.join("restored-workspaces");
     if bundle.manifest.workspace_count > 0 {
         restore_workspace(&bundle, &restore_root).map_err(bundle_error)?;
@@ -287,7 +291,6 @@ pub fn restore_bundle(root: &Path, path: &Path) -> Result<BundleData, RuntimeErr
             }
         }
     }
-    let (_cas, mut index, _store) = open_storage_existing(root)?;
     let scan_id = index
         .restore_sessions(&sessions)
         .map_err(|_| RuntimeError::Storage)?;
