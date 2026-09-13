@@ -491,8 +491,8 @@ impl IndexDb {
             } else {
                 None
             };
-            let canonical_json = serde_json::to_string(session)?;
-            let canonical_hash = canonical_hash("session", session)
+            let canonical_json = serde_json::to_string(&session)?;
+            let canonical_hash = canonical_hash("session", &session)
                 .map_err(|_| IndexError::InvariantViolation)?
                 .as_str()
                 .to_owned();
