@@ -1602,6 +1602,7 @@ impl ProjectRestoreReceipt {
     }
 }
 
+#[cfg(test)]
 fn restore_project_files(root: &Path, entries: &[WorkspaceFileEntry]) -> Result<(), String> {
     restore_project_files_guarded(root, entries, &|| Ok(())).map(|_| ())
 }
