@@ -49,7 +49,7 @@ pub fn session_raw_provenance_status(
         .iter()
         .map(|record| record.raw_sha256.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let references = session
+    let mut references = session
         .messages
         .iter()
         .map(|message| &message.raw_ref)

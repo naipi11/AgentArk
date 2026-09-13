@@ -230,7 +230,7 @@ impl SessionQuery for IndexDb {
     }
 
     fn show_session(&self, id: Uuid) -> Result<SessionDetail, IndexError> {
-        let json: String = self
+        let json: (String, String) = self
             .connection()
             .query_row(
                 "SELECT canonical_json, raw_provenance_status FROM sessions WHERE id = ?1",
