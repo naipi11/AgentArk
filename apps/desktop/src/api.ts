@@ -91,7 +91,7 @@ export const api = {
   status: () => invoke<StatusDto>('status'),
   sessionsList: (limit = 50, offset = 0, workspaceId?: string, agentKind?: AgentKind) => invoke<SessionSummary[]>('sessions_list', { limit, offset, workspaceId, agentKind }),
   sessionsShow: (sessionId: string) => invoke<PublicSessionDetail>('sessions_show', { sessionId }),
-  search: (query: string, limit = 50) => invoke<SearchHit[]>('search', { query, limit }),
+  search: (query: string, limit = 50, agentKind?: AgentKind) => invoke<SearchHit[]>('search', agentKind === undefined ? { query, limit } : { query, limit, agentKind }),
   quarantinesList: () => invoke<QuarantineDto[]>('quarantines_list'),
   codexDefaultRoot: () => invoke<string | null>('codex_default_root'),
   claudeDefaultRoot: () => invoke<string | null>('claude_default_root'),

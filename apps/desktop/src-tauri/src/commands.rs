@@ -84,8 +84,11 @@ pub fn search(
     state: State<'_, AppState>,
     query: String,
     limit: u32,
+    agent_kind: Option<AgentKind>,
 ) -> Result<Vec<SearchHit>, String> {
-    with_query(&state.services, |service| service.search(&query, limit))
+    with_query(&state.services, |service| {
+        service.search_filtered(&query, agent_kind, limit)
+    })
 }
 
 #[tauri::command]

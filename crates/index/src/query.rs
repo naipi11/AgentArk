@@ -53,6 +53,17 @@ pub trait SessionQuery {
     }
     fn show_session(&self, id: Uuid) -> Result<SessionDetail, IndexError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, IndexError>;
+    fn search_filtered(
+        &self,
+        query: &str,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, IndexError> {
+        if agent_kind.is_some() {
+            return Err(IndexError::InvalidQuery);
+        }
+        self.search(query, limit)
+    }
     fn list_quarantines(&self) -> Result<Vec<QuarantineSummary>, IndexError>;
 }
 
@@ -228,22 +239,34 @@ impl SessionQuery for IndexDb {
     }
 
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, IndexError> {
+        self.search_filtered(query, None, limit)
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, IndexError> {
         let query = query.trim();
         if query.is_empty() {
             return Err(IndexError::InvalidQuery);
         }
+        let agent_kind = agent_kind_storage_label(agent_kind.as_ref())?;
         let escaped = query
             .split_whitespace()
-            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .map(|term| format!("\"{}\"", term.replace('\"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ");
         let mut statement = self.connection().prepare(
             "WITH matched AS (
-                 SELECT rowid, rank
-                 FROM session_fts
-                 WHERE session_fts MATCH ?1
-                 ORDER BY rank
-                 LIMIT ?2
+                 SELECT f.rowid, f.rank
+                 FROM session_fts f
+                 JOIN sessions s ON s.id = f.session_id
+                 JOIN agent_installs ai ON ai.id = s.install_id
+                 WHERE session_fts MATCH ?1 AND (?2 IS NULL OR ai.kind = ?2)
+                 ORDER BY f.rank
+                 LIMIT ?3
              )
              SELECT s.id, s.search_title,
                     snippet(session_fts, 2, '[', ']', ' … ', 16), matched.rank
@@ -252,7 +275,7 @@ impl SessionQuery for IndexDb {
              JOIN sessions s ON s.id = f.session_id
              ORDER BY matched.rank",
         )?;
-        let rows = statement.query_map(params![escaped, limit.min(100)], |row| {
+        let rows = statement.query_map(params![escaped, agent_kind, limit.min(100)], |row| {
             Ok(SearchHit {
                 session_id: parse_uuid(row.get::<_, String>(0)?)?,
                 title: row.get(1)?,

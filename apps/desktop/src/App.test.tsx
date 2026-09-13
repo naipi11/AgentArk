@@ -86,6 +86,18 @@ test('search tab exposes full-text archive search', async () => {
   await waitFor(() => expect(invoke).toHaveBeenCalledWith('search', { query: 'needle', limit: 50 }));
 });
 
+test('search exposes the shared Agent selector and passes its filter', async () => {
+  render(<LocaleProvider><App /></LocaleProvider>);
+  await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+  const selector = await screen.findByRole('combobox', { name: 'Agent' });
+  fireEvent.change(selector, { target: { value: 'claudeCode' } });
+  const input = await screen.findByRole('textbox', { name: 'Search messages, tools, and titles' });
+  fireEvent.change(input, { target: { value: 'needle' } });
+  fireEvent.click(screen.getAllByRole('button', { name: 'Search' })[1]);
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith('search', { query: 'needle', limit: 50, agentKind: 'claudeCode' }));
+});
+
 test('transfer view exposes export and import session history actions', async () => {
   render(<LocaleProvider><App /></LocaleProvider>);
   await waitFor(() => expect(screen.getByText('ready')).toBeInTheDocument());

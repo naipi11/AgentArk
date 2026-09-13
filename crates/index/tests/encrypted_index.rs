@@ -162,7 +162,7 @@ fn filters_sessions_and_projects_by_agent_kind() {
         session: &codex_session,
         source_records: &[],
         sanitized_title: "codex",
-        sanitized_body: "codex",
+        sanitized_body: "shared shared shared codex",
         findings: &[],
         canonical_hash: &codex_hash,
     })
@@ -185,7 +185,7 @@ fn filters_sessions_and_projects_by_agent_kind() {
         session: &claude_session,
         source_records: &[],
         sanitized_title: "claude",
-        sanitized_body: "claude",
+        sanitized_body: "shared claude",
         findings: &[],
         canonical_hash: &claude_hash,
     })
@@ -208,6 +208,29 @@ fn filters_sessions_and_projects_by_agent_kind() {
             .path_native,
         "C:\\codex"
     );
+    assert_eq!(
+        db.search_filtered("codex", Some(AgentKind::Codex), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.search_filtered("codex", Some(AgentKind::ClaudeCode), 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.search_filtered("claude", Some(AgentKind::ClaudeCode), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    let filtered = db
+        .search_filtered("shared", Some(AgentKind::ClaudeCode), 1)
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].session_id, claude_session.id);
 }
 
 #[test]

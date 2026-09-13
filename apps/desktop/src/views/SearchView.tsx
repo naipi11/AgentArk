@@ -1,10 +1,11 @@
 import { useRef, useState, type FormEvent } from 'react';
-import { api, type PublicSessionDetail, type SearchHit } from '../api';
+import { api, type AgentFilter, type PublicSessionDetail, type SearchHit } from '../api';
+import { AgentSelector } from '../components/AgentSelector';
 import { useI18n } from '../i18n';
 
-type Props = { onSelect: (detail: PublicSessionDetail) => void };
+type Props = { onSelect: (detail: PublicSessionDetail) => void; agentKind: AgentFilter; onAgentKindChange: (value: AgentFilter) => void };
 
-export function SearchView({ onSelect }: Props) {
+export function SearchView({ onSelect, agentKind, onAgentKindChange }: Props) {
   const { t } = useI18n();
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -20,7 +21,7 @@ export function SearchView({ onSelect }: Props) {
     setBusy(true);
     setError(false);
     try {
-      const nextHits = await api.search(next, 50);
+      const nextHits = await api.search(next, 50, agentKind === 'all' ? undefined : agentKind);
       if (currentRequest === requestId.current) setHits(nextHits);
     } catch {
       if (currentRequest === requestId.current) {
@@ -42,8 +43,10 @@ export function SearchView({ onSelect }: Props) {
 
   return (
     <section className="card" aria-label={t('search.title')}>
-      <p className="eyebrow">{t('search.title')}</p>
-      <h2>{t('search.title')}</h2>
+      <div className="section-heading">
+        <div><p className="eyebrow">{t('search.title')}</p><h2>{t('search.title')}</h2></div>
+        <AgentSelector value={agentKind} onChange={onAgentKindChange} />
+      </div>
       <form className="scan-form" onSubmit={(event) => void submit(event)}>
         <input aria-label={t('search.placeholder')} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('search.placeholder')} />
         <button className="primary-button" type="submit" disabled={busy || !query.trim()}>{busy ? t('search.searching') : t('search.submit')}</button>

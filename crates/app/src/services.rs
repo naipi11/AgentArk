@@ -65,6 +65,17 @@ pub trait QueryUseCase: Send + Sync {
     }
     fn show_session(&self, id: Uuid) -> Result<PublicSessionDetail, AppError>;
     fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, AppError>;
+    fn search_filtered(
+        &self,
+        query: &str,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, AppError> {
+        if agent_kind.is_some() {
+            return Err(AppError::Invariant("agent filter is unavailable".into()));
+        }
+        self.search(query, limit)
+    }
     fn list_quarantines(&self) -> Result<Vec<QuarantineDto>, AppError>;
 }
 
@@ -238,6 +249,15 @@ impl<I: SessionQuery + Send + Sync> QueryUseCase for IndexQueryService<I> {
         Ok(self.index.search(query, limit)?)
     }
 
+    fn search_filtered(
+        &self,
+        query: &str,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, AppError> {
+        Ok(self.index.search_filtered(query, agent_kind, limit)?)
+    }
+
     fn list_quarantines(&self) -> Result<Vec<QuarantineDto>, AppError> {
         Ok(self
             .index
@@ -348,6 +368,19 @@ impl<I: SessionQuery + Send> QueryUseCase for LockedIndexQueryService<I> {
             .lock()
             .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
             .search(query, limit)
+            .map_err(AppError::from)
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        agent_kind: Option<AgentKind>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, AppError> {
+        self.index
+            .lock()
+            .map_err(|_| AppError::Invariant("query state is poisoned".into()))?
+            .search_filtered(query, agent_kind, limit)
             .map_err(AppError::from)
     }
 
