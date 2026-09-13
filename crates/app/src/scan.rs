@@ -377,12 +377,65 @@ fn verify_raw_references(
         .tool_events
         .iter()
         .any(|event| &event.raw_ref != raw_hash);
-    if invalid_message || invalid_tool {
+    let invalid_attachment = session
+        .attachments
+        .iter()
+        .any(|attachment| &attachment.raw_ref != raw_hash);
+    if invalid_message || invalid_tool || invalid_attachment {
         return Err(AppError::Invariant(
             "normalized raw reference is not the archived object hash".into(),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_raw_references;
+    use agentark_canonical::{
+        Attachment, CanonicalSchemaVersion, CanonicalSession, Completeness, Sha256Digest,
+    };
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    fn session_with_attachment(raw_ref: Sha256Digest) -> CanonicalSession {
+        CanonicalSession {
+            schema_version: CanonicalSchemaVersion::V0_1_0,
+            id: Uuid::new_v4(),
+            install_id: Uuid::new_v4(),
+            source_session_id: "attachment-fixture".into(),
+            source_kind: "fixture".into(),
+            workspace: None,
+            title: None,
+            archived: false,
+            created_at_raw: None,
+            updated_at_raw: None,
+            model_provider: None,
+            model_name: None,
+            completeness: Completeness::Complete,
+            messages: Vec::new(),
+            tool_events: Vec::new(),
+            attachments: vec![Attachment {
+                id: Uuid::new_v4(),
+                source_locator: "attachment.bin".into(),
+                media_type: Some("application/octet-stream".into()),
+                size: 3,
+                sha256: Sha256Digest::from_bytes(b"bin"),
+                raw_ref,
+            }],
+            raw_extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn raw_reference_validation_covers_attachments() {
+        let archived_hash = Sha256Digest::from_bytes(b"raw-record");
+        let session = session_with_attachment(archived_hash.clone());
+        assert!(verify_raw_references(&session, &archived_hash).is_ok());
+
+        let mismatched = session_with_attachment(Sha256Digest::from_bytes(b"other-record"));
+        assert!(verify_raw_references(&mismatched, &archived_hash).is_err());
+    }
 }
 
 fn sanitize_session(
