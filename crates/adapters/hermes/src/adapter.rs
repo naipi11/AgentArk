@@ -340,7 +340,7 @@ fn normalize_session(bytes: &[u8], install_id: Uuid) -> Result<CanonicalSession,
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_owned());
-        let canonical_uri = file_uri_for_path(path);
+        let canonical_uri = file_uri_for_path(Path::new(&path));
         Workspace {
             id: workspace_id(&canonical_uri),
             path_native: path,
