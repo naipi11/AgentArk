@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use agentark_canonical::Sha256Digest;
 use serde::{Deserialize, Serialize};
@@ -124,9 +126,50 @@ pub struct CheckpointFile {
     pub sha256: Sha256Digest,
 }
 
-pub fn ensure_appendable(path: &Path) -> Result<(), AuditError> {
+const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const AUDIT_LOCK_RETRY: Duration = Duration::from_millis(25);
+
+struct AuditLock {
+    path: PathBuf,
+}
+
+impl Drop for AuditLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_audit_lock(path: &Path) -> Result<AuditLock, AuditError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audit path is invalid"))?;
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    let deadline = Instant::now() + AUDIT_LOCK_TIMEOUT;
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock) => {
+                writeln!(lock, "{}", std::process::id())?;
+                lock.sync_all()?;
+                return Ok(AuditLock { path: lock_path });
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists && Instant::now() < deadline =>
+            {
+                thread::sleep(AUDIT_LOCK_RETRY);
+            }
+            Err(error) => return Err(AuditError::Io(error)),
+        }
+    }
+}
+
+fn verify_appendable_locked(path: &Path) -> Result<(), AuditError> {
     let verification = verify_chain(path)?;
     if !verification.valid {
         return Err(AuditError::InvalidChain(
@@ -140,12 +183,17 @@ pub fn ensure_appendable(path: &Path) -> Result<(), AuditError> {
     Ok(())
 }
 
+pub fn ensure_appendable(path: &Path) -> Result<(), AuditError> {
+    let _lock = acquire_audit_lock(path)?;
+    verify_appendable_locked(path)
+}
+
 pub fn append_event(path: &Path, mut event: AuditEvent) -> Result<AuditEvent, AuditError> {
+    let _lock = acquire_audit_lock(path)?;
+    verify_appendable_locked(path)?;
     let previous = last_event(path)?;
     event.previous_hash = previous.as_ref().map(|value| value.event_hash.clone());
     event.event_hash = hash_event(&event)?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(&mut file, &event)?;
     file.write_all(b"\n")?;
@@ -309,6 +357,41 @@ mod tests {
         text = text.replacen("migration.completed", "migration.tampered", 1);
         fs::write(&path, text).unwrap();
         assert!(!verify_chain(&path).unwrap().valid);
+        assert!(matches!(
+            append_event(&path, event("after-tamper")),
+            Err(AuditError::InvalidChain(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_appends_preserve_a_valid_chain() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let handles = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || append_event(&path, event(&format!("event-{index}"))))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let verification = verify_chain(&path).unwrap();
+        assert!(verification.valid);
+        assert_eq!(verification.event_count, 8);
+    }
+
+    #[test]
+    fn an_existing_audit_lock_fails_closed_after_timeout() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let lock_path = dir.path().join(".audit.jsonl.lock");
+        fs::write(&lock_path, b"other-process").unwrap();
+        let started = std::time::Instant::now();
+        let result = ensure_appendable(&path);
+        assert!(matches!(result, Err(AuditError::Io(_))));
+        assert!(started.elapsed() >= AUDIT_LOCK_TIMEOUT);
+        assert!(lock_path.exists());
     }
 
     #[test]
