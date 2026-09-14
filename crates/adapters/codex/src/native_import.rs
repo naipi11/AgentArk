@@ -1425,12 +1425,11 @@ where
             } else {
                 None
             };
-            if let Some(cleanup_path) = cleanup_path {
-                if let Err(remove_error) = parent_dir.remove_file(cleanup_path)
-                    && remove_error.kind() != io::ErrorKind::NotFound
-                {
-                    return Err(NativeImportError::ManualIntervention);
-                }
+            if let Some(cleanup_path) = cleanup_path
+                && let Err(remove_error) = parent_dir.remove_file(cleanup_path)
+                && remove_error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(NativeImportError::ManualIntervention);
             }
             // Remove the directory through the child capability so a
             // concurrent pathname replacement cannot redirect cleanup.
