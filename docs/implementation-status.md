@@ -33,7 +33,7 @@ Vendor databases/files are never opened writable.
   reporting success.
   The corresponding CLI exit codes are `5` for unreadable files, `4` for integrity
   failures, and `2` for invalid or incompatible bundle formats.
-  The unreleased 0.6.5 work also filters selected workspaces through sessions and
+  The 0.6.5 release also filters selected workspaces through sessions and
   native payload collection, sanitizes imported sessions, and moves desktop bundle
   operations to a blocking worker.
 - CLI `bundle export` requires explicit `--project` selections; use `--all-projects` for an intentional full archive export.
@@ -86,7 +86,7 @@ fall back to the verified AgentArk archive. Cloud relay, multi-user server mode,
 and L3 credential migration remain deliberately disabled for the local-first
 release.
 
-The unreleased 0.6.5 candidate extends the transfer UI and runtime with Agent-scoped project selection, an optional project
+The 0.6.5 release extends the transfer UI and runtime with Agent-scoped project selection, an optional project
 file checkbox, bundle verification/preview, conflict blocking, and restore into
 `restored-workspaces` on the destination device.
 
@@ -107,13 +107,14 @@ target `CODEX_HOME`, rewrites only workspace path fields, creates an
 and manual-intervention outcomes separately. Restart Codex after a successful
 native recovery to refresh its session list.
 
-## 0.6.5 readiness
+## 0.6.6 release
 
-The unreleased 0.6.5 candidate adds strict bundle framing and manifest checks,
+The 0.6.6 release adds explicit raw provenance status reporting and the
+latest search, restore, and audit-chain hardening on top of the 0.6.5
+release, including strict bundle framing and manifest checks,
 selected-workspace filtering, fail-closed project-file export, recursive import
 sanitation, safe CAS object paths, atomic first-run bootstrap creation, background
 desktop bundle operations, full-text search, explicit raw provenance status
 reporting, and an executable Playwright timeline fixture. Canonical-only bundle
 transfers report unresolved original source evidence instead of copying source
-CAS bytes or destination-keyed object IDs. The release remains gated on the
-full cross-platform CI run and a clean release build.
+CAS bytes or destination-keyed object IDs. The release is gated by the full cross-platform CI run and a clean release build.

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.6] - 2026-09-14
+
+### Fixed
+
+- Report raw source provenance explicitly as `none`, `available`, `unresolved`, or `unknown` without copying source CAS identifiers or bytes across devices.
+- Validate message, tool-event, and attachment raw references before indexing or importing bundles.
+- Serialize audit-chain appends and reject corrupted chains or lock contention instead of risking concurrent writes.
+- Validate destination storage before materializing restored workspace files during CLI bundle restore.
+- Filter archive search by Agent before applying the result limit while preserving legacy unfiltered search payloads.
+
+### Release
+
+- Bump the desktop package and Tauri bundle version to `0.6.6`.
+
+[0.6.6]: https://github.com/naipi11/AgentArk/releases/tag/v0.6.6
+
+
 ## [0.6.5] - 2026-09-13
 
 ### Fixed
