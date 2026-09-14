@@ -231,7 +231,7 @@ fn upgrades_version_one_index_without_losing_existing_session() {
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),
-        "2"
+        "3"
     );
     assert_eq!(
         connection
