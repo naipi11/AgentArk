@@ -10,7 +10,7 @@ use agentark_adapter_codex::{
     ensure_codex_not_running_excluding, fork_rollout_with_target_provider_guarded,
     native_thread_expectation, probe_target_default, restore_native_rollouts_guarded,
     rewrite_native_workspace_paths, verify_rollouts_with_app_server, verify_target_session,
-    write_rollout_atomic_guarded,
+    write_rollout_atomic_guarded_exclusive_parent,
 };
 use agentark_canonical::{CanonicalSession, Sha256Digest};
 use agentark_migration::{
@@ -742,7 +742,7 @@ fn create_continuation_with_operations<F, C, R>(
 ) -> Result<CodexContinuationReport, RecoveryError>
 where
     F: FnOnce(&Path, &CodexContinuationRequest) -> Result<CodexContinuationReport, RecoveryError>,
-    C: FnOnce(&Path) -> Result<(), RecoveryError>,
+    C: FnOnce(agentark_adapter_codex::StagedRollout) -> Result<(), RecoveryError>,
     R: FnOnce(&CodexContinuationReport) -> Result<(), RecoveryError>,
 {
     create_continuation_with_guarded_operations(
@@ -765,7 +765,7 @@ fn create_continuation_with_guarded_operations<F, C, R, G>(
 ) -> Result<CodexContinuationReport, RecoveryError>
 where
     F: FnOnce(&Path, &CodexContinuationRequest) -> Result<CodexContinuationReport, RecoveryError>,
-    C: FnOnce(&Path) -> Result<(), RecoveryError>,
+    C: FnOnce(agentark_adapter_codex::StagedRollout) -> Result<(), RecoveryError>,
     R: FnOnce(&CodexContinuationReport) -> Result<(), RecoveryError>,
     G: Fn(&[u32]) -> Result<(), RecoveryError>,
 {
@@ -774,7 +774,7 @@ where
         .join("sessions")
         .join(format!(".agentark-staging-{}", Uuid::new_v4()));
     let staged_source = staging_directory.join("source.jsonl");
-    let mut staged_written = false;
+    let mut staged: Option<agentark_adapter_codex::StagedRollout> = None;
     let operation = (|| {
         let target_cwd = continuation_target_cwd(input);
         let source = build_canonical_continuation_source(
@@ -784,13 +784,14 @@ where
             &target_default.model,
         )
         .map_err(map_native_payload_error)?;
-        write_rollout_atomic_guarded(&staged_source, std::slice::from_ref(&source.bytes), &|| {
-            guard(&[]).map_err(|_| NativeImportError::CodexRunning)
-        })
+        let staged_rollout = write_rollout_atomic_guarded_exclusive_parent(
+            &staged_source,
+            std::slice::from_ref(&source.bytes),
+            &|| guard(&[]).map_err(|_| NativeImportError::CodexRunning),
+        )
         .map_err(map_native_import_error)?;
-        staged_written = true;
         let request = CodexContinuationRequest {
-            source_rollout: staged_source.clone(),
+            source_rollout: staged_rollout.source_path().to_path_buf(),
             source_thread_id: source.thread_id,
             target_cwd,
             target_provider: Some(target_default.model_provider.clone()),
@@ -798,10 +799,15 @@ where
             title: source.title,
             visible_history: source.visible_history.expectation(),
         };
-        fork(&staged_source, &request)
+        let result = fork(staged_rollout.source_path(), &request);
+        staged = Some(staged_rollout);
+        result
     })();
-    let cleanup_result = if staged_written {
-        guard(&[]).and_then(|()| cleanup(&staged_source))
+    // Cleanup is guarded and consumes the capability token. No path lookup is
+    // performed after the write, so a replaced symlink/junction cannot redirect
+    // cleanup outside the directory created by this operation.
+    let cleanup_result = if let Some(staged_rollout) = staged.take() {
+        guard(&[]).and_then(|()| cleanup(staged_rollout))
     } else {
         Ok(())
     };
@@ -815,22 +821,10 @@ where
     }
 }
 
-fn remove_staged_source(path: &Path) -> Result<(), RecoveryError> {
-    let parent = path.parent().ok_or(RecoveryError::Rollback)?;
-    let file_cleanup = match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(RecoveryError::Rollback),
-    };
-    let directory_cleanup = match fs::remove_dir_all(parent) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(RecoveryError::Rollback),
-    };
-    match (file_cleanup, directory_cleanup) {
-        (_, Ok(())) => Ok(()),
-        (Ok(()), Err(error)) | (Err(error), Err(_)) => Err(error),
-    }
+fn remove_staged_source(
+    staged: agentark_adapter_codex::StagedRollout,
+) -> Result<(), RecoveryError> {
+    staged.cleanup().map_err(|_| RecoveryError::Rollback)
 }
 
 fn cleanup_native_paths<F>(paths: &[PathBuf], remove: F) -> Result<(), RecoveryError>
@@ -1466,6 +1460,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_atomic_stage_write_removes_orphaned_staging_directory() {
+        let root = TempRoot::new();
+        let checks = AtomicUsize::new(0);
+        let fork_calls = AtomicUsize::new(0);
+
+        let result = create_continuation_with_guarded_operations(
+            &input(&root.0),
+            &target_default(),
+            |_excluded| match checks.fetch_add(1, Ordering::SeqCst) {
+                // Before creating the staging directory.
+                0 => Ok(()),
+                // Before the atomic rename: force the write to fail after the
+                // directory and temporary file have been created.
+                1 => Err(RecoveryError::Unavailable),
+                // Cleanup performed by the atomic writer.
+                2 => Ok(()),
+                _ => panic!("unexpected process guard"),
+            },
+            |_path, _request| {
+                fork_calls.fetch_add(1, Ordering::SeqCst);
+                Err(RecoveryError::Verification)
+            },
+            remove_staged_source,
+            |_report| Ok(()),
+        );
+
+        assert_eq!(result.unwrap_err(), RecoveryError::Unavailable);
+        assert_eq!(fork_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            fs::read_dir(root.0.join("sessions"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn process_appearing_before_staging_cleanup_requires_manual_intervention() {
         let root = TempRoot::new();
         let checks = AtomicUsize::new(0);
@@ -1529,7 +1560,7 @@ mod tests {
                         .expectation(),
                 })
             },
-            |_path| Err(RecoveryError::Rollback),
+            |_staged| Err(RecoveryError::Rollback),
             |_report| {
                 rollback_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -1538,20 +1569,6 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), RecoveryError::ManualIntervention);
         assert_eq!(rollback_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn staging_cleanup_removes_owned_nonempty_directory() {
-        let root = TempRoot::new();
-        let staging = root.0.join("sessions/.agentark-staging-fixture");
-        let source = staging.join("source.jsonl");
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(&source, b"source").unwrap();
-        fs::write(staging.join("extra.tmp"), b"extra").unwrap();
-
-        remove_staged_source(&source).unwrap();
-
-        assert!(!staging.exists());
     }
 
     #[test]

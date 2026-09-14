@@ -19,16 +19,16 @@ pub use filesystem::{
 pub use native_import::{
     CodexContinuationReport, CodexContinuationRequest, CodexTargetDefault,
     CodexTargetSessionExpectation, NativeCapability, NativeImportError, NativeThreadExpectation,
-    backup_codex_targets, delete_thread_with_app_server, delete_thread_with_app_server_guarded,
-    delete_thread_with_app_server_transport, delete_thread_with_app_server_transport_guarded,
-    fork_rollout_with_target_provider, fork_rollout_with_target_provider_guarded,
-    fork_rollout_with_target_provider_transport,
+    StagedRollout, backup_codex_targets, delete_thread_with_app_server,
+    delete_thread_with_app_server_guarded, delete_thread_with_app_server_transport,
+    delete_thread_with_app_server_transport_guarded, fork_rollout_with_target_provider,
+    fork_rollout_with_target_provider_guarded, fork_rollout_with_target_provider_transport,
     fork_rollout_with_target_provider_transport_guarded, native_import_capability_from_outputs,
     probe_target_default, probe_target_default_transport, verify_rollout_with_app_server,
     verify_rollouts_with_app_server, verify_target_session, verify_target_session_transport,
     verify_thread_listing, write_rollout_atomic, write_rollout_atomic_guarded,
-    write_rollout_atomic_with_guarded_operations, write_rollout_atomic_with_operations,
-    write_rollout_atomic_with_reader,
+    write_rollout_atomic_guarded_exclusive_parent, write_rollout_atomic_with_guarded_operations,
+    write_rollout_atomic_with_operations, write_rollout_atomic_with_reader,
 };
 pub use native_payload::{
     CanonicalContinuationSource, CodexVisibleHistory, CodexVisibleHistoryExpectation,

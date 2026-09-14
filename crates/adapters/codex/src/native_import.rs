@@ -1284,3 +1284,160 @@ where
     }
     result
 }
+
+/// A rollout staged in an AgentArk-owned directory.
+///
+/// The open directory capability is retained across the caller's fork
+/// operation. Cleanup is therefore pinned to the directory created by this
+/// invocation, even if an attacker replaces its pathname after the write.
+#[derive(Debug)]
+pub struct StagedRollout {
+    source_path: PathBuf,
+    filename: PathBuf,
+    parent_dir: Dir,
+    digest: Sha256Digest,
+}
+
+impl StagedRollout {
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
+    /// Removes the staged source and its empty owned directory through the
+    /// retained no-follow capability. Any unexpected failure is manual
+    /// intervention, not a best-effort cleanup result.
+    pub fn cleanup(self) -> Result<(), NativeImportError> {
+        let file_cleanup = match self.parent_dir.remove_file(&self.filename) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(NativeImportError::ManualIntervention),
+        };
+        if file_cleanup.is_err() {
+            return Err(NativeImportError::ManualIntervention);
+        }
+        // Remove the directory through the retained handle. This preserves
+        // identity if its pathname was replaced after staging; on Windows the
+        // handle-aware implementation resolves the current directory name.
+        self.parent_dir
+            .remove_open_dir()
+            .map_err(|_| NativeImportError::ManualIntervention)
+    }
+}
+
+/// Writes a rollout only after exclusively creating its parent directory.
+///
+/// The returned object retains no-follow directory capabilities for safe
+/// cleanup after the caller has used the staged source. A pre-existing parent
+/// is never reused or removed.
+#[doc(hidden)]
+pub fn write_rollout_atomic_guarded_exclusive_parent<G>(
+    path: &Path,
+    lines: &[Vec<u8>],
+    guard: &G,
+) -> Result<StagedRollout, NativeImportError>
+where
+    G: Fn() -> Result<(), NativeImportError> + ?Sized,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| NativeImportError::Invalid("rollout has no parent".into()))?;
+    let parent_root = parent
+        .parent()
+        .ok_or_else(|| NativeImportError::Invalid("rollout parent has no root".into()))?;
+    let parent_name = PathBuf::from(
+        parent
+            .file_name()
+            .ok_or_else(|| NativeImportError::Invalid("rollout parent has no name".into()))?
+            .to_owned(),
+    );
+    let filename = PathBuf::from(
+        path.file_name()
+            .ok_or_else(|| NativeImportError::Invalid("rollout has no filename".into()))?
+            .to_owned(),
+    );
+    guard()?;
+    let parent_root_dir = agentark_security::open_or_create_directory_nofollow(parent_root)
+        .map_err(|error| match error {
+            SecurityError::Io(error) => NativeImportError::Io(error),
+            _ => NativeImportError::Invalid("rollout parent is not a safe directory".into()),
+        })?;
+    // Exclusive creation proves that this invocation owns the directory. A
+    // collision, including a symlink or reparse point, is never reused.
+    parent_root_dir.create_dir(&parent_name)?;
+    let parent_dir = match open_child_directory_nofollow(&parent_root_dir, &parent_name) {
+        Ok(directory) => directory,
+        Err(error) => {
+            // Do not perform a path-based cleanup after losing the no-follow
+            // capability. Leave the owned path for manual intervention.
+            return Err(match error {
+                SecurityError::Io(error) => NativeImportError::Io(error),
+                _ => NativeImportError::Invalid("rollout parent is not a safe directory".into()),
+            });
+        }
+    };
+    let temporary = PathBuf::from(format!(
+        ".{}.{}.tmp",
+        filename.to_string_lossy(),
+        Uuid::new_v4()
+    ));
+    let mut temporary_created = false;
+    let mut renamed = false;
+    let result = (|| {
+        let mut options = CapOpenOptions::new();
+        options.create_new(true).write(true);
+        let mut file = parent_dir.open_with(&temporary, &options)?;
+        temporary_created = true;
+        for line in lines {
+            file.write_all(line)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        guard()?;
+        parent_dir.rename(&temporary, &parent_dir, &filename)?;
+        renamed = true;
+        let mut committed = parent_dir.open(&filename)?;
+        let mut committed_bytes = Vec::new();
+        committed.read_to_end(&mut committed_bytes)?;
+        Ok(Sha256Digest::from_bytes(&committed_bytes))
+    })();
+    match result {
+        Ok(digest) => Ok(StagedRollout {
+            source_path: path.to_path_buf(),
+            filename,
+            parent_dir,
+            digest,
+        }),
+        Err(error) => {
+            // The parent was created exclusively by this call and the
+            // capability remains pinned to it. Guard immediately before
+            // deleting the temporary/committed file and directory.
+            if guard().is_err() {
+                return Err(NativeImportError::ManualIntervention);
+            }
+            let cleanup_path = if renamed {
+                Some(Path::new(&filename))
+            } else if temporary_created {
+                Some(temporary.as_path())
+            } else {
+                None
+            };
+            if let Some(cleanup_path) = cleanup_path {
+                if let Err(remove_error) = parent_dir.remove_file(cleanup_path)
+                    && remove_error.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(NativeImportError::ManualIntervention);
+                }
+            }
+            // Remove the directory through the child capability so a
+            // concurrent pathname replacement cannot redirect cleanup.
+            if parent_dir.remove_open_dir().is_err() {
+                return Err(NativeImportError::ManualIntervention);
+            }
+            Err(error)
+        }
+    }
+}

@@ -378,6 +378,125 @@ fn guarded_delete_checks_processes_immediately_before_mutation() {
 }
 
 #[test]
+fn exclusive_atomic_rollout_refuses_preexisting_parent_without_claiming_it() {
+    let root = tempdir().unwrap();
+    let parent = root.path().join("sessions/owned");
+    fs::create_dir_all(&parent).unwrap();
+    let destination = parent.join("rollout.jsonl");
+    let error = agentark_adapter_codex::write_rollout_atomic_guarded_exclusive_parent(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        &|| Ok(()),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Io(_)));
+    assert!(parent.is_dir());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn exclusive_atomic_rollout_cleans_owned_parent_after_guarded_failure() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let destination = sessions.join("owned").join("rollout.jsonl");
+    let checks = AtomicUsize::new(0);
+
+    let error = agentark_adapter_codex::write_rollout_atomic_guarded_exclusive_parent(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        &|| match checks.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(()),
+            1 => Err(NativeImportError::CodexRunning),
+            2 => Ok(()),
+            _ => panic!("unexpected process guard"),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::CodexRunning));
+    assert!(fs::read_dir(&sessions).unwrap().next().is_none());
+}
+
+#[test]
+fn staged_rollout_cleanup_removes_owned_parent() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let parent = sessions.join("owned");
+    let destination = parent.join("rollout.jsonl");
+    let staged = agentark_adapter_codex::write_rollout_atomic_guarded_exclusive_parent(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        &|| Ok(()),
+    )
+    .unwrap();
+
+    staged.cleanup().unwrap();
+
+    assert!(!parent.exists());
+    assert!(!destination.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_rollout_cleanup_is_pinned_when_path_is_replaced() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let destination = sessions.join("owned").join("rollout.jsonl");
+    let staged = agentark_adapter_codex::write_rollout_atomic_guarded_exclusive_parent(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        &|| Ok(()),
+    )
+    .unwrap();
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("rollout.jsonl"), b"must remain").unwrap();
+
+    fs::rename(destination.parent().unwrap(), sessions.join("renamed")).unwrap();
+    fs::create_dir(sessions.join("owned")).unwrap();
+    fs::write(sessions.join("owned/rollout.jsonl"), b"replacement").unwrap();
+
+    staged.cleanup().unwrap();
+
+    assert_eq!(
+        fs::read(outside.join("rollout.jsonl")).unwrap(),
+        b"must remain"
+    );
+    assert_eq!(
+        fs::read(sessions.join("owned/rollout.jsonl")).unwrap(),
+        b"replacement"
+    );
+    assert!(!sessions.join("renamed").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn exclusive_atomic_rollout_rejects_preexisting_junction_parent() {
+    let root = tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let parent = sessions.join("owned");
+    link_directory(&parent, &outside);
+    let destination = parent.join("rollout.jsonl");
+
+    let error = agentark_adapter_codex::write_rollout_atomic_guarded_exclusive_parent(
+        &destination,
+        &[b"fixture\n".to_vec()],
+        &|| Ok(()),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeImportError::Io(_)));
+    assert!(!outside.join("rollout.jsonl").exists());
+}
+
+#[test]
 fn atomic_rollout_post_rename_read_failure_removes_committed_destination() {
     let root = tempdir().unwrap();
     let destination = root.path().join("sessions/rollout.jsonl");
